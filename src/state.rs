@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// One running or waiting job.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Job {
     pub id: u64,
     /// The calmrun process that owns the entry.
@@ -30,11 +30,19 @@ pub struct Job {
     /// Child process id once started (for display).
     #[serde(default)]
     pub child_pid: Option<u32>,
+    /// Set when the owner gave up waiting (`--wait-timeout`): the entry keeps its place for a
+    /// re-run with `--ticket <id>` until this time, and is skipped by the scheduler meanwhile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_until: Option<u64>,
 }
 
 impl Job {
     pub fn running(&self) -> bool {
         self.started_ms.is_some()
+    }
+
+    pub fn parked(&self) -> bool {
+        self.parked_until.is_some()
     }
 }
 
@@ -129,10 +137,14 @@ impl Store {
     }
 }
 
-/// Drop entries whose owner is gone (pid dead or reused by a different process).
-pub fn prune(state: &mut State, alive: impl Fn(u32, u64) -> bool) -> usize {
+/// Drop entries whose owner is gone (pid dead or reused by a different process). A parked
+/// entry has no owner; it stays until its ticket expires.
+pub fn prune(state: &mut State, now_ms: u64, alive: impl Fn(u32, u64) -> bool) -> usize {
     let before = state.jobs.len();
-    state.jobs.retain(|j| alive(j.pid, j.pid_start));
+    state.jobs.retain(|j| match j.parked_until {
+        Some(until) => until > now_ms,
+        None => alive(j.pid, j.pid_start),
+    });
     before - state.jobs.len()
 }
 
@@ -155,6 +167,7 @@ mod tests {
             queued_ms: 0,
             started_ms: None,
             child_pid: None,
+            parked_until: None,
         }
     }
 
@@ -169,8 +182,17 @@ mod tests {
             })
             .unwrap();
         assert_eq!(store.read().jobs.len(), 2);
-        let removed = store.with_lock(|s| prune(s, |pid, _| pid == 10)).unwrap();
+        let removed = store.with_lock(|s| prune(s, 0, |pid, _| pid == 10)).unwrap();
         assert_eq!(removed, 1);
+        store
+            .with_lock(|s| {
+                let mut parked = job(3, 30);
+                parked.parked_until = Some(500);
+                s.jobs.push(parked);
+            })
+            .unwrap();
+        assert_eq!(store.with_lock(|s| prune(s, 400, |pid, _| pid == 10)).unwrap(), 0);
+        assert_eq!(store.with_lock(|s| prune(s, 600, |pid, _| pid == 10)).unwrap(), 1);
         assert_eq!(
             store.read().jobs.iter().map(|j| j.id).collect::<Vec<_>>(),
             vec![1]

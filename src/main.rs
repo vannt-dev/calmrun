@@ -31,6 +31,10 @@ fn main() {
         }) => cmd_hook(),
         Some(Sub::Init { force }) => cmd_init(force),
         Some(Sub::Mcp) => mcp::serve(),
+        Some(Sub::Guide) => {
+            print!("{}", GUIDE);
+            0
+        }
         Some(Sub::Probe(ref a)) => cmd_probe(a),
         Some(Sub::CtrlC { pid }) => cmd_ctrl_c(pid),
         None if cli.command.is_empty() => {
@@ -56,6 +60,9 @@ fn run_queued(cli: Cli) -> i32 {
         }
     }
     let req = queue::Request {
+        rerun_hint: Some(rerun_hint(std::env::args().skip(1).collect())),
+        wait_timeout: cli.wait_timeout.filter(|t| *t > 0.0).map(Duration::from_secs_f64),
+        ticket: cli.ticket,
         argv: cli.command,
         kind: cli.kind,
         cost: cli.cost,
@@ -68,6 +75,74 @@ fn run_queued(cli: Cli) -> i32 {
         eprintln!("{m}");
     }
     out.code
+}
+
+const GUIDE: &str = "calmrun: a machine-wide queue for heavy commands. Several agents share this computer.
+
+Wrap heavy commands (tests, type checks, linters, builds, Playwright, docker compose,
+pytest, cargo/gradle builds):
+    calmrun -- npx vitest run
+    calmrun -- cargo test
+    calmrun \"npm ci && npm test\"     (one quoted string runs in the shell)
+Do not wrap light commands (git, ls, cat, package installs).
+
+Long runs: start them in the background and check back, or cap the wait:
+    calmrun --wait-timeout 120 -- npx vitest run
+If it has not started in 120 s it exits 75 and prints the exact command that resumes
+the same place in line (calmrun --ticket <id> -- ...). The place is kept for 10 minutes.
+
+See the queue:        calmrun status          (calmrun status --json for tools)
+Move a job forward:   calmrun bump <label>
+Exit codes: the command's own; 75 = not started in time (place kept); 2 = refused;
+127 = command not found; 130 = Ctrl+C.
+MCP: `calmrun mcp` offers run_task / queue_status / bump to agents that speak MCP.
+";
+
+/// Quote a word for display so it can be pasted back into a shell.
+fn shell_quote(w: &str) -> String {
+    let safe = !w.is_empty()
+        && w.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-\\".contains(c));
+    if safe {
+        w.to_string()
+    } else if cfg!(windows) {
+        format!("\"{}\"", w.replace('"', "\\\""))
+    } else {
+        format!("'{}'", w.replace('\'', "'\\''"))
+    }
+}
+
+/// The command line that resumes this run with its ticket: the same arguments with
+/// `--ticket {ticket}` in front (an older --ticket is dropped).
+fn rerun_hint(args: Vec<String>) -> String {
+    let mut out = vec![
+        "calmrun".to_string(),
+        "--ticket".to_string(),
+        "{ticket}".to_string(),
+    ];
+    let mut i = 0;
+    let mut in_command = false;
+    while i < args.len() {
+        let a = &args[i];
+        if !in_command && a == "--ticket" {
+            i += 2;
+            continue;
+        }
+        if !in_command && a.starts_with("--ticket=") {
+            i += 1;
+            continue;
+        }
+        if a == "--" {
+            in_command = true;
+        }
+        out.push(if a == "{ticket}" {
+            a.clone()
+        } else {
+            shell_quote(a)
+        });
+        i += 1;
+    }
+    out.join(" ")
 }
 
 fn cmd_status(as_json: bool) -> i32 {
@@ -284,5 +359,31 @@ fn cmd_ctrl_c(pid: u32) -> i32 {
         0
     } else {
         1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(s: &str) -> Vec<String> {
+        s.split(' ').map(String::from).collect()
+    }
+
+    #[test]
+    fn rerun_hint_keeps_args_and_replaces_ticket() {
+        assert_eq!(
+            rerun_hint(v("--wait-timeout 60 -- npx vitest run")),
+            "calmrun --ticket {ticket} --wait-timeout 60 -- npx vitest run"
+        );
+        assert_eq!(
+            rerun_hint(v("--ticket 4 --cost 2 -- cargo test")),
+            "calmrun --ticket {ticket} --cost 2 -- cargo test"
+        );
+        let h = rerun_hint(vec!["--".into(), "echo".into(), "a b".into()]);
+        assert!(
+            h.ends_with("-- echo \"a b\"") || h.ends_with("-- echo 'a b'"),
+            "{h}"
+        );
     }
 }

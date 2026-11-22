@@ -74,13 +74,14 @@ calmrun: waiting for RAM: 2.1 GB free, needs 3.0 GB
 ## CLI
 
 ```
-calmrun [--kind K] [--cost N] [--prio high] [--label L] -- <command...>
+calmrun [--kind K] [--cost N] [--prio high] [--label L] [--wait-timeout SECS] [--ticket ID] -- <command...>
 calmrun status [--json]
 calmrun stats [--days N] [--json]
 calmrun bump <label-substring>
 calmrun doctor
 calmrun hook claude
 calmrun mcp
+calmrun guide
 calmrun init [--force]
 ```
 
@@ -92,6 +93,29 @@ calmrun init [--force]
 - The exit code is the command's exit code (on Unix a signal `n` becomes `128 + n`). A missing
   command exits 127; a refused command exits 2.
 - Ctrl+C reaches the command; a job still waiting leaves the queue and exits 130.
+- `--wait-timeout SECS` caps the wait. If the job has not started by then, calmrun exits **75**
+  (EX_TEMPFAIL) and keeps its place in line for 10 minutes. It prints the exact command that
+  resumes that place, the same arguments with `--ticket <id>` in front:
+
+  ```
+  calmrun: not started within 120s (waiting — 6 of 6 points in use, 2nd in line (needs 2)); your place in line is kept for 10 min.
+  calmrun: next: calmrun --ticket 17 --wait-timeout 120 -- npx vitest run
+  ```
+
+  While the owner is away, the kept place does not block anyone; when the ticket comes back
+  it rejoins at its old position. An expired or unknown ticket joins the end of the line.
+- Messages meant for agents say what happened and what to run next (`calmrun: next: …`), for
+  example after a refused `docker compose up` or a command that is not on `PATH`.
+  `calmrun guide` prints short instructions to paste into an agent's context.
+
+| Exit code | Meaning |
+| --- | --- |
+| the command's | it ran |
+| 2 | refused (e.g. attached `docker compose up`) |
+| 75 | not started within `--wait-timeout`; place kept, see the `next:` line |
+| 124 | stopped by the MCP `timeout_s` |
+| 127 | command not found |
+| 130 | Ctrl+C |
 
 ## Rules
 
@@ -247,7 +271,7 @@ speak MCP can queue work without a shell wrapper. It offers three tools:
 
 | Tool | What it does |
 | --- | --- |
-| `run_task` | `{command, cwd?, kind?, cost?, label?, timeout_s?, prio?}`. Waits in the same queue as the CLI, runs the command at low priority and returns the exit code, wait and run time, the last 200 lines of output and the path of the full log (kept under `logs/` in the state directory; the newest 200 are kept). While it waits, the server sends progress notifications if the client passed a `progressToken`. `timeout_s` stops the command (exit 124). Cancelling the request leaves the queue or stops the command. |
+| `run_task` | `{command, cwd?, kind?, cost?, label?, timeout_s?, prio?, wait_timeout_s?, ticket?}`. Waits in the same queue as the CLI, runs the command at low priority and returns the exit code, wait and run time, the last 200 lines of output and the path of the full log (kept under `logs/` in the state directory; the newest 200 are kept). While it waits, the server sends progress notifications if the client passed a `progressToken`. `timeout_s` stops the command (exit 124). `wait_timeout_s` gives up waiting (exit 75) and returns a `ticket`; pass it back as `ticket` to resume the same place in line. Cancelling the request leaves the queue or stops the command. |
 | `queue_status` | The same data as `calmrun status --json`. |
 | `bump` | `{label}`: move matching waiting jobs to the front. |
 

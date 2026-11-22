@@ -724,6 +724,21 @@ pub fn refuse_reason(argv: &[String]) -> Option<String> {
     })
 }
 
+/// The same compose command with `-d` added after `up` (argv words only).
+pub fn detached_compose(argv: &[String]) -> Option<Vec<String>> {
+    if is_shell_string(argv) || !compose_up_attached(argv) {
+        return None;
+    }
+    let start = argv.iter().position(|w| {
+        let t = tool_name(w);
+        t == "docker" || t == "docker-compose"
+    })?;
+    let up = start + argv[start..].iter().position(|w| w == "up")?;
+    let mut out = argv.to_vec();
+    out.insert(up + 1, "-d".to_string());
+    Some(out)
+}
+
 /// FNV-1a 64-bit, stable across builds and platforms.
 pub fn fnv1a(s: &str) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -981,6 +996,11 @@ mod tests {
         assert!(refuse_reason(&argv("docker-compose up -dV")).is_none());
         assert!(refuse_reason(&argv("docker compose up --wait")).is_none());
         assert!(refuse_reason(&argv("docker compose build")).is_none());
+        assert_eq!(
+            detached_compose(&argv("docker compose -f a.yml up --build")),
+            Some(argv("docker compose -f a.yml up -d --build"))
+        );
+        assert_eq!(detached_compose(&argv("docker compose up -d")), None);
     }
 
     #[test]

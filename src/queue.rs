@@ -67,13 +67,18 @@ impl Ctx {
 }
 
 pub fn prune_dead(s: &mut State, sys: &mut Sys) {
-    let pairs: Vec<(u32, u64)> = s.jobs.iter().map(|j| (j.pid, j.pid_start)).collect();
+    let pairs: Vec<(u32, u64)> = s
+        .jobs
+        .iter()
+        .filter(|j| !j.parked())
+        .map(|j| (j.pid, j.pid_start))
+        .collect();
     let alive: HashSet<(u32, u64)> = pairs
         .iter()
         .zip(sys.alive_set(&pairs))
         .filter_map(|(p, ok)| ok.then_some(*p))
         .collect();
-    state::prune(s, |pid, start| alive.contains(&(pid, start)));
+    state::prune(s, now_ms(), |pid, start| alive.contains(&(pid, start)));
 }
 
 pub fn ordinal(n: usize) -> String {
@@ -104,7 +109,17 @@ pub struct Request {
     pub log: Option<PathBuf>,
     /// Set by the caller to give up (waiting) or stop the command (running).
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Give up waiting after this long (exit 75) but keep the place for a ticket.
+    pub wait_timeout: Option<Duration>,
+    /// Resume the place of an earlier `--wait-timeout` run.
+    pub ticket: Option<u64>,
+    /// How to show the re-run command; `{ticket}` is replaced by the ticket id.
+    pub rerun_hint: Option<String>,
 }
+
+/// How long a ticket keeps its place without a re-run.
+pub const TICKET_TTL_MS: u64 = 10 * 60_000;
+pub const EXIT_WAIT_TIMEOUT: i32 = 75;
 
 /// What happened.
 #[derive(Debug, Clone, PartialEq)]
@@ -119,6 +134,8 @@ pub struct Outcome {
     pub run_ms: u64,
     /// A line for the user when calmrun itself has something to say (refusal, error).
     pub message: Option<String>,
+    /// Ticket id when the wait timed out and the place is kept.
+    pub ticket: Option<u64>,
 }
 
 /// Progress callbacks.
@@ -127,6 +144,10 @@ pub trait Notify {
     fn waiting(&mut self, line: &str);
     /// Called once when the command starts.
     fn started(&mut self, _wait_ms: u64) {}
+    /// A one-off note for the user.
+    fn note(&mut self, line: &str) {
+        eprintln!("{line}");
+    }
 }
 
 /// Prints the waiting line at once and then every 30 s.
@@ -142,7 +163,11 @@ impl StderrNotify {
 
 impl Notify for StderrNotify {
     fn waiting(&mut self, line: &str) {
-        if self.last.is_none_or(|t| t.elapsed() >= Duration::from_secs(30)) {
+        if self.last.is_none() {
+            eprintln!("{line}");
+            eprintln!("calmrun: it starts by itself when there is room; `calmrun status` shows the queue");
+            self.last = Some(Instant::now());
+        } else if self.last.is_some_and(|t| t.elapsed() >= Duration::from_secs(30)) {
             eprintln!("{line}");
             self.last = Some(Instant::now());
         }
@@ -160,10 +185,14 @@ fn spawn_error(argv: &[String], e: &io::Error) -> (i32, String) {
     } else {
         126
     };
-    let msg = format!(
-        "calmrun: cannot run {}: {e}",
-        argv.first().map(String::as_str).unwrap_or("")
-    );
+    let name = argv.first().map(String::as_str).unwrap_or("");
+    let hint = if code == 127 {
+        "\ncalmrun: next: check the name and PATH; a package's own bin may need `npx`, \
+         `pnpm exec` or `uv run` in front"
+    } else {
+        ""
+    };
+    let msg = format!("calmrun: cannot run {name}: {e}{hint}");
     (code, msg)
 }
 
@@ -198,11 +227,16 @@ pub fn run(ctx: &mut Ctx, mut req: Request, notify: &mut dyn Notify) -> Outcome 
         wait_ms: 0,
         run_ms: 0,
         message: None,
+        ticket: None,
     };
     if let Some(reason) = detect::refuse_reason(&req.argv) {
         out.code = 2;
         out.status = "refused".into();
-        out.message = Some(format!("calmrun: refused: {reason}"));
+        let next = match detect::detached_compose(&req.argv) {
+            Some(fixed) => format!("calmrun -- {}", fixed.join(" ")),
+            None => "add -d after `up`, or run `docker compose up` outside calmrun".to_string(),
+        };
+        out.message = Some(format!("calmrun: refused: {reason}.\ncalmrun: next: {next}"));
         return out;
     }
     if let Some(a) = detect::vitest_args(&req.argv, cfg.vitest_workers) {
@@ -304,18 +338,38 @@ pub fn run(ctx: &mut Ctx, mut req: Request, notify: &mut dyn Notify) -> Outcome 
         queued_ms,
         started_ms: None,
         child_pid: None,
+        parked_until: None,
     };
     let sys = &mut ctx.sys;
+    let ticket = req.ticket;
     let enq = store.with_lock(|s| {
         prune_dead(s, sys);
+        if let Some(t) = ticket {
+            if let Some(j) = s.jobs.iter_mut().find(|j| j.id == t && j.parked()) {
+                // Resume the kept place: same id, order and queue time.
+                entry.id = j.id;
+                entry.order = j.order;
+                entry.queued_ms = j.queued_ms;
+                entry.high = entry.high || j.high;
+                *j = entry.clone();
+                return (entry.clone(), true);
+            }
+        }
         s.next_id += 1;
         entry.id = s.next_id;
         entry.order = s.next_order();
         s.jobs.push(entry.clone());
-        entry.clone()
+        (entry.clone(), false)
     });
     let entry = match enq {
-        Ok(e) => e,
+        Ok((e, resumed)) => {
+            if let (Some(t), false) = (ticket, resumed) {
+                notify.note(&format!(
+                    "calmrun: ticket {t} has expired or is unknown; joining the end of the line"
+                ));
+            }
+            e
+        }
         Err(e) => {
             out.code = 1;
             out.status = "error".into();
@@ -324,9 +378,12 @@ pub fn run(ctx: &mut Ctx, mut req: Request, notify: &mut dyn Notify) -> Outcome 
         }
     };
     let id = entry.id;
+    let queued_ms = entry.queued_ms;
     let lim = ctx.limits();
+    let wait_started = Instant::now();
 
     // Wait for our turn.
+    let mut last_line = String::from("waiting");
     let started_ms = loop {
         if cancelled(&req) {
             let _ = store.with_lock(|s| s.jobs.retain(|j| j.id != id));
@@ -334,6 +391,31 @@ pub fn run(ctx: &mut Ctx, mut req: Request, notify: &mut dyn Notify) -> Outcome 
             out.status = "cancelled".into();
             out.wait_ms = now_ms().saturating_sub(queued_ms);
             out.message = Some("calmrun: cancelled while waiting; left the queue".into());
+            return out;
+        }
+        if req.wait_timeout.is_some_and(|t| wait_started.elapsed() >= t) {
+            let until = now_ms() + TICKET_TTL_MS;
+            let _ = store.with_lock(|s| {
+                if let Some(j) = s.jobs.iter_mut().find(|j| j.id == id) {
+                    j.parked_until = Some(until);
+                }
+            });
+            let secs = req.wait_timeout.map_or(0, |t| t.as_secs());
+            let mut msg = format!(
+                "calmrun: not started within {secs}s ({}); your place in line is kept for 10 min.",
+                last_line.trim_start_matches("calmrun: ")
+            );
+            if let Some(h) = &req.rerun_hint {
+                msg.push_str(&format!(
+                    "\ncalmrun: next: {}",
+                    h.replace("{ticket}", &id.to_string())
+                ));
+            }
+            out.code = EXIT_WAIT_TIMEOUT;
+            out.status = "wait-timeout".into();
+            out.wait_ms = now_ms().saturating_sub(queued_ms);
+            out.message = Some(msg);
+            out.ticket = Some(id);
             return out;
         }
         let free = ctx.sys.free_ram();
@@ -356,7 +438,10 @@ pub fn run(ctx: &mut Ctx, mut req: Request, notify: &mut dyn Notify) -> Outcome 
         });
         match step {
             Ok(Ok(t)) => break t,
-            Ok(Err(line)) => notify.waiting(&line),
+            Ok(Err(line)) => {
+                notify.waiting(&line);
+                last_line = line;
+            }
             Err(e) => {
                 out.code = 1;
                 out.status = "error".into();
@@ -510,6 +595,14 @@ pub fn status_json(ctx: &mut Ctx, state: &State) -> serde_json::Value {
         "min_free_bytes": ctx.cfg.min_free_bytes,
         "running": running.iter().map(|j| job_json(j, now, None)).collect::<Vec<_>>(),
         "waiting": waiting.iter().enumerate().map(|(i, j)| job_json(j, now, Some(i + 1))).collect::<Vec<_>>(),
+        "parked": state.jobs.iter().filter(|j| j.parked()).map(|j| json!({
+            "ticket": j.id,
+            "label": j.label,
+            "kind": j.kind,
+            "cost": j.cost,
+            "cwd": j.cwd,
+            "expires_in_ms": j.parked_until.unwrap_or(0).saturating_sub(now),
+        })).collect::<Vec<_>>(),
         "warnings": stuck_warnings(state, now),
     })
 }

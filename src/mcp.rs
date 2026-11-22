@@ -67,7 +67,9 @@ fn tools() -> Value {
                     "cost": {"type": "integer", "minimum": 1, "description": "Budget points; default by kind"},
                     "label": {"type": "string", "description": "Name shown in the queue"},
                     "timeout_s": {"type": "number", "exclusiveMinimum": 0, "description": "Stop the command after this many seconds (exit 124)"},
-                    "prio": {"type": "string", "enum": ["normal", "high"]}
+                    "prio": {"type": "string", "enum": ["normal", "high"]},
+                    "wait_timeout_s": {"type": "number", "exclusiveMinimum": 0, "description": "Give up waiting after this many seconds; the result carries a ticket that keeps the place in line for 10 minutes"},
+                    "ticket": {"type": "integer", "description": "Ticket from an earlier wait timeout: resume that place in line"}
                 },
                 "required": ["command"]
             }
@@ -204,6 +206,13 @@ fn run_task(out: &Out, args: &Value, token: Option<Value>, cancel: Arc<AtomicBoo
             .map(Duration::from_secs_f64),
         log: Some(log.clone()),
         cancel: Some(cancel),
+        wait_timeout: args
+            .get("wait_timeout_s")
+            .and_then(Value::as_f64)
+            .filter(|t| *t > 0.0)
+            .map(Duration::from_secs_f64),
+        ticket: args.get("ticket").and_then(Value::as_u64),
+        rerun_hint: Some("call run_task again with the same arguments plus \"ticket\": {ticket}".into()),
     };
     let mut notify = McpNotify {
         out: out.clone(),
@@ -247,6 +256,7 @@ fn run_task(out: &Out, args: &Value, token: Option<Value>, cancel: Arc<AtomicBoo
         "run_ms": o.run_ms,
         "log_path": if ran { Value::String(log.to_string_lossy().to_string()) } else { Value::Null },
         "message": o.message,
+        "ticket": o.ticket,
     });
     text_result(text, o.code != 0, Some(structured))
 }

@@ -20,9 +20,10 @@ pub fn effective_cost(cost: u32, budget: u32) -> u32 {
     cost.clamp(1, budget.max(1))
 }
 
-/// Waiting jobs in queue order: prio high first, then `order` (first come).
+/// Waiting jobs in queue order: prio high first, then `order` (first come). Parked entries
+/// (owner gone, place kept for a ticket) are not waiting.
 pub fn waiting_in_order(jobs: &[Job]) -> Vec<&Job> {
-    let mut w: Vec<&Job> = jobs.iter().filter(|j| !j.running()).collect();
+    let mut w: Vec<&Job> = jobs.iter().filter(|j| !j.running() && !j.parked()).collect();
     w.sort_by_key(|j| (!j.high, j.order, j.id));
     w
 }
@@ -123,6 +124,7 @@ mod tests {
             queued_ms: 1_000,
             started_ms: running.then_some(1_000),
             child_pid: None,
+            parked_until: None,
         }
     }
     fn keyed(mut j: Job, k: &str) -> Job {
@@ -231,6 +233,15 @@ mod tests {
         b.order = -1;
         let jobs = vec![job(1, 2, true), job(2, 2, false), b];
         assert_eq!(admissible(&jobs, 2_000, 16 * GB, LIM), vec![3]);
+    }
+
+    #[test]
+    fn parked_entries_are_skipped() {
+        let mut parked = job(1, 2, false);
+        parked.parked_until = Some(99_999_999);
+        let jobs = vec![parked, job(2, 2, false)];
+        assert_eq!(admissible(&jobs, 2_000, 16 * GB, LIM), vec![2]);
+        assert_eq!(waiting_in_order(&jobs).len(), 1);
     }
 
     #[test]

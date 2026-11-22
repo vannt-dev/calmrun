@@ -357,3 +357,77 @@ fn windows_cmd_shim_arguments_survive() {
     let got: Vec<String> = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(got, args);
 }
+
+#[test]
+fn wait_timeout_keeps_the_place_with_a_ticket() {
+    let env = Env::new();
+    let holder = env.probe(2, &["--cost", "2"], "holder", 6000, None);
+    env.wait_queue(1, 0);
+    // B gives up after 1 s and gets a ticket.
+    let out = env
+        .cmd(2)
+        .args([
+            "--cost",
+            "2",
+            "--wait-timeout",
+            "1",
+            "--",
+            EXE,
+            "__probe",
+            "--id",
+            "b",
+            "--log",
+        ])
+        .arg(&env.log)
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(75));
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    let next = err
+        .lines()
+        .find_map(|l| l.strip_prefix("calmrun: next: "))
+        .unwrap_or_else(|| panic!("no next line in: {err}"))
+        .to_string();
+    assert!(next.starts_with("calmrun --ticket "), "{next}");
+    let ticket = next.split_whitespace().nth(2).unwrap().to_string();
+    let s = env.status();
+    assert_eq!(s["parked"][0]["ticket"].to_string(), ticket);
+    assert_eq!(s["waiting"].as_array().unwrap().len(), 0);
+    // C queues normally; then B comes back with its ticket and is still ahead of C.
+    let c = env.probe(2, &["--cost", "2"], "c", 200, None);
+    env.wait_queue(1, 1);
+    let b = env.probe(2, &["--cost", "2", "--ticket", &ticket], "b", 200, None);
+    env.wait_queue(1, 2);
+    assert!(wait_all(vec![holder, b, c], Duration::from_secs(60))
+        .iter()
+        .all(|&x| x == 0));
+    let order: Vec<String> = env.intervals().into_iter().map(|x| x.0).collect();
+    assert_eq!(order, vec!["holder", "b", "c"]);
+    assert_eq!(env.status()["parked"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn refusal_prints_the_next_command() {
+    let env = Env::new();
+    let out = env
+        .cmd(2)
+        .args(["--", "docker", "compose", "up"])
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("calmrun: next: calmrun -- docker compose up -d"),
+        "{err}"
+    );
+}
+
+#[test]
+fn guide_prints_instructions() {
+    let env = Env::new();
+    let out = env.cmd(2).arg("guide").stdout(Stdio::piped()).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("calmrun -- npx vitest run") && text.contains("--wait-timeout"));
+}

@@ -32,6 +32,15 @@ pub struct Cli {
     #[arg(long, value_name = "L")]
     pub label: Option<String>,
 
+    /// Give up waiting after this many seconds: exit 75 and keep the place in line for
+    /// 10 minutes. calmrun prints the command that resumes it.
+    #[arg(long, value_name = "SECS")]
+    pub wait_timeout: Option<f64>,
+
+    /// Resume the place in line kept by an earlier --wait-timeout run.
+    #[arg(long, value_name = "ID")]
+    pub ticket: Option<u64>,
+
     /// The command to run. Separate words run directly; one quoted string runs in the shell.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "COMMAND")]
     pub command: Vec<String>,
@@ -72,6 +81,8 @@ pub enum Sub {
         #[command(subcommand)]
         target: HookTarget,
     },
+    /// Print short instructions for coding agents.
+    Guide,
     /// Serve the queue to coding agents over MCP (JSON-RPC on stdin/stdout).
     Mcp,
     /// Write a commented default config file and print its path.

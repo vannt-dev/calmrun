@@ -19,6 +19,9 @@ All notable changes to this project are documented here. The format follows
 - `status`, `stats`, `bump`, `doctor`, `init` subcommands and `history.jsonl`.
 - `calmrun hook claude`: a Claude Code PreToolUse hook that sends heavy shell commands
   through calmrun.
+- `--wait-timeout SECS`: exit 75 when not started in time and keep the place in line for 10
+  minutes; `--ticket <id>` resumes it. The `next:` line gives the exact command.
+- `calmrun guide`, and `next:` hints on refusals and missing commands.
 - `calmrun mcp`: an MCP server over stdio with `run_task` (same queue as the CLI, captured
   log, last 200 lines, progress notifications, timeout, cancellation), `queue_status` and
   `bump`.
