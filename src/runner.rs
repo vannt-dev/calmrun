@@ -46,7 +46,7 @@ pub fn build(argv: &[String]) -> io::Result<Command> {
 }
 
 #[cfg(unix)]
-fn shell_command(line: &str) -> Command {
+pub fn shell_command(line: &str) -> Command {
     let mut c = Command::new("/bin/sh");
     c.arg("-c").arg(line);
     c
@@ -65,7 +65,7 @@ fn comspec() -> String {
 }
 
 #[cfg(windows)]
-fn shell_command(line: &str) -> Command {
+pub fn shell_command(line: &str) -> Command {
     use std::os::windows::process::CommandExt;
     let mut c = Command::new(comspec());
     c.raw_arg(format!("/d /s /c \"{line}\""));
