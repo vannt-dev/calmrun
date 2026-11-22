@@ -187,6 +187,11 @@ mod tests {
         assert_eq!(kinds, vec!["tsc", "vitest"]);
         let (w, _) = wrap_command("CI=1 FOO=\"a b\" npx jest", &BTreeMap::new()).unwrap();
         assert_eq!(w, "CI=1 FOO=\"a b\" calmrun -- npx jest");
+        let (w, _) = wrap_command("time npx vitest run", &BTreeMap::new()).unwrap();
+        assert_eq!(w, "time calmrun -- npx vitest run");
+        let (w, _) = wrap_command("nice -n 5 cargo build", &BTreeMap::new()).unwrap();
+        assert_eq!(w, "nice -n 5 calmrun -- cargo build");
+        assert!(wrap_command("time calmrun -- npx vitest", &BTreeMap::new()).is_none());
     }
 
     #[test]
@@ -218,6 +223,8 @@ mod tests {
             "cat package.json | grep vitest",
             "git status && git diff",
             "echo 'npx vitest' > notes.txt",
+            "cat > run.sh <<'EOF'\nnpm test\nnpx vitest run\nEOF",
+            "git commit -m \"$(cat <<'EOF'\nci: run npm test\n\nnpx vitest\nEOF\n)\"",
         ] {
             assert!(run("Bash", c, Mode::Deny).is_none(), "{c}");
         }

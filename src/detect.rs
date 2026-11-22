@@ -107,7 +107,8 @@ pub struct Parsed {
     pub launcher: Vec<String>,
     pub tool: String,
     pub rest: Vec<String>,
-    /// Index of the first word after env assignments (where a wrapper can be inserted).
+    /// Index of the first word after env assignments and wrappers such as `time` or `nohup`
+    /// (where `calmrun --` can be inserted).
     pub start: usize,
 }
 
@@ -123,12 +124,10 @@ fn skip_flags(words: &[String], mut i: usize, value_flags: &[&str]) -> usize {
 
 pub fn parse(words: &[String]) -> Option<Parsed> {
     let mut i = 0;
-    let mut start = 0;
     loop {
         let w = words.get(i)?;
         if is_assignment(w) {
             i += 1;
-            start = i;
             continue;
         }
         let t = tool_name(w);
@@ -145,6 +144,7 @@ pub fn parse(words: &[String]) -> Option<Parsed> {
         }
         break;
     }
+    let start = i;
     let first = tool_name(&words[i]);
     let next = words.get(i + 1).map(|s| s.to_ascii_lowercase());
     let mut launcher = Vec::new();
@@ -522,8 +522,40 @@ pub fn split_segments(s: &str) -> Vec<Range<usize>> {
             out.push(a..b);
         }
     };
+    // Heredoc terminators waiting for the end of the current line.
+    let mut pending: Vec<String> = Vec::new();
     while i < bytes.len() {
         let c = bytes[i];
+        // Heredocs (`<<EOF`, `<<-'EOF'`) are found in any quote state, so a heredoc inside
+        // "$(cat <<'EOF' ... )" is skipped too. Their bodies are data, never commands.
+        if c == b'<' && bytes.get(i + 1) == Some(&b'<') && bytes.get(i + 2) != Some(&b'<') {
+            if let Some((delim, used)) = heredoc_delimiter(&s[i + 2..]) {
+                pending.push(delim);
+                i += 2 + used;
+                continue;
+            }
+        }
+        if c == b'\n' && !pending.is_empty() {
+            if quote.is_none() {
+                push(&mut out, seg_start, i);
+            }
+            let mut pos = i + 1;
+            for d in pending.drain(..) {
+                while pos < bytes.len() {
+                    let end = s[pos..].find('\n').map_or(bytes.len(), |e| pos + e);
+                    let line = s[pos..end].trim_start_matches('\t').trim_end();
+                    pos = end + 1;
+                    if line == d {
+                        break;
+                    }
+                }
+            }
+            i = pos.min(bytes.len());
+            if quote.is_none() {
+                seg_start = i;
+            }
+            continue;
+        }
         if let Some(q) = quote {
             if c == b'\\' && q == b'"' {
                 i += 2;
@@ -561,6 +593,35 @@ pub fn split_segments(s: &str) -> Vec<Range<usize>> {
     }
     push(&mut out, seg_start, bytes.len());
     out
+}
+
+/// The delimiter word after `<<` (with optional `-` and quotes) and the bytes it used.
+fn heredoc_delimiter(rest: &str) -> Option<(String, usize)> {
+    let b = rest.as_bytes();
+    let mut i = 0;
+    if b.first() == Some(&b'-') {
+        i += 1;
+    }
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+        i += 1;
+    }
+    let mut word = String::new();
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\'' || c == b'"' {
+            let close = rest[i + 1..].find(c as char)? + i + 1;
+            word.push_str(&rest[i + 1..close]);
+            i = close + 1;
+        } else if c == b'\\' {
+            i += 1;
+        } else if c.is_ascii_whitespace() || b";|&<>()`".contains(&c) {
+            break;
+        } else {
+            word.push(c as char);
+            i += 1;
+        }
+    }
+    (!word.is_empty()).then_some((word, i))
 }
 
 /// `--maxWorkers=N` rule for vitest invoked directly as separate argv words.
@@ -830,6 +891,21 @@ mod tests {
         let s = "(cd x && vitest)";
         let parts: Vec<&str> = split_segments(s).into_iter().map(|r| &s[r]).collect();
         assert_eq!(parts, vec!["cd x", "vitest"]);
+    }
+
+    #[test]
+    fn heredoc_bodies_are_not_commands() {
+        let s = "cat > run.sh <<'EOF'\nnpm test\nnpx vitest run\nEOF\nls";
+        let parts: Vec<&str> = split_segments(s).into_iter().map(|r| &s[r]).collect();
+        assert_eq!(parts, vec!["cat > run.sh <<'EOF'", "ls"]);
+        let s = "git commit -m \"$(cat <<'EOF'\nfix: run npm test in CI\n\nnpx vitest \"x\"\nEOF\n)\" && git push";
+        let parts: Vec<&str> = split_segments(s).into_iter().map(|r| &s[r]).collect();
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert!(parts[0].starts_with("git commit"));
+        assert_eq!(parts[1], "git push");
+        let s = "cat <<-END >x\n\tcargo build\n\tEND\ncargo test";
+        let parts: Vec<&str> = split_segments(s).into_iter().map(|r| &s[r]).collect();
+        assert_eq!(parts, vec!["cat <<-END >x", "cargo test"]);
     }
 
     #[test]
