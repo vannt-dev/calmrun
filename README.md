@@ -208,8 +208,10 @@ with each heavy part wrapped in place:
 cd web && npm ci && npx vitest run      →      cd web && npm ci && calmrun -- npx vitest run
 ```
 
-Light commands (`git`, `ls`, `cat`, `npm install`, …) are never blocked, and any input the hook
-does not understand is allowed (no output, exit 0).
+Light commands (`git`, `ls`, `cat`, `npm install`, …) are never blocked, heredoc bodies (for
+example a commit message written with `<<'EOF'`) are not treated as commands, and any input
+the hook does not understand is allowed (no output, exit 0). Wrappers such as `VAR=1`, `time`
+or `nice` stay in front: `time npx vitest` becomes `time calmrun -- npx vitest`.
 
 Add it to `.claude/settings.json` in a project, or to `~/.claude/settings.json` for every
 project:
