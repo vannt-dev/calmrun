@@ -72,6 +72,8 @@ pub enum Sub {
         #[command(subcommand)]
         target: HookTarget,
     },
+    /// Serve the queue to coding agents over MCP (JSON-RPC on stdin/stdout).
+    Mcp,
     /// Write a commented default config file and print its path.
     Init {
         /// Overwrite an existing file.

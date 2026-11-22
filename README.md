@@ -80,6 +80,7 @@ calmrun stats [--days N] [--json]
 calmrun bump <label-substring>
 calmrun doctor
 calmrun hook claude
+calmrun mcp
 calmrun init [--force]
 ```
 
@@ -238,6 +239,48 @@ With `CALMRUN_HOOK_MODE=rewrite` the hook instead returns `updatedInput` with th
 command and no permission decision, so your normal permission rules still apply to the wrapped
 command. In auto mode Claude Code may decline a changed input, in which case the original
 command runs unwrapped; the default deny mode does not have that gap.
+
+### MCP server
+
+`calmrun mcp` is an [MCP](https://modelcontextprotocol.io) server over stdio. Agents that
+speak MCP can queue work without a shell wrapper. It offers three tools:
+
+| Tool | What it does |
+| --- | --- |
+| `run_task` | `{command, cwd?, kind?, cost?, label?, timeout_s?, prio?}`. Waits in the same queue as the CLI, runs the command at low priority and returns the exit code, wait and run time, the last 200 lines of output and the path of the full log (kept under `logs/` in the state directory; the newest 200 are kept). While it waits, the server sends progress notifications if the client passed a `progressToken`. `timeout_s` stops the command (exit 124). Cancelling the request leaves the queue or stops the command. |
+| `queue_status` | The same data as `calmrun status --json`. |
+| `bump` | `{label}`: move matching waiting jobs to the front. |
+
+A `command` made of plain words runs the program directly (and gets the vitest
+`--maxWorkers` rule); one that uses shell syntax (`&&`, pipes, redirects, `$VAR`, …) runs in
+`sh -c` on macOS/Linux and `cmd /d /s /c` on Windows.
+
+Register it with your agent:
+
+```sh
+# Claude Code
+claude mcp add calmrun -- calmrun mcp
+```
+
+```toml
+# Codex: ~/.codex/config.toml
+[mcp_servers.calmrun]
+command = "calmrun"
+args = ["mcp"]
+tool_timeout_sec = 3600   # tasks may wait in the queue and run for a while
+```
+
+```json
+// Cursor: ~/.cursor/mcp.json   ·   Gemini CLI: ~/.gemini/settings.json
+{
+  "mcpServers": {
+    "calmrun": { "command": "calmrun", "args": ["mcp"] }
+  }
+}
+```
+
+Long test runs can outlast a client's default tool timeout; raise it where the client allows
+(Gemini CLI: a `timeout` in milliseconds on the server entry).
 
 ### Instructions for agents
 
