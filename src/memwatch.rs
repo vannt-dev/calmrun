@@ -10,6 +10,7 @@ use sysinfo::{MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, Sys
 pub const CRITICAL_FOR: Duration = Duration::from_secs(3);
 const SAMPLE_EVERY: Duration = Duration::from_secs(1);
 
+/// Why a running job was stopped.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stop {
     /// The tree used more than the ceiling.
@@ -19,6 +20,7 @@ pub enum Stop {
 }
 
 impl Stop {
+    /// The history status word.
     pub fn status(&self) -> &'static str {
         match self {
             Stop::Ceiling { .. } => "ceiling",
@@ -26,6 +28,7 @@ impl Stop {
         }
     }
 
+    /// The message for the user, with the numbers and what to do next.
     pub fn message(&self, label: &str) -> String {
         match self {
             Stop::Ceiling { used, ceiling } => format!(
@@ -93,6 +96,7 @@ pub fn tree_bytes(rows: &[(u32, Option<u32>, u64)], root: u32) -> u64 {
     total
 }
 
+/// Samples one job's process tree and the free RAM.
 pub struct MemWatch {
     sys: System,
     pub ceiling: u64,
@@ -104,6 +108,7 @@ pub struct MemWatch {
 }
 
 impl MemWatch {
+    /// A watcher, or `None` when both limits are off.
     pub fn new(ceiling: u64, floor: u64) -> Option<MemWatch> {
         if ceiling == 0 && floor == 0 {
             return None;

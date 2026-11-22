@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand, ValueEnum};
     args_conflicts_with_subcommands = true,
     after_help = "Examples:\n  calmrun -- npx vitest run\n  calmrun --cost 3 --label e2e -- npx playwright test\n  calmrun status"
 )]
+/// The command line.
 pub struct Cli {
     #[command(subcommand)]
     pub sub: Option<Sub>,
@@ -55,12 +56,14 @@ pub struct Cli {
     pub command: Vec<String>,
 }
 
+/// Queue priority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Prio {
     Normal,
     High,
 }
 
+/// Subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Sub {
     /// Show running and waiting jobs, the budget and free RAM.
@@ -127,12 +130,14 @@ pub enum Sub {
     CtrlC { pid: u32 },
 }
 
+/// Agents calmrun has a hook for.
 #[derive(Debug, Subcommand)]
 pub enum HookTarget {
     /// Claude Code PreToolUse hook: reads the hook JSON on stdin.
     Claude,
 }
 
+/// Arguments of the hidden test helper `__probe`.
 #[derive(Debug, clap::Args)]
 pub struct ProbeArgs {
     #[arg(long)]

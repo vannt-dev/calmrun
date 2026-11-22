@@ -440,6 +440,9 @@ Use `calmrun status` to see what is running or waiting. Do not wrap light comman
 
 ## Development
 
+[ARCHITECTURE.md](ARCHITECTURE.md) maps the modules and explains how to add a tool, a
+gate, an MCP tool or an agent.
+
 ```sh
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings

@@ -1,27 +1,48 @@
-//! Running one job through the queue. Shared by the CLI and the MCP server.
+//! The service every agent entry point uses (CLI, MCP): submit a job, wait for its turn, run
+//! it, record it. [`run`] is the whole flow; each phase is its own function below.
 
 use crate::config::{self, bytes_to_gb, Config};
-use crate::scheduler::{self, Block, Limits};
+use crate::detect::{self, Detected};
+use crate::error::{Error, Result};
+use crate::kinds::Workers;
+use crate::memwatch::{self, MemWatch};
+use crate::messages::{self, WaitContext};
+use crate::scheduler::{self, Inputs, Limits};
 use crate::state::{self, Job, State, Store};
-use crate::sys::Sys;
-use crate::{detect, history, memwatch, runner};
-use serde_json::json;
+use crate::sys::{DiskCheck, Sys};
+use crate::{history, runner};
 use std::collections::HashSet;
-use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const POLL: Duration = Duration::from_millis(500);
-pub const STUCK_MS: u64 = 30 * 60_000;
+/// First poll interval while waiting; it grows while nothing changes.
+const POLL_MIN: Duration = Duration::from_millis(250);
+/// Longest poll interval while waiting.
+const POLL_MAX: Duration = Duration::from_millis(1500);
+/// Cancellation is noticed within this, even during a long poll interval.
+const CANCEL_CHECK: Duration = Duration::from_millis(100);
+/// The CLI repeats the waiting line this often.
+const MESSAGE_EVERY: Duration = Duration::from_secs(30);
+/// Publish the tree's memory to the state every this many samples.
+const MEM_PUBLISH_EVERY: u64 = 2;
 
+/// How long a ticket keeps its place without a re-run.
+pub const TICKET_TTL_MS: u64 = 10 * 60_000;
+/// Not started within `--wait-timeout` (EX_TEMPFAIL).
+pub const EXIT_WAIT_TIMEOUT: i32 = 75;
+/// Refused (attached `docker compose up`).
+pub const EXIT_REFUSED: i32 = 2;
+/// Stopped by the MCP `timeout_s`.
+pub const EXIT_TIMEOUT: i32 = 124;
+
+/// Milliseconds since the Unix epoch.
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// Loaded settings plus a system-info handle.
@@ -37,8 +58,9 @@ pub struct Ctx {
 
 /// A queue id may hold letters, digits, `-`, `_` and `.` (not leading).
 pub fn valid_queue_id(id: &str) -> bool {
+    const MAX_LEN: usize = 64;
     !id.is_empty()
-        && id.len() <= 64
+        && id.len() <= MAX_LEN
         && !id.starts_with('.')
         && id
             .chars()
@@ -46,8 +68,9 @@ pub fn valid_queue_id(id: &str) -> bool {
 }
 
 impl Ctx {
-    pub fn load() -> Ctx {
-        let mut sys = Sys::new();
+    /// Read the config (a broken file is reported and ignored) and the machine.
+    pub fn load() -> Result<Ctx> {
+        let mut sys = Sys::new()?;
         let home = config::home_dir();
         let config_path = config::config_path(&home);
         let machine = sys.machine();
@@ -56,16 +79,26 @@ impl Ctx {
             config::FileConfig::default()
         });
         let cfg = config::resolve(machine, file, &|k| std::env::var(k).ok());
-        Ctx {
+        Ok(Ctx {
             cfg,
             home,
             config_path,
             machine,
             sys,
             queue: None,
-        }
+        })
     }
 
+    /// Use a separate queue.
+    pub fn with_queue(mut self, queue: Option<String>) -> Result<Ctx> {
+        if let Some(q) = queue.as_deref().filter(|q| !valid_queue_id(q)) {
+            return Err(Error::InvalidQueue(q.to_string()));
+        }
+        self.queue = queue;
+        Ok(self)
+    }
+
+    /// The scheduler limits from the config.
     pub fn limits(&self) -> Limits {
         Limits {
             budget: self.cfg.budget,
@@ -74,14 +107,20 @@ impl Ctx {
         }
     }
 
-    pub fn store(&self) -> io::Result<Store> {
-        match &self.queue {
+    /// The files of the selected queue.
+    pub fn store(&self) -> Result<Store> {
+        let opened = match &self.queue {
             Some(id) => Store::open_queue(&self.home, id),
             None => Store::open(&self.home),
-        }
+        };
+        opened.map_err(|source| Error::StateDir {
+            path: self.home.clone(),
+            source,
+        })
     }
 }
 
+/// Drop entries whose owner died (pid gone or reused), and expired tickets.
 pub fn prune_dead(s: &mut State, sys: &mut Sys) {
     let pairs: Vec<(u32, u64)> = s
         .jobs
@@ -95,17 +134,6 @@ pub fn prune_dead(s: &mut State, sys: &mut Sys) {
         .filter_map(|(p, ok)| ok.then_some(*p))
         .collect();
     state::prune(s, now_ms(), |pid, start| alive.contains(&(pid, start)));
-}
-
-pub fn ordinal(n: usize) -> String {
-    let suffix = match (n % 10, n % 100) {
-        (_, 11..=13) => "th",
-        (1, _) => "st",
-        (2, _) => "nd",
-        (3, _) => "rd",
-        _ => "th",
-    };
-    format!("{n}{suffix}")
 }
 
 /// One job to run.
@@ -137,15 +165,12 @@ pub struct Request {
     pub needs: Vec<String>,
 }
 
-/// How long a ticket keeps its place without a re-run.
-pub const TICKET_TTL_MS: u64 = 10 * 60_000;
-pub const EXIT_WAIT_TIMEOUT: i32 = 75;
-
 /// What happened.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Outcome {
     pub code: i32,
-    /// Exit code as text, or a word: refused, interrupted, cancelled, timeout, spawn-failed.
+    /// Exit code as text, or a word: refused, interrupted, cancelled, timeout, wait-timeout,
+    /// ceiling, low-memory, spawn-failed, error.
     pub status: String,
     pub label: String,
     pub kind: String,
@@ -158,9 +183,26 @@ pub struct Outcome {
     pub ticket: Option<u64>,
 }
 
+impl Outcome {
+    fn ended(mut self, code: i32, status: &str, message: Option<String>) -> Outcome {
+        self.code = code;
+        self.status = status.to_string();
+        self.message = message;
+        self
+    }
+
+    fn error(self, e: &Error) -> Outcome {
+        self.ended(e.exit_code(), e.status(), Some(format!("calmrun: {e}")))
+    }
+}
+
 /// Progress callbacks.
 pub trait Notify {
-    /// Called on every poll while waiting, with the current reason line.
+    /// Whether [`Notify::waiting`] would use a line now (so it is not built for nothing).
+    fn wants_line(&self) -> bool {
+        true
+    }
+    /// The current waiting line.
     fn waiting(&mut self, line: &str);
     /// Called once when the command starts.
     fn started(&mut self, _wait_ms: u64) {}
@@ -170,63 +212,171 @@ pub trait Notify {
     }
 }
 
-/// Prints the waiting line at once and then every 30 s.
+/// Prints the waiting line at once (with a hint) and then every 30 s.
+#[derive(Default)]
 pub struct StderrNotify {
     last: Option<Instant>,
 }
 
-impl StderrNotify {
-    pub fn new() -> StderrNotify {
-        StderrNotify { last: None }
+impl Notify for StderrNotify {
+    fn wants_line(&self) -> bool {
+        self.last.is_none_or(|t| t.elapsed() >= MESSAGE_EVERY)
+    }
+
+    fn waiting(&mut self, line: &str) {
+        if !self.wants_line() {
+            return;
+        }
+        eprintln!("{line}");
+        if self.last.is_none() {
+            eprintln!("{}", messages::STARTS_BY_ITSELF);
+        }
+        self.last = Some(Instant::now());
     }
 }
 
-impl Notify for StderrNotify {
-    fn waiting(&mut self, line: &str) {
-        if self.last.is_none() {
-            eprintln!("{line}");
-            eprintln!("calmrun: it starts by itself when there is room; `calmrun status` shows the queue");
-            self.last = Some(Instant::now());
-        } else if self.last.is_some_and(|t| t.elapsed() >= Duration::from_secs(30)) {
-            eprintln!("{line}");
-            self.last = Some(Instant::now());
+/// A request after detection: what will run and how it is booked.
+struct Prepared {
+    req: Request,
+    det: Detected,
+    kind: String,
+    cost: u32,
+    label: String,
+    cwd: PathBuf,
+}
+
+impl Prepared {
+    fn outcome(&self) -> Outcome {
+        Outcome {
+            label: self.label.clone(),
+            kind: self.kind.clone(),
+            cost: self.cost,
+            ..Outcome::default()
         }
     }
+
+    fn cancelled(&self) -> bool {
+        runner::INTERRUPTED.load(Ordering::SeqCst) || self.cancel_requested()
+    }
+
+    fn cancel_requested(&self) -> bool {
+        self.req.cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst))
+    }
 }
 
-fn cancelled(req: &Request) -> bool {
-    runner::INTERRUPTED.load(Ordering::SeqCst)
-        || req.cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst))
-}
-
-fn spawn_error(argv: &[String], e: &io::Error) -> (i32, String) {
-    let code = if e.kind() == io::ErrorKind::NotFound {
-        127
-    } else {
-        126
+/// Run the command for `req` through the queue.
+pub fn run(ctx: &mut Ctx, req: Request, notify: &mut dyn Notify) -> Outcome {
+    let p = match prepare(ctx, req) {
+        Ok(p) => p,
+        Err(out) => return *out,
     };
-    let name = argv.first().map(String::as_str).unwrap_or("");
-    let hint = if code == 127 {
-        "\ncalmrun: next: check the name and PATH; a package's own bin may need `npx`, \
-         `pnpm exec` or `uv run` in front"
-    } else {
-        ""
+    if held_by_outer(ctx) {
+        return run_nested(&p);
+    }
+    let store = match ctx.store() {
+        Ok(s) => s,
+        Err(e) => return p.outcome().error(&e),
     };
-    let msg = format!("calmrun: cannot run {name}: {e}{hint}");
-    (code, msg)
+    let entry = match enqueue(ctx, &store, &p, notify) {
+        Ok(e) => e,
+        Err(e) => return p.outcome().error(&e),
+    };
+    let started_ms = match wait_turn(ctx, &store, &p, &entry, notify) {
+        Ok(t) => t,
+        Err(out) => return *out,
+    };
+    let out = execute(ctx, &store, &p, &entry, started_ms, notify);
+    record(&store, ctx.queue.as_deref(), &out);
+    out
 }
 
-fn prepare(req: &Request, cfg: &Config) -> io::Result<std::process::Command> {
+/// Refusals, detection, hints and booking details.
+fn prepare(ctx: &Ctx, mut req: Request) -> std::result::Result<Prepared, Box<Outcome>> {
+    let cfg = &ctx.cfg;
+    if let Some(reason) = detect::refuse_reason(&req.argv) {
+        let fixed = detect::detached_compose(&req.argv);
+        return Err(Box::new(Outcome::default().ended(
+            EXIT_REFUSED,
+            "refused",
+            Some(messages::refused(&reason, fixed.as_deref())),
+        )));
+    }
+    let det = detect::detect(&req.argv, &cfg.kinds);
+    let kind = req.kind.clone().unwrap_or_else(|| det.kind_name().to_string());
+    let cost = scheduler::effective_cost(
+        req.cost.unwrap_or_else(|| crate::kinds::cost(&kind, &cfg.kinds)),
+        cfg.budget,
+    );
+    let label = match req.label.as_deref().map(str::trim) {
+        Some(l) if !l.is_empty() => l.to_string(),
+        _ if det.label.is_empty() => "command".into(),
+        _ => det.label.clone(),
+    };
+    let workers = |w: Workers| match w {
+        Workers::Vitest => cfg.vitest_workers,
+        Workers::CoreShare => tool_workers(ctx.machine.logical_cores, cost, cfg.budget),
+    };
+    let hints = detect::apply_hints(&req.argv, &det.tool, &workers, &|v| std::env::var_os(v).is_some());
+    if let Some(a) = hints.argv {
+        req.argv = a;
+    }
+    req.env.extend(hints.env);
+    req.needs = normalized(&req.needs);
+    let cwd = req
+        .cwd
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    Ok(Prepared {
+        req,
+        det,
+        kind,
+        cost,
+        label,
+        cwd,
+    })
+}
+
+fn normalized(needs: &[String]) -> Vec<String> {
+    let mut n: Vec<String> = needs
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    n.sort();
+    n.dedup();
+    n
+}
+
+/// Worker count for a tool: the job's share of the logical cores.
+pub fn tool_workers(cores: usize, cost: u32, budget: u32) -> u32 {
+    ((cores as u64 * cost as u64) / budget.max(1) as u64).max(1) as u32
+}
+
+/// True when an outer calmrun (still alive) already holds points for us.
+fn held_by_outer(ctx: &mut Ctx) -> bool {
+    std::env::var("CALMRUN_HELD")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .is_some_and(|held| held != std::process::id() && ctx.sys.start_time(held).is_some())
+}
+
+/// Nested run: no queueing, no history (the outer run records it).
+fn run_nested(p: &Prepared) -> Outcome {
+    let t0 = Instant::now();
+    let mut watch = Watcher::new(p, None, None, 0);
+    let result = command(p).and_then(|c| runner::run(c, false, |_| {}, &mut |pid| watch.check(pid)));
+    let mut out = finish(p, result, watch.reason);
+    out.run_ms = t0.elapsed().as_millis() as u64;
+    out
+}
+
+/// The command, ready to spawn.
+fn command(p: &Prepared) -> std::io::Result<Command> {
+    let req = &p.req;
     let mut cmd = match (req.shell, req.argv.first()) {
         (true, Some(line)) => runner::shell_command(line),
-        _ => {
-            let cwd = req
-                .cwd
-                .clone()
-                .or_else(|| std::env::current_dir().ok())
-                .unwrap_or_default();
-            runner::build(&req.argv, &cwd)?
-        }
+        _ => runner::build(&req.argv, &p.cwd)?,
     };
     if let Some(d) = &req.cwd {
         cmd.current_dir(d);
@@ -241,674 +391,385 @@ fn prepare(req: &Request, cfg: &Config) -> io::Result<std::process::Command> {
         let f = std::fs::File::create(log)?;
         cmd.stdin(Stdio::null()).stdout(f.try_clone()?).stderr(f);
     }
-    let _ = cfg;
     Ok(cmd)
 }
 
-/// Run the command for `req` through the queue.
-pub fn run(ctx: &mut Ctx, mut req: Request, notify: &mut dyn Notify) -> Outcome {
-    let cfg = ctx.cfg.clone();
-    let mut out = Outcome {
-        code: 0,
-        status: String::new(),
-        label: String::new(),
-        kind: String::new(),
-        cost: 0,
-        wait_ms: 0,
-        run_ms: 0,
-        message: None,
-        ticket: None,
-    };
-    if let Some(reason) = detect::refuse_reason(&req.argv) {
-        out.code = 2;
-        out.status = "refused".into();
-        let next = match detect::detached_compose(&req.argv) {
-            Some(fixed) => format!("calmrun -- {}", fixed.join(" ")),
-            None => "add -d after `up`, or run `docker compose up` outside calmrun".to_string(),
-        };
-        out.message = Some(format!("calmrun: refused: {reason}.\ncalmrun: next: {next}"));
-        return out;
-    }
-    if let Some(a) = detect::vitest_args(&req.argv, cfg.vitest_workers) {
-        req.argv = a;
-    }
-    let timeout = req.timeout;
-    let started_at = std::cell::Cell::new(None::<Instant>);
-    let mut watch = |_pid: u32| -> bool {
-        if req.cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
-            return true;
-        }
-        matches!((timeout, started_at.get()), (Some(t), Some(s)) if s.elapsed() > t)
-    };
-
-    // Nested: an outer calmrun already holds points for us.
-    if let Some(held) = std::env::var("CALMRUN_HELD")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-    {
-        if held != std::process::id() && ctx.sys.start_time(held).is_some() {
-            let t0 = Instant::now();
-            started_at.set(Some(t0));
-            match prepare(&req, &cfg).and_then(|c| runner::run(c, false, |_| {}, &mut watch)) {
-                Ok(e) => {
-                    out.code = e.code;
-                    out.status = e.code.to_string();
-                }
-                Err(e) => {
-                    let (c, m) = spawn_error(&req.argv, &e);
-                    out.code = c;
-                    out.message = Some(m);
-                    out.status = "spawn-failed".into();
-                }
-            }
-            out.run_ms = t0.elapsed().as_millis() as u64;
-            return out;
-        }
-    }
-
-    let det = detect::detect(&req.argv, &cfg.kinds);
-    let kind = req.kind.clone().unwrap_or_else(|| det.kind_name().to_string());
-    let cost = scheduler::effective_cost(
-        req.cost.unwrap_or_else(|| detect::kind_cost(&kind, &cfg.kinds)),
-        cfg.budget,
-    );
-    let label = req
-        .label
-        .clone()
-        .filter(|l| !l.trim().is_empty())
-        .unwrap_or_else(|| {
-            if det.label.is_empty() {
-                "command".into()
-            } else {
-                det.label.clone()
-            }
-        });
-    out.label = label.clone();
-    out.kind = kind.clone();
-    out.cost = cost;
-    // Share of the machine's cores this job's points stand for.
-    let workers = tool_workers(ctx.machine.logical_cores, cost, cfg.budget);
-    if let Some(a) = detect::gradle_args(&req.argv, workers) {
-        req.argv = a;
-    }
-    if det.tool == "cargo" && std::env::var_os("CARGO_BUILD_JOBS").is_none() {
-        req.env.push(("CARGO_BUILD_JOBS".into(), workers.to_string()));
-    }
-    let cwd = req
-        .cwd
-        .clone()
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."));
-    let keys = detect::exclusive_keys(
-        &detect::Detected {
-            kind: Some(kind.clone()),
-            ..det.clone()
-        },
-        &cwd,
-    );
-
-    let store = match ctx.store() {
-        Ok(s) => s,
-        Err(e) => {
-            out.code = 1;
-            out.status = "error".into();
-            out.message = Some(format!(
-                "calmrun: cannot open state dir {}: {e}",
-                ctx.home.display()
-            ));
-            return out;
-        }
-    };
+/// Add our entry, or take back a parked one with `--ticket`.
+fn enqueue(ctx: &mut Ctx, store: &Store, p: &Prepared, notify: &mut dyn Notify) -> Result<Job> {
     let me = std::process::id();
-    let my_start = ctx.sys.start_time(me).unwrap_or(0);
-    let queued_ms = now_ms();
     let mut entry = Job {
-        id: 0,
         pid: me,
-        pid_start: my_start,
-        label: label.clone(),
-        kind: kind.clone(),
-        cost,
-        keys,
-        cwd: cwd.to_string_lossy().to_string(),
-        high: req.high,
-        order: 0,
-        queued_ms,
-        started_ms: None,
-        child_pid: None,
-        parked_until: None,
-        mem_bytes: None,
-        disk_short: false,
-        needs: {
-            let mut n: Vec<String> = req
-                .needs
-                .iter()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            n.sort();
-            n.dedup();
-            n
-        },
+        pid_start: ctx.sys.start_time(me).unwrap_or(0),
+        label: p.label.clone(),
+        kind: p.kind.clone(),
+        cost: p.cost,
+        keys: detect::exclusive_keys(&p.kind, &p.det.tool, &p.cwd),
+        cwd: p.cwd.to_string_lossy().to_string(),
+        high: p.req.high,
+        queued_ms: now_ms(),
+        needs: p.req.needs.clone(),
+        ..Job::default()
     };
+    let ticket = p.req.ticket;
     let sys = &mut ctx.sys;
-    let ticket = req.ticket;
-    let enq = store.with_lock(|s| {
-        prune_dead(s, sys);
-        if let Some(t) = ticket {
-            if let Some(j) = s.jobs.iter_mut().find(|j| j.id == t && j.parked()) {
+    let resumed = store
+        .with_lock(|s| {
+            prune_dead(s, sys);
+            if let Some(j) = ticket.and_then(|t| s.jobs.iter_mut().find(|j| j.id == t && j.parked())) {
                 // Resume the kept place: same id, order and queue time.
                 entry.id = j.id;
                 entry.order = j.order;
                 entry.queued_ms = j.queued_ms;
-                entry.high = entry.high || j.high;
+                entry.high |= j.high;
                 *j = entry.clone();
-                return (entry.clone(), true);
+                return true;
             }
-        }
-        s.next_id += 1;
-        entry.id = s.next_id;
-        entry.order = s.next_order();
-        s.jobs.push(entry.clone());
-        (entry.clone(), false)
-    });
-    let entry = match enq {
-        Ok((e, resumed)) => {
-            if let (Some(t), false) = (ticket, resumed) {
-                notify.note(&format!(
-                    "calmrun: ticket {t} has expired or is unknown; joining the end of the line"
-                ));
-            }
-            e
-        }
-        Err(e) => {
-            out.code = 1;
-            out.status = "error".into();
-            out.message = Some(format!("calmrun: cannot lock queue state: {e}"));
-            return out;
-        }
-    };
-    let id = entry.id;
-    let queued_ms = entry.queued_ms;
-    let lim = ctx.limits();
-    let wait_started = Instant::now();
+            s.next_id += 1;
+            entry.id = s.next_id;
+            entry.order = s.next_order();
+            s.jobs.push(entry.clone());
+            false
+        })
+        .map_err(Error::State)?;
+    if let (Some(t), false) = (ticket, resumed) {
+        notify.note(&format!(
+            "calmrun: ticket {t} has expired or is unknown; joining the end of the line"
+        ));
+    }
+    Ok(entry)
+}
 
-    // Wait for our turn.
+/// What one poll found.
+enum Tick {
+    Started(u64),
+    Waiting {
+        line: Option<String>,
+        fingerprint: (usize, usize, usize),
+    },
+}
+
+/// Poll until the scheduler admits us. Returns the start time, or the outcome when the wait
+/// ends otherwise (cancelled, wait timeout, state error).
+fn wait_turn(
+    ctx: &mut Ctx,
+    store: &Store,
+    p: &Prepared,
+    entry: &Job,
+    notify: &mut dyn Notify,
+) -> std::result::Result<u64, Box<Outcome>> {
+    let limits = ctx.limits();
+    let wait_started = Instant::now();
+    let mut disk = DiskCheck::new(&p.cwd, ctx.cfg.min_free_disk_bytes);
     let mut last_line = String::from("waiting");
-    let mut disk = DiskCheck::new(&cwd, cfg.min_free_disk_bytes);
-    let started_ms = loop {
-        if cancelled(&req) {
-            let _ = store.with_lock(|s| s.jobs.retain(|j| j.id != id));
-            out.code = 130;
-            out.status = "cancelled".into();
-            out.wait_ms = now_ms().saturating_sub(queued_ms);
-            out.message = Some("calmrun: cancelled while waiting; left the queue".into());
-            return out;
+    let mut poll = POLL_MIN;
+    let mut last_fp = None;
+    loop {
+        if p.cancelled() {
+            let _ = store.with_lock(|s| s.jobs.retain(|j| j.id != entry.id));
+            let msg = "calmrun: cancelled while waiting; left the queue".to_string();
+            return Err(Box::new(waited(p, entry).ended(
+                runner::EXIT_INTERRUPTED,
+                "cancelled",
+                Some(msg),
+            )));
         }
-        if req.wait_timeout.is_some_and(|t| wait_started.elapsed() >= t) {
-            let until = now_ms() + TICKET_TTL_MS;
-            let _ = store.with_lock(|s| {
-                if let Some(j) = s.jobs.iter_mut().find(|j| j.id == id) {
-                    j.parked_until = Some(until);
-                }
-            });
-            let secs = req.wait_timeout.map_or(0, |t| t.as_secs());
-            let mut msg = format!(
-                "calmrun: not started within {secs}s ({}); your place in line is kept for 10 min.",
-                last_line.trim_start_matches("calmrun: ")
-            );
-            if let Some(h) = &req.rerun_hint {
-                msg.push_str(&format!(
-                    "\ncalmrun: next: {}",
-                    h.replace("{ticket}", &id.to_string())
-                ));
-            }
-            out.code = EXIT_WAIT_TIMEOUT;
-            out.status = "wait-timeout".into();
-            out.wait_ms = now_ms().saturating_sub(queued_ms);
-            out.message = Some(msg);
-            out.ticket = Some(id);
-            return out;
-        }
-        let free = ctx.sys.free_ram();
-        let now = now_ms();
+        let timed_out = p.req.wait_timeout.is_some_and(|t| wait_started.elapsed() >= t);
+        let want_line = timed_out || notify.wants_line();
+        let free_ram = ctx.sys.free_ram();
         let short = disk.short();
-        let sys = &mut ctx.sys;
-        let step = store.with_lock(|s| {
+        let tick = tick(ctx, store, entry, &disk, short, free_ram, limits, want_line)
+            .map_err(|e| Box::new(p.outcome().error(&e)))?;
+        match tick {
+            Tick::Started(t) => {
+                if short {
+                    notify.note(&disk_warning(&disk));
+                }
+                return Ok(t);
+            }
+            Tick::Waiting { line, fingerprint } => {
+                if let Some(l) = line {
+                    notify.waiting(&l);
+                    last_line = l;
+                }
+                if timed_out {
+                    return Err(Box::new(park(store, p, entry, &last_line)));
+                }
+                poll = if last_fp == Some(fingerprint) {
+                    (poll * 3 / 2).min(POLL_MAX)
+                } else {
+                    POLL_MIN
+                };
+                last_fp = Some(fingerprint);
+            }
+        }
+        sleep_unless_cancelled(poll, p);
+    }
+}
+
+/// One locked look at the queue: prune, publish our disk state, schedule.
+#[allow(clippy::too_many_arguments)]
+fn tick(
+    ctx: &mut Ctx,
+    store: &Store,
+    entry: &Job,
+    disk: &DiskCheck,
+    short: bool,
+    free_ram: u64,
+    limits: Limits,
+    want_line: bool,
+) -> Result<Tick> {
+    let now = now_ms();
+    let caps = &ctx.cfg.resources;
+    let sys = &mut ctx.sys;
+    store
+        .with_lock(|s| {
             prune_dead(s, sys);
-            if !s.jobs.iter().any(|j| j.id == id) {
+            match s.jobs.iter_mut().find(|j| j.id == entry.id) {
+                Some(j) => j.disk_short = short,
                 // Our entry vanished (state file removed by hand); put it back.
-                s.jobs.push(entry.clone());
+                None => s.jobs.push(Job {
+                    disk_short: short,
+                    ..entry.clone()
+                }),
             }
-            if let Some(j) = s.jobs.iter_mut().find(|j| j.id == id) {
-                j.disk_short = short;
-            }
-            let (admitted, blocked) = scheduler::plan_with(&s.jobs, now, free, lim, &cfg.resources);
-            if admitted.contains(&id) {
-                if let Some(j) = s.jobs.iter_mut().find(|j| j.id == id) {
+            let plan = scheduler::schedule(
+                &s.jobs,
+                &Inputs {
+                    now_ms: now,
+                    free_ram,
+                    limits,
+                    caps,
+                },
+            );
+            if plan.admits(entry.id) {
+                if let Some(j) = s.jobs.iter_mut().find(|j| j.id == entry.id) {
                     j.started_ms = Some(now);
                     j.disk_short = false;
                 }
-                return Ok(now);
+                return Tick::Started(now);
             }
-            Err(waiting_line(
-                s,
-                id,
-                &entry,
-                &blocked,
-                lim,
-                cost,
-                &disk,
-                now,
-                &cfg.resources,
-            ))
-        });
-        match step {
-            Ok(Ok(t)) => break t,
-            Ok(Err(line)) => {
-                notify.waiting(&line);
-                last_line = line;
+            let waiting = scheduler::waiting_in_order(&s.jobs);
+            let place = waiting.iter().position(|j| j.id == entry.id).unwrap_or(0);
+            let running = s.jobs.len() - waiting.len();
+            let line = want_line.then(|| {
+                let c = WaitContext {
+                    me: entry,
+                    budget: limits.budget,
+                    disk,
+                    caps,
+                    now_ms: now,
+                };
+                messages::waiting_line(s, &plan.reason(entry.id), &c)
+            });
+            Tick::Waiting {
+                line,
+                fingerprint: (s.jobs.len(), running, place),
             }
-            Err(e) => {
-                out.code = 1;
-                out.status = "error".into();
-                out.message = Some(format!("calmrun: cannot lock queue state: {e}"));
-                return out;
-            }
-        }
-        std::thread::sleep(POLL);
-    };
+        })
+        .map_err(Error::State)
+}
 
-    out.wait_ms = started_ms.saturating_sub(queued_ms);
-    if disk.short() {
-        notify.note(&format!(
-            "calmrun: warning: only {:.1} GB free on {} (wanted {:.1} GB); starting anyway \
-             because nothing else is running",
-            bytes_to_gb(disk.free),
-            disk.mount,
-            bytes_to_gb(cfg.min_free_disk_bytes)
-        ));
+fn sleep_unless_cancelled(total: Duration, p: &Prepared) {
+    let end = Instant::now() + total;
+    while Instant::now() < end && !p.cancelled() {
+        std::thread::sleep(CANCEL_CHECK.min(end.saturating_duration_since(Instant::now())));
     }
-    notify.started(out.wait_ms);
-    started_at.set(Some(Instant::now()));
-    let mut mem = memwatch::MemWatch::new(cfg.ceiling_bytes, cfg.critical_free_bytes);
-    let stop_reason: std::cell::RefCell<Option<memwatch::Stop>> = std::cell::RefCell::new(None);
-    let mut samples = 0u64;
-    let mut full_watch = |pid: u32| -> bool {
-        if watch(pid) {
-            return true;
+}
+
+fn waited(p: &Prepared, entry: &Job) -> Outcome {
+    Outcome {
+        wait_ms: now_ms().saturating_sub(entry.queued_ms),
+        ..p.outcome()
+    }
+}
+
+/// `--wait-timeout` passed: keep the place for a ticket and say how to resume.
+fn park(store: &Store, p: &Prepared, entry: &Job, last_line: &str) -> Outcome {
+    let until = now_ms() + TICKET_TTL_MS;
+    let _ = store.with_lock(|s| {
+        if let Some(j) = s.jobs.iter_mut().find(|j| j.id == entry.id) {
+            j.parked_until = Some(until);
         }
-        let Some(m) = mem.as_mut() else { return false };
+    });
+    let secs = p.req.wait_timeout.map_or(0, |t| t.as_secs());
+    let msg = messages::wait_timeout(
+        secs,
+        last_line,
+        p.req.rerun_hint.as_deref(),
+        entry.id,
+        TICKET_TTL_MS / 60_000,
+    );
+    let mut out = waited(p, entry).ended(EXIT_WAIT_TIMEOUT, "wait-timeout", Some(msg));
+    out.ticket = Some(entry.id);
+    out
+}
+
+fn disk_warning(disk: &DiskCheck) -> String {
+    format!(
+        "calmrun: warning: only {:.1} GB free on {} (wanted {:.1} GB); starting anyway because \
+         nothing else is running",
+        bytes_to_gb(disk.free),
+        disk.mount,
+        bytes_to_gb(disk.need)
+    )
+}
+
+/// Why the watcher stopped the command.
+enum StopReason {
+    Cancelled,
+    Timeout(Duration),
+    Memory(memwatch::Stop),
+}
+
+/// Asked every 250 ms while the command runs: cancel, timeout, memory.
+struct Watcher<'a> {
+    cancel: Option<&'a AtomicBool>,
+    timeout: Option<Duration>,
+    started: Instant,
+    mem: Option<MemWatch>,
+    /// Where to publish the tree's memory (not for nested runs).
+    store: Option<&'a Store>,
+    id: u64,
+    samples: u64,
+    reason: Option<StopReason>,
+}
+
+impl<'a> Watcher<'a> {
+    fn new(p: &'a Prepared, mem: Option<MemWatch>, store: Option<&'a Store>, id: u64) -> Watcher<'a> {
+        Watcher {
+            cancel: p.req.cancel.as_deref(),
+            timeout: p.req.timeout,
+            started: Instant::now(),
+            mem,
+            store,
+            id,
+            samples: 0,
+            reason: None,
+        }
+    }
+
+    fn check(&mut self, pid: u32) -> bool {
+        if self.cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+            self.reason = Some(StopReason::Cancelled);
+        } else if let Some(t) = self.timeout.filter(|t| self.started.elapsed() > *t) {
+            self.reason = Some(StopReason::Timeout(t));
+        } else if let Some(stop) = self.check_memory(pid) {
+            self.reason = Some(StopReason::Memory(stop));
+        }
+        self.reason.is_some()
+    }
+
+    fn check_memory(&mut self, pid: u32) -> Option<memwatch::Stop> {
+        let mem = self.mem.as_mut()?;
+        let (store, id) = (self.store, self.id);
         // Only the biggest running job is stopped when free RAM is critical.
         let mut biggest = |mine: u64| {
-            store
-                .with_lock(|s| {
+            store.is_none_or(|st| {
+                st.with_lock(|s| {
                     s.jobs
                         .iter()
                         .filter(|j| j.running() && j.id != id)
                         .all(|j| j.mem_bytes.unwrap_or(0) <= mine)
                 })
                 .unwrap_or(true)
+            })
         };
-        let (fresh, stop) = m.check(pid, &mut biggest);
+        let (fresh, stop) = mem.check(pid, &mut biggest);
         if fresh {
-            samples += 1;
-            if samples % 2 == 1 {
-                let used = m.used;
-                let _ = store.with_lock(|s| {
-                    if let Some(j) = s.jobs.iter_mut().find(|j| j.id == id) {
-                        j.mem_bytes = Some(used);
-                    }
+            self.samples += 1;
+            if self.samples % MEM_PUBLISH_EVERY == 1 {
+                let used = mem.used;
+                let _ = store.map(|st| {
+                    st.with_lock(|s| {
+                        if let Some(j) = s.jobs.iter_mut().find(|j| j.id == id) {
+                            j.mem_bytes = Some(used);
+                        }
+                    })
                 });
             }
         }
-        match stop {
-            Some(r) => {
-                *stop_reason.borrow_mut() = Some(r);
-                true
-            }
-            None => false,
-        }
-    };
-    let result = prepare(&req, &cfg).and_then(|mut cmd| {
-        cmd.env("CALMRUN_HELD", me.to_string());
-        runner::run(
-            cmd,
-            cfg.low_cpu,
-            |child| {
-                let _ = store.with_lock(|s| {
-                    if let Some(j) = s.jobs.iter_mut().find(|j| j.id == id) {
-                        j.child_pid = Some(child);
-                    }
-                });
-            },
-            &mut full_watch,
-        )
-    });
-    let stop_reason = stop_reason.into_inner();
-    out.run_ms = now_ms().saturating_sub(started_ms);
-    let _ = store.with_lock(|s| s.jobs.retain(|j| j.id != id));
-    match result {
-        Ok(e) if e.stopped && stop_reason.is_some() => {
-            let r = stop_reason.as_ref().expect("checked");
-            out.code = e.code;
-            out.status = r.status().into();
-            out.message = Some(r.message(&label));
-        }
-        Ok(e) if e.stopped && req.cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) => {
-            out.code = 130;
-            out.status = "cancelled".into();
-            out.message = Some(format!("calmrun: stopped {label}: the request was cancelled"));
-        }
-        Ok(e) if e.stopped => {
-            out.code = 124;
-            out.status = "timeout".into();
-            out.message = Some(format!(
-                "calmrun: stopped {label}: still running after the {}s timeout",
-                timeout.map_or(0, |t| t.as_secs())
-            ));
-        }
-        Ok(e) if runner::INTERRUPTED.load(Ordering::SeqCst) => {
-            out.code = e.code;
-            out.status = "interrupted".into();
-        }
-        Ok(e) => {
-            out.code = e.code;
-            out.status = e.code.to_string();
-        }
-        Err(e) => {
-            let (c, m) = spawn_error(&req.argv, &e);
-            out.code = c;
-            out.message = Some(m);
-            out.status = "spawn-failed".into();
-        }
+        stop
     }
+}
+
+/// Run the admitted command, then leave the queue.
+fn execute(
+    ctx: &Ctx,
+    store: &Store,
+    p: &Prepared,
+    entry: &Job,
+    started_ms: u64,
+    notify: &mut dyn Notify,
+) -> Outcome {
+    let wait_ms = started_ms.saturating_sub(entry.queued_ms);
+    notify.started(wait_ms);
+    let cfg = &ctx.cfg;
+    let mem = MemWatch::new(cfg.ceiling_bytes, cfg.critical_free_bytes);
+    let mut watch = Watcher::new(p, mem, Some(store), entry.id);
+    let id = entry.id;
+    let set_child = |child: u32| {
+        let _ = store.with_lock(|s| {
+            if let Some(j) = s.jobs.iter_mut().find(|j| j.id == id) {
+                j.child_pid = Some(child);
+            }
+        });
+    };
+    let result = command(p).and_then(|mut cmd| {
+        cmd.env("CALMRUN_HELD", std::process::id().to_string());
+        runner::run(cmd, cfg.low_cpu, set_child, &mut |pid| watch.check(pid))
+    });
+    let _ = store.with_lock(|s| s.jobs.retain(|j| j.id != id));
+    let mut out = finish(p, result, watch.reason);
+    out.wait_ms = wait_ms;
+    out.run_ms = now_ms().saturating_sub(started_ms);
+    out
+}
+
+/// Turn how the command ended into an outcome.
+fn finish(p: &Prepared, result: std::io::Result<runner::Ended>, reason: Option<StopReason>) -> Outcome {
+    let out = p.outcome();
+    let label = &p.label;
+    match (result, reason) {
+        (Err(source), _) => {
+            let program = p.req.argv.first().cloned().unwrap_or_default();
+            out.error(&Error::Spawn { program, source })
+        }
+        (Ok(e), Some(StopReason::Memory(stop))) if e.stopped => {
+            out.ended(e.code, stop.status(), Some(stop.message(label)))
+        }
+        (Ok(e), Some(StopReason::Cancelled)) if e.stopped => out.ended(
+            runner::EXIT_INTERRUPTED,
+            "cancelled",
+            Some(format!("calmrun: stopped {label}: the request was cancelled")),
+        ),
+        (Ok(e), Some(StopReason::Timeout(t))) if e.stopped => out.ended(
+            EXIT_TIMEOUT,
+            "timeout",
+            Some(format!(
+                "calmrun: stopped {label}: still running after the {}s timeout",
+                t.as_secs()
+            )),
+        ),
+        (Ok(e), _) if runner::INTERRUPTED.load(Ordering::SeqCst) => out.ended(e.code, "interrupted", None),
+        (Ok(e), _) => out.ended(e.code, &e.code.to_string(), None),
+    }
+}
+
+/// Append the run to `history.jsonl` (best effort: history is a convenience).
+fn record(store: &Store, queue: Option<&str>, out: &Outcome) {
     let _ = history::append(
-        &store.history_path(),
+        store.history_path(),
         &history::Record {
             at: history::format_utc(now_ms()),
-            label,
-            kind,
-            cost,
+            label: out.label.clone(),
+            kind: out.kind.clone(),
+            cost: out.cost,
             wait_ms: out.wait_ms,
             run_ms: out.run_ms,
             status: out.status.clone(),
-            queue: ctx.queue.clone(),
+            queue: queue.map(str::to_string),
         },
     );
-    out
-}
-
-/// Free space on the drive of a directory, refreshed every few seconds.
-pub struct DiskCheck {
-    disks: Option<sysinfo::Disks>,
-    target: String,
-    need: u64,
-    pub free: u64,
-    pub mount: String,
-    last: Option<Instant>,
-}
-
-impl DiskCheck {
-    pub fn new(dir: &Path, need: u64) -> DiskCheck {
-        let real = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-        let mut target = real.to_string_lossy().replace("\\\\?\\", "");
-        if cfg!(windows) {
-            target = target.to_lowercase();
-        }
-        DiskCheck {
-            disks: None,
-            target,
-            need,
-            free: u64::MAX,
-            mount: String::new(),
-            last: None,
-        }
-    }
-
-    /// True while the drive has less than the required free space.
-    pub fn short(&mut self) -> bool {
-        if self.need == 0 {
-            return false;
-        }
-        if self.last.is_none_or(|t| t.elapsed() >= Duration::from_secs(3)) {
-            self.last = Some(Instant::now());
-            let disks = self.disks.get_or_insert_with(|| {
-                sysinfo::Disks::new_with_refreshed_list()
-                    .unwrap_or_else(|_| sysinfo::Disks::new().expect("disk info unavailable"))
-            });
-            disks.refresh(true);
-            let best = disks
-                .iter()
-                .filter(|d| {
-                    let mut m = d.mount_point().to_string_lossy().to_string();
-                    if cfg!(windows) {
-                        m = m.to_lowercase();
-                    }
-                    self.target.starts_with(&m)
-                })
-                .max_by_key(|d| d.mount_point().as_os_str().len());
-            if let Some(d) = best {
-                self.free = d.available_space();
-                self.mount = d.mount_point().to_string_lossy().to_string();
-            }
-        }
-        self.free < self.need
-    }
-}
-
-fn running_summary(s: &State, now: u64) -> String {
-    let mut running: Vec<&Job> = s.jobs.iter().filter(|j| j.running()).collect();
-    running.sort_by_key(|j| j.started_ms);
-    let parts: Vec<String> = running
-        .iter()
-        .take(3)
-        .map(|j| {
-            let dir = Path::new(&j.cwd)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| j.cwd.clone());
-            let since = now.saturating_sub(j.started_ms.unwrap_or(now));
-            format!("{} in {dir} ({})", j.label, history::human_ms(since))
-        })
-        .collect();
-    let mut out = parts.join(", ");
-    if running.len() > 3 {
-        out.push_str(&format!(", +{} more", running.len() - 3));
-    }
-    out
-}
-
-/// Worker count for a tool: the job's share of the logical cores.
-pub fn tool_workers(cores: usize, cost: u32, budget: u32) -> u32 {
-    ((cores as u64 * cost as u64) / budget.max(1) as u64).max(1) as u32
-}
-
-#[allow(clippy::too_many_arguments)]
-fn waiting_line(
-    s: &State,
-    id: u64,
-    entry: &Job,
-    blocked: &[(u64, Block)],
-    lim: Limits,
-    cost: u32,
-    disk: &DiskCheck,
-    now: u64,
-    caps: &std::collections::BTreeMap<String, u32>,
-) -> String {
-    let line = waiting_reason(s, id, entry, blocked, lim, cost, disk, caps);
-    let running = running_summary(s, now);
-    if running.is_empty() {
-        line
-    } else {
-        format!("{line}; running: {running}")
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn waiting_reason(
-    s: &State,
-    id: u64,
-    entry: &Job,
-    blocked: &[(u64, Block)],
-    lim: Limits,
-    cost: u32,
-    disk: &DiskCheck,
-    caps: &std::collections::BTreeMap<String, u32>,
-) -> String {
-    let used = scheduler::used_points(&s.jobs, lim.budget);
-    let place = scheduler::waiting_in_order(&s.jobs)
-        .iter()
-        .position(|j| j.id == id)
-        .unwrap_or(0)
-        + 1;
-    let why = blocked
-        .iter()
-        .find(|(b, _)| *b == id)
-        .map(|(_, r)| r.clone())
-        .unwrap_or(Block::Order);
-    match why {
-        Block::Ram { free, needs } => format!(
-            "calmrun: waiting for RAM: {:.1} GB free, needs {:.1} GB",
-            bytes_to_gb(free),
-            bytes_to_gb(needs)
-        ),
-        Block::Resource(name) => {
-            let holders: Vec<String> = s
-                .jobs
-                .iter()
-                .filter(|j| j.running() && j.needs.contains(&name))
-                .map(|j| j.label.clone())
-                .collect();
-            format!(
-                "calmrun: waiting for resource \"{name}\" ({} of {} slot(s) held by {}), {} in line",
-                holders.len(),
-                scheduler::capacity(caps, &name),
-                holders.join(", "),
-                ordinal(place)
-            )
-        }
-        Block::Disk => format!(
-            "calmrun: waiting for disk space: {:.1} GB free on {}, needs {:.1} GB",
-            bytes_to_gb(disk.free),
-            disk.mount,
-            bytes_to_gb(disk.need)
-        ),
-        Block::Key => {
-            let holder = s
-                .jobs
-                .iter()
-                .find(|j| j.running() && j.keys.iter().any(|k| entry.keys.contains(k)))
-                .map(|j| j.label.clone())
-                .unwrap_or_default();
-            format!(
-                "calmrun: waiting — same dependency folder is in use by \"{holder}\", {} in line",
-                ordinal(place)
-            )
-        }
-        Block::Points { .. } | Block::Order => format!(
-            "calmrun: waiting — {used} of {} points in use, {} in line (needs {cost})",
-            lim.budget,
-            ordinal(place)
-        ),
-    }
-}
-
-fn job_json(j: &Job, now: u64, place: Option<usize>) -> serde_json::Value {
-    json!({
-        "id": j.id,
-        "label": j.label,
-        "kind": j.kind,
-        "cost": j.cost,
-        "pid": j.pid,
-        "child_pid": j.child_pid,
-        "mem_bytes": j.mem_bytes,
-        "needs": j.needs,
-        "cwd": j.cwd,
-        "high": j.high,
-        "since_ms": j.started_ms.unwrap_or(j.queued_ms),
-        "for_ms": now.saturating_sub(j.started_ms.unwrap_or(j.queued_ms)),
-        "place": place,
-    })
-}
-
-/// A pruned snapshot of the queue.
-pub fn snapshot(ctx: &mut Ctx) -> io::Result<State> {
-    let store = ctx.store()?;
-    let sys = &mut ctx.sys;
-    store.with_lock(|s| {
-        prune_dead(s, sys);
-        s.clone()
-    })
-}
-
-/// The data behind `status --json` and the MCP `queue_status` tool.
-pub fn status_json(ctx: &mut Ctx, state: &State) -> serde_json::Value {
-    let now = now_ms();
-    let free = ctx.sys.free_ram();
-    let budget = ctx.cfg.budget;
-    let used = scheduler::used_points(&state.jobs, budget);
-    let running: Vec<&Job> = state.jobs.iter().filter(|j| j.running()).collect();
-    let waiting = scheduler::waiting_in_order(&state.jobs);
-    json!({
-        "queue": ctx.queue,
-        "budget": budget,
-        "used": used,
-        "free_ram_bytes": free,
-        "min_free_bytes": ctx.cfg.min_free_bytes,
-        "running": running.iter().map(|j| job_json(j, now, None)).collect::<Vec<_>>(),
-        "waiting": waiting.iter().enumerate().map(|(i, j)| job_json(j, now, Some(i + 1))).collect::<Vec<_>>(),
-        "parked": state.jobs.iter().filter(|j| j.parked()).map(|j| json!({
-            "ticket": j.id,
-            "label": j.label,
-            "kind": j.kind,
-            "cost": j.cost,
-            "cwd": j.cwd,
-            "expires_in_ms": j.parked_until.unwrap_or(0).saturating_sub(now),
-        })).collect::<Vec<_>>(),
-        "warnings": stuck_warnings(state, now),
-    })
-}
-
-pub fn stuck_warnings(state: &State, now: u64) -> Vec<String> {
-    scheduler::waiting_in_order(&state.jobs)
-        .iter()
-        .filter(|j| now.saturating_sub(j.queued_ms) > STUCK_MS)
-        .map(|j| {
-            format!(
-                "\"{}\" (pid {}) has waited {} — is something stuck? Check the running jobs \
-                 with `calmrun status`, or move it forward with `calmrun bump {}`",
-                j.label,
-                j.pid,
-                history::human_ms(now - j.queued_ms),
-                j.label
-            )
-        })
-        .collect()
-}
-
-/// Move waiting jobs whose label contains `needle` to the front. Returns how many moved.
-pub fn bump(ctx: &mut Ctx, needle: &str) -> io::Result<usize> {
-    let needle = needle.to_lowercase();
-    let store = ctx.store()?;
-    let sys = &mut ctx.sys;
-    store.with_lock(|s| {
-        prune_dead(s, sys);
-        let min = s.jobs.iter().map(|j| j.order).min().unwrap_or(0);
-        let ids: Vec<u64> = scheduler::waiting_in_order(&s.jobs)
-            .into_iter()
-            .filter(|j| j.label.to_lowercase().contains(&needle))
-            .map(|j| j.id)
-            .collect();
-        let n = ids.len() as i64;
-        for (i, id) in ids.iter().enumerate() {
-            if let Some(j) = s.jobs.iter_mut().find(|j| j.id == *id) {
-                j.high = true;
-                j.order = min - n + i as i64;
-            }
-        }
-        ids.len()
-    })
 }
 
 /// Directory for captured logs (MCP runs).
@@ -918,7 +779,9 @@ pub fn log_dir(home: &Path) -> PathBuf {
 
 /// Keep the newest `keep` log files.
 pub fn prune_logs(dir: &Path, keep: usize) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     let mut files: Vec<(SystemTime, PathBuf)> = rd
         .flatten()
         .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
@@ -937,8 +800,7 @@ pub fn tail_lines(path: &Path, n: usize) -> String {
     let bytes = std::fs::read(path).unwrap_or_default();
     let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = text.lines().collect();
-    let start = lines.len().saturating_sub(n);
-    lines[start..].join("\n")
+    lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
 #[cfg(test)]
@@ -952,33 +814,30 @@ mod tests {
         assert_eq!(tool_workers(2, 1, 4), 1);
     }
 
-    fn job(id: u64, label: &str, cwd: &str, started: u64) -> Job {
-        Job {
-            id,
-            label: label.into(),
-            cwd: cwd.into(),
-            started_ms: Some(started),
-            ..Default::default()
+    #[test]
+    fn queue_ids() {
+        assert!(valid_queue_id("e2e-runs_1.x"));
+        for bad in ["", ".hidden", "../x", "a/b", "a b"] {
+            assert!(!valid_queue_id(bad), "{bad}");
         }
     }
 
     #[test]
-    fn running_summary_names_jobs_and_folders() {
-        let s = State {
-            next_id: 9,
-            jobs: vec![
-                job(1, "npx vitest", "/src/web", 10_000),
-                job(2, "cargo build", "/src/api", 60_000),
-                Job {
-                    id: 3,
-                    label: "waiting".into(),
-                    ..Default::default()
-                },
-            ],
-        };
-        assert_eq!(
-            running_summary(&s, 200_000),
-            "npx vitest in web (3m10s), cargo build in api (2m20s)"
-        );
+    fn needs_are_trimmed_sorted_unique() {
+        let n = normalized(&[" db".into(), "gpu".into(), "db".into(), "".into()]);
+        assert_eq!(n, vec!["db".to_string(), "gpu".to_string()]);
+    }
+
+    #[test]
+    fn logs_tail_and_prune() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("a.log");
+        std::fs::write(&f, "1\n2\n3\n4\n").unwrap();
+        assert_eq!(tail_lines(&f, 2), "3\n4");
+        for i in 0..5 {
+            std::fs::write(tmp.path().join(format!("{i}.log")), "x").unwrap();
+        }
+        prune_logs(tmp.path(), 3);
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 3);
     }
 }

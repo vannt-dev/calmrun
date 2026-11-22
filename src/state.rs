@@ -46,15 +46,18 @@ pub struct Job {
 }
 
 impl Job {
+    /// Whether the job has started.
     pub fn running(&self) -> bool {
         self.started_ms.is_some()
     }
 
+    /// Whether the job only holds a ticket.
     pub fn parked(&self) -> bool {
         self.parked_until.is_some()
     }
 }
 
+/// The contents of `state.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct State {
     #[serde(default)]
@@ -64,6 +67,7 @@ pub struct State {
 }
 
 impl State {
+    /// An order value behind every existing entry.
     pub fn next_order(&self) -> i64 {
         self.jobs
             .iter()
@@ -74,12 +78,18 @@ impl State {
     }
 }
 
+/// Rename retries when Windows briefly holds the target open (a reader or a scanner).
+const RENAME_RETRIES: u64 = 20;
+const RENAME_BACKOFF_MS: u64 = 10;
+
+/// A queue's files: `state.json`, `state.lock`, and the shared `history.jsonl`.
 pub struct Store {
     dir: PathBuf,
     history: PathBuf,
 }
 
 impl Store {
+    /// The default queue, in `dir`.
     pub fn open(dir: &Path) -> io::Result<Store> {
         std::fs::create_dir_all(dir)?;
         Ok(Store {
@@ -102,12 +112,14 @@ impl Store {
         self.dir.join("state.json")
     }
 
-    pub fn history_path(&self) -> PathBuf {
-        self.history.clone()
+    /// The shared `history.jsonl`.
+    pub fn history_path(&self) -> &Path {
+        &self.history
     }
 
-    /// Run `f` on the state with the lock held; writes the state back if `f` changed it.
-    /// The lock is an OS lock (LockFileEx / flock), so a crashed holder frees it.
+    /// Run `f` on the state with the lock held; writes the state back only if `f` changed
+    /// it. The state file is read once per call. The lock is an OS lock (LockFileEx /
+    /// flock), so a crashed holder frees it. Never sleep or spawn inside `f`.
     pub fn with_lock<R>(&self, f: impl FnOnce(&mut State) -> R) -> io::Result<R> {
         let lock = OpenOptions::new()
             .create(true)
@@ -116,40 +128,32 @@ impl Store {
             .write(true)
             .open(self.dir.join("state.lock"))?;
         lock.lock()?;
-        let before = self.read();
-        let mut state = before.clone();
+        let before = std::fs::read(self.state_path()).unwrap_or_default();
+        let mut state: State = serde_json::from_slice(&before).unwrap_or_default();
         let out = f(&mut state);
-        if state != before {
-            self.write(&state)?;
+        let after = serde_json::to_vec_pretty(&state).map_err(io::Error::other)?;
+        if after != before {
+            self.write(&after)?;
         }
         drop(lock);
         Ok(out)
     }
 
-    /// Read the state without the lock (for `status`; may be a moment stale).
-    pub fn read(&self) -> State {
-        match std::fs::read(self.state_path()) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-            Err(_) => State::default(),
-        }
-    }
-
-    fn write(&self, state: &State) -> io::Result<()> {
+    fn write(&self, bytes: &[u8]) -> io::Result<()> {
         let tmp = self.dir.join(format!("state.json.{}.tmp", std::process::id()));
         {
             let mut f = File::create(&tmp)?;
-            f.write_all(&serde_json::to_vec_pretty(state).map_err(io::Error::other)?)?;
+            f.write_all(bytes)?;
             f.sync_all()?;
         }
         let target = self.state_path();
         let mut last = None;
-        for attempt in 0..20 {
+        for attempt in 0..RENAME_RETRIES {
             match std::fs::rename(&tmp, &target) {
                 Ok(()) => return Ok(()),
-                // Windows: a reader or scanner may hold the target open for a moment.
                 Err(e) => {
                     last = Some(e);
-                    std::thread::sleep(Duration::from_millis(10 + attempt * 10));
+                    std::thread::sleep(Duration::from_millis(RENAME_BACKOFF_MS * (attempt + 1)));
                 }
             }
         }
@@ -205,7 +209,7 @@ mod tests {
                 s.jobs.push(job(2, 20));
             })
             .unwrap();
-        assert_eq!(store.read().jobs.len(), 2);
+        assert_eq!(store.with_lock(|s| s.jobs.len()).unwrap(), 2);
         let removed = store.with_lock(|s| prune(s, 0, |pid, _| pid == 10)).unwrap();
         assert_eq!(removed, 1);
         store
@@ -218,7 +222,9 @@ mod tests {
         assert_eq!(store.with_lock(|s| prune(s, 400, |pid, _| pid == 10)).unwrap(), 0);
         assert_eq!(store.with_lock(|s| prune(s, 600, |pid, _| pid == 10)).unwrap(), 1);
         assert_eq!(
-            store.read().jobs.iter().map(|j| j.id).collect::<Vec<_>>(),
+            store
+                .with_lock(|s| s.jobs.iter().map(|j| j.id).collect::<Vec<_>>())
+                .unwrap(),
             vec![1]
         );
     }
@@ -228,6 +234,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("state.json"), "{not json").unwrap();
         let store = Store::open(tmp.path()).unwrap();
-        assert!(store.read().jobs.is_empty());
+        assert!(store.with_lock(|s| s.jobs.is_empty()).unwrap());
     }
 }

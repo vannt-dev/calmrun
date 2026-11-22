@@ -19,6 +19,7 @@ dirs = "7.0.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 sysinfo = "0.40.4"
+thiserror = "2.0.21"
 toml = "1.2.2"
 
 [target."cfg(unix)".dependencies]

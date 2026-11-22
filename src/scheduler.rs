@@ -1,11 +1,13 @@
 //! The scheduling rules as a pure function: state snapshot in, waiters allowed to start out.
 //!
 //! Every waiting calmrun process runs the same function on the same snapshot and starts only
-//! if its own id is in the result, so the queue behaves as if one scheduler decided.
+//! if its own id is in the result, so the queue behaves as if one scheduler decided. The start
+//! conditions themselves are [`crate::gates`]; this module owns order and passing.
 
 use crate::state::Job;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 
+/// Queue-wide limits from the config.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
     pub budget: u32,
@@ -13,6 +15,16 @@ pub struct Limits {
     pub min_free_bytes: u64,
     /// A waiter older than this may no longer be passed (0 = strict order).
     pub pass_limit_ms: u64,
+}
+
+/// Everything besides the jobs that a scheduling pass looks at.
+#[derive(Debug, Clone, Copy)]
+pub struct Inputs<'a> {
+    pub now_ms: u64,
+    pub free_ram: u64,
+    pub limits: Limits,
+    /// Slots per named resource.
+    pub caps: &'a BTreeMap<String, u32>,
 }
 
 /// Cost as the scheduler sees it: at least 1, at most the budget.
@@ -28,6 +40,7 @@ pub fn waiting_in_order(jobs: &[Job]) -> Vec<&Job> {
     w
 }
 
+/// Points taken by running jobs.
 pub fn used_points(jobs: &[Job], budget: u32) -> u32 {
     jobs.iter()
         .filter(|j| j.running())
@@ -35,7 +48,12 @@ pub fn used_points(jobs: &[Job], budget: u32) -> u32 {
         .sum()
 }
 
-/// Why the first blocked waiter cannot start (for the waiting message).
+/// Slots of a named resource (a resource that is not configured has 1 slot).
+pub fn capacity(caps: &BTreeMap<String, u32>, name: &str) -> u32 {
+    caps.get(name).copied().unwrap_or(1).max(1)
+}
+
+/// Why a waiter cannot start (for the waiting message).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
     Points {
@@ -50,95 +68,104 @@ pub enum Block {
     Key,
     /// All slots of this named resource are taken.
     Resource(String),
+    /// Kept in line behind a waiter that may no longer be passed.
     Order,
 }
 
-/// Ids of the waiters that may start now, in queue order.
-#[cfg(test)]
-pub fn admissible(jobs: &[Job], now_ms: u64, free_ram: u64, lim: Limits) -> Vec<u64> {
-    plan(jobs, now_ms, free_ram, lim).0
+/// The outcome of one scheduling pass.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Plan {
+    /// Waiters that may start now, in queue order.
+    pub admitted: Vec<u64>,
+    /// Every other waiter with its reason.
+    pub blocked: Vec<(u64, Block)>,
 }
 
-/// Admitted ids plus, for every waiter that is not admitted, the reason.
+impl Plan {
+    /// Whether this waiter may start.
+    pub fn admits(&self, id: u64) -> bool {
+        self.admitted.contains(&id)
+    }
+
+    /// Why this waiter may not start (`Order` if it was not looked at).
+    pub fn reason(&self, id: u64) -> Block {
+        self.blocked
+            .iter()
+            .find(|(b, _)| *b == id)
+            .map_or(Block::Order, |(_, r)| r.clone())
+    }
+}
+
+/// Walk the waiters in order; admit each that passes every gate, taking its share of each.
+/// A later waiter may pass a blocked one only while no blocked waiter ahead of it has waited
+/// longer than the pass limit.
+pub fn schedule(jobs: &[Job], inputs: &Inputs) -> Plan {
+    schedule_with(jobs, inputs, crate::gates::standard(jobs, inputs))
+}
+
+/// [`schedule`] with an explicit list of gates.
+pub fn schedule_with<'a>(
+    jobs: &'a [Job],
+    inputs: &Inputs,
+    mut gates: Vec<Box<dyn crate::gates::Gate<'a> + 'a>>,
+) -> Plan {
+    let mut active = jobs.iter().any(Job::running);
+    let mut plan = Plan::default();
+    let mut barrier = false;
+    for w in waiting_in_order(jobs) {
+        let reason = if barrier {
+            Some(Block::Order)
+        } else {
+            gates.iter().find_map(|g| g.blocks(w, active))
+        };
+        match reason {
+            None => {
+                gates.iter_mut().for_each(|g| g.admit(w));
+                active = true;
+                plan.admitted.push(w.id);
+            }
+            Some(r) => {
+                let waited = inputs.now_ms.saturating_sub(w.queued_ms);
+                let limit = inputs.limits.pass_limit_ms;
+                barrier |= limit == 0 || waited > limit;
+                plan.blocked.push((w.id, r));
+            }
+        }
+    }
+    plan
+}
+
+/// Test shorthand: no named resources.
 #[cfg(test)]
 pub fn plan(jobs: &[Job], now_ms: u64, free_ram: u64, lim: Limits) -> (Vec<u64>, Vec<(u64, Block)>) {
     plan_with(jobs, now_ms, free_ram, lim, &BTreeMap::new())
 }
 
-/// Slots of a named resource (a resource that is not configured has 1 slot).
-pub fn capacity(caps: &BTreeMap<String, u32>, name: &str) -> u32 {
-    caps.get(name).copied().unwrap_or(1).max(1)
-}
-
-/// `plan` with named-resource capacities.
+/// Test shorthand with named resources.
+#[cfg(test)]
 pub fn plan_with(
     jobs: &[Job],
     now_ms: u64,
     free_ram: u64,
-    lim: Limits,
+    limits: Limits,
     caps: &BTreeMap<String, u32>,
 ) -> (Vec<u64>, Vec<(u64, Block)>) {
-    let mut held: HashMap<&str, u32> = HashMap::new();
-    for j in jobs.iter().filter(|j| j.running()) {
-        for n in &j.needs {
-            *held.entry(n.as_str()).or_default() += 1;
-        }
-    }
-    let mut used = used_points(jobs, lim.budget);
-    let mut keys: HashSet<&str> = jobs
-        .iter()
-        .filter(|j| j.running())
-        .flat_map(|j| j.keys.iter().map(String::as_str))
-        .collect();
-    let mut active = jobs.iter().any(Job::running);
-    let mut admitted = Vec::new();
-    let mut blocked = Vec::new();
-    // Once a skipped waiter has waited past the pass limit, nobody behind it may pass.
-    let mut barrier = false;
-    for w in waiting_in_order(jobs) {
-        let cost = effective_cost(w.cost, lim.budget);
-        let reason = if barrier {
-            Some(Block::Order)
-        } else if used + cost > lim.budget {
-            Some(Block::Points { used, needs: cost })
-        } else if w.keys.iter().any(|k| keys.contains(k.as_str())) {
-            Some(Block::Key)
-        } else if let Some(n) = w
-            .needs
-            .iter()
-            .find(|n| held.get(n.as_str()).copied().unwrap_or(0) >= capacity(caps, n))
-        {
-            Some(Block::Resource(n.clone()))
-        } else if active && w.disk_short {
-            Some(Block::Disk)
-        } else if active && lim.min_free_bytes > 0 && free_ram < lim.min_free_bytes {
-            Some(Block::Ram {
-                free: free_ram,
-                needs: lim.min_free_bytes,
-            })
-        } else {
-            None
-        };
-        match reason {
-            None => {
-                used += cost;
-                keys.extend(w.keys.iter().map(String::as_str));
-                for n in &w.needs {
-                    *held.entry(n.as_str()).or_default() += 1;
-                }
-                active = true;
-                admitted.push(w.id);
-            }
-            Some(r) => {
-                let waited = now_ms.saturating_sub(w.queued_ms);
-                if lim.pass_limit_ms == 0 || waited > lim.pass_limit_ms {
-                    barrier = true;
-                }
-                blocked.push((w.id, r));
-            }
-        }
-    }
-    (admitted, blocked)
+    let p = schedule(
+        jobs,
+        &Inputs {
+            now_ms,
+            free_ram,
+            limits,
+            caps,
+        },
+    );
+    (p.admitted, p.blocked)
+}
+
+/// Test shorthand: only the admitted ids.
+#[cfg(test)]
+pub fn admissible(jobs: &[Job], now_ms: u64, free_ram: u64, lim: Limits) -> Vec<u64> {
+    plan(jobs, now_ms, free_ram, lim).0
 }
 
 #[cfg(test)]
@@ -309,6 +336,31 @@ mod tests {
         // Unconfigured resources have one slot.
         let jobs = vec![need(job(1, 1, false), "x"), need(job(2, 1, false), "x")];
         assert_eq!(plan_with(&jobs, 2_000, 16 * GB, LIM, &caps).0, vec![1]);
+    }
+
+    #[test]
+    fn extra_gates_plug_in_without_touching_the_loop() {
+        /// Lets only even job ids start.
+        struct EvenOnly;
+        impl<'a> crate::gates::Gate<'a> for EvenOnly {
+            fn blocks(&self, w: &'a Job, _: bool) -> Option<Block> {
+                (w.id % 2 == 1).then_some(Block::Key)
+            }
+            fn admit(&mut self, _: &'a Job) {}
+        }
+        let jobs = vec![job(1, 1, false), job(2, 1, false), job(4, 1, false)];
+        let caps = BTreeMap::new();
+        let inputs = Inputs {
+            now_ms: 2_000,
+            free_ram: 16 * GB,
+            limits: LIM,
+            caps: &caps,
+        };
+        let mut gates = crate::gates::standard(&jobs, &inputs);
+        gates.push(Box::new(EvenOnly));
+        let plan = schedule_with(&jobs, &inputs, gates);
+        assert_eq!(plan.admitted, vec![2, 4]);
+        assert_eq!(plan.reason(1), Block::Key);
     }
 
     #[test]

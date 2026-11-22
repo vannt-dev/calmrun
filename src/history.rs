@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 
+/// One line of `history.jsonl`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Record {
     /// UTC time the run ended, `YYYY-MM-DDTHH:MM:SSZ`.
@@ -21,6 +22,7 @@ pub struct Record {
     pub queue: Option<String>,
 }
 
+/// Append one record (one write, so concurrent runs do not interleave).
 pub fn append(path: &Path, r: &Record) -> std::io::Result<()> {
     let mut line = serde_json::to_string(r).map_err(std::io::Error::other)?;
     line.push('\n');
@@ -52,6 +54,7 @@ fn civil_to_days(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// Unix milliseconds as `YYYY-MM-DDTHH:MM:SSZ`.
 pub fn format_utc(unix_ms: u64) -> String {
     let secs = (unix_ms / 1000) as i64;
     let (y, m, d) = days_to_civil(secs.div_euclid(86_400));
@@ -64,6 +67,7 @@ pub fn format_utc(unix_ms: u64) -> String {
     )
 }
 
+/// The inverse of [`format_utc`].
 pub fn parse_utc(s: &str) -> Option<u64> {
     let b = s.as_bytes();
     if b.len() < 19 {
@@ -75,6 +79,7 @@ pub fn parse_utc(s: &str) -> Option<u64> {
     u64::try_from(secs).ok().map(|s| s * 1000)
 }
 
+/// One row of `calmrun stats`.
 #[derive(Debug, Default, Clone, PartialEq, Serialize)]
 pub struct Row {
     pub label: String,
@@ -86,6 +91,7 @@ pub struct Row {
     pub avg_run_ms: u64,
 }
 
+/// Group the history since `since_ms` by label and kind.
 pub fn summarize(text: &str, since_ms: u64) -> Vec<Row> {
     let mut acc: BTreeMap<(String, String), (Row, u64, u64)> = BTreeMap::new();
     for line in text.lines() {
@@ -126,6 +132,7 @@ pub fn summarize(text: &str, since_ms: u64) -> Vec<Row> {
     rows
 }
 
+/// A duration for people: `1.5s`, `2m05s`, `2h03m`.
 pub fn human_ms(ms: u64) -> String {
     let s = ms / 1000;
     if s < 60 {

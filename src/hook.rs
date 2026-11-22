@@ -7,10 +7,12 @@
 //! `updatedInput` replaces the whole tool input. Printing nothing leaves the call alone.
 
 use crate::config::KindConfig;
-use crate::detect::{detect_words, parse, split_segments, tokenize, tool_name};
+use crate::detect::{detect_words, parse, tool_name};
+use crate::shell::{split_segments, tokenize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
+/// What the hook does with a heavy command.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Mode {
     Deny,
@@ -18,6 +20,7 @@ pub enum Mode {
 }
 
 impl Mode {
+    /// `CALMRUN_HOOK_MODE=rewrite` rewrites; anything else denies with a suggestion.
     pub fn from_env() -> Mode {
         match std::env::var("CALMRUN_HOOK_MODE").ok().as_deref().map(str::trim) {
             Some("rewrite") => Mode::Rewrite,

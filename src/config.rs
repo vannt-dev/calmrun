@@ -71,26 +71,52 @@ pub fn parse_resources(s: &str) -> BTreeMap<String, u32> {
         .collect()
 }
 
-pub fn default_budget(m: Machine) -> u32 {
-    let by_cores = m.logical_cores.saturating_sub(2) as u64;
-    let by_ram = (m.total_ram as f64 / GB / 4.0).floor() as u64;
-    by_cores.min(by_ram).max(2) as u32
+/// Cores kept free for the editor, the agents and the OS.
+const RESERVED_CORES: usize = 2;
+/// RAM per budget point.
+const GB_PER_POINT: f64 = 4.0;
+/// The budget never goes below this.
+const MIN_BUDGET: u64 = 2;
+/// Free-RAM gate: a fraction of the RAM, at least this many GB.
+const MIN_FREE_RAM_FRACTION: f64 = 1.0 / 8.0;
+const MIN_FREE_FLOOR_GB: f64 = 3.0;
+/// Memory ceiling for one job's tree, as a fraction of the RAM.
+const CEILING_FRACTION: f64 = 0.5;
+/// Critical free-RAM floor: a fraction of the RAM, at most this many GB.
+const CRITICAL_FRACTION: f64 = 0.05;
+const CRITICAL_MAX_GB: f64 = 1.0;
+/// Free space needed on the cwd's drive.
+pub const DEFAULT_MIN_FREE_DISK_GB: f64 = 5.0;
+/// Minutes a waiter may be passed.
+pub const DEFAULT_PASS_LIMIT_MIN: f64 = 10.0;
+
+fn ram_gb(m: Machine) -> f64 {
+    m.total_ram as f64 / GB
 }
 
+/// Logical cores − 2, capped at floor(RAM GB / 4), at least 2.
+pub fn default_budget(m: Machine) -> u32 {
+    let by_cores = m.logical_cores.saturating_sub(RESERVED_CORES) as u64;
+    let by_ram = (ram_gb(m) / GB_PER_POINT).floor() as u64;
+    by_cores.min(by_ram).max(MIN_BUDGET) as u32
+}
+
+/// max(3, RAM / 8) GB.
 pub fn default_min_free_gb(m: Machine) -> f64 {
-    (m.total_ram as f64 / GB / 8.0).max(3.0)
+    (ram_gb(m) * MIN_FREE_RAM_FRACTION).max(MIN_FREE_FLOOR_GB)
 }
 
 /// Half of the RAM.
 pub fn default_ceiling_gb(m: Machine) -> f64 {
-    m.total_ram as f64 / GB / 2.0
+    ram_gb(m) * CEILING_FRACTION
 }
 
 /// 5% of the RAM, at most 1 GB.
 pub fn default_critical_free_gb(m: Machine) -> f64 {
-    (m.total_ram as f64 / GB * 0.05).min(1.0)
+    (ram_gb(m) * CRITICAL_FRACTION).min(CRITICAL_MAX_GB)
 }
 
+/// 1 worker up to 4 cores, 2 below 12, else 3.
 pub fn default_vitest_workers(m: Machine) -> u32 {
     match m.logical_cores {
         0..=4 => 1,
@@ -104,18 +130,12 @@ pub fn home_dir() -> PathBuf {
     if let Some(h) = std::env::var_os("CALMRUN_HOME").filter(|v| !v.is_empty()) {
         return PathBuf::from(h);
     }
-    let base = if cfg!(target_os = "linux") {
-        dirs::state_dir()
-    } else if cfg!(target_os = "macos") {
-        dirs::data_dir()
-    } else {
-        dirs::data_local_dir()
-    };
-    base.or_else(|| dirs::home_dir().map(|h| h.join(".local").join("state")))
+    crate::sys::state_base_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("calmrun")
 }
 
+/// The config file: `CALMRUN_CONFIG`, else `config.toml` in the state directory.
 pub fn config_path(home: &Path) -> PathBuf {
     match std::env::var_os("CALMRUN_CONFIG").filter(|v| !v.is_empty()) {
         Some(p) => PathBuf::from(p),
@@ -123,6 +143,7 @@ pub fn config_path(home: &Path) -> PathBuf {
     }
 }
 
+/// Parse the config file; a missing file is an empty config.
 pub fn read_file_config(path: &Path) -> Result<FileConfig, String> {
     match std::fs::read_to_string(path) {
         Ok(text) => toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display())),
@@ -145,7 +166,7 @@ pub fn resolve(m: Machine, file: FileConfig, env: &dyn Fn(&str) -> Option<String
         .max(0.0);
     let pass_min = num("CALMRUN_PASS_MIN")
         .or(file.pass_limit_min)
-        .unwrap_or(10.0)
+        .unwrap_or(DEFAULT_PASS_LIMIT_MIN)
         .max(0.0);
     let vitest_workers = num("CALMRUN_VITEST_WORKERS")
         .map(|v| v as u32)
@@ -162,7 +183,7 @@ pub fn resolve(m: Machine, file: FileConfig, env: &dyn Fn(&str) -> Option<String
         .max(0.0);
     let disk_gb = num("CALMRUN_MIN_FREE_DISK_GB")
         .or(file.min_free_disk_gb)
-        .unwrap_or(5.0)
+        .unwrap_or(DEFAULT_MIN_FREE_DISK_GB)
         .max(0.0);
     let low_cpu = !matches!(
         env("CALMRUN_LOW_CPU").as_deref().map(str::trim),
@@ -188,6 +209,7 @@ pub fn resolve(m: Machine, file: FileConfig, env: &dyn Fn(&str) -> Option<String
     }
 }
 
+/// Bytes to (binary) gigabytes.
 pub fn bytes_to_gb(b: u64) -> f64 {
     b as f64 / GB
 }

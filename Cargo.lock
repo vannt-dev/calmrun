@@ -79,6 +79,7 @@ dependencies = [
  "serde_json",
  "sysinfo",
  "tempfile",
+ "thiserror",
  "toml",
  "windows-sys",
 ]

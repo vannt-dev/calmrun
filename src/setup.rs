@@ -4,11 +4,15 @@
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
+/// Marker before the calmrun block.
 pub const START: &str =
     "<!-- calmrun:start (managed by `calmrun setup`; remove with `calmrun setup --remove --write`) -->";
+/// Marker after the calmrun block.
 pub const END: &str = "<!-- calmrun:end -->";
+/// The hook command `--hook` installs.
 pub const HOOK_COMMAND: &str = "calmrun hook claude";
 
+/// The instructions inside the block.
 pub const BLOCK_BODY: &str = "## Heavy commands (calmrun)
 
 This computer is shared by several agents. Run heavy commands through the calmrun queue so
@@ -22,55 +26,92 @@ Playwright, docker compose, pytest, cargo/gradle builds.
 - `calmrun status` shows what runs and waits. Do not wrap light commands (git, ls, cat,
   package installs).";
 
+/// The whole block with its markers.
 pub fn block() -> String {
     format!("{START}\n{BLOCK_BODY}\n{END}\n")
 }
 
-/// One agent and where its global instructions live.
+/// A supported agent: where its global instruction file lives. Adding an agent = one entry.
+pub struct AgentSpec {
+    pub name: &'static str,
+    /// Environment variable that moves the agent's folder, if any.
+    pub env_dir: Option<&'static str>,
+    /// The folder under the home directory when the variable is not set.
+    pub home_dir: &'static [&'static str],
+    /// The instructions file inside that folder.
+    pub file: &'static str,
+    /// Another file in the folder that the agent reads instead, when it exists.
+    pub shadowed_by: Option<&'static str>,
+}
+
+/// Agents `setup` knows, with paths taken from each agent's documentation.
+pub const AGENTS: &[AgentSpec] = &[
+    AgentSpec {
+        name: "claude",
+        env_dir: Some("CLAUDE_CONFIG_DIR"),
+        home_dir: &[".claude"],
+        file: "CLAUDE.md",
+        shadowed_by: None,
+    },
+    AgentSpec {
+        name: "codex",
+        env_dir: Some("CODEX_HOME"),
+        home_dir: &[".codex"],
+        file: "AGENTS.md",
+        shadowed_by: Some("AGENTS.override.md"),
+    },
+    AgentSpec {
+        name: "gemini",
+        env_dir: None,
+        home_dir: &[".gemini"],
+        file: "GEMINI.md",
+        shadowed_by: None,
+    },
+    AgentSpec {
+        name: "opencode",
+        env_dir: None,
+        home_dir: &[".config", "opencode"],
+        file: "AGENTS.md",
+        shadowed_by: None,
+    },
+];
+
+/// The agent whose settings get the hook.
+const HOOK_AGENT: &str = "claude";
+
+/// One agent and where its global instructions live on this machine.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Agent {
     pub name: &'static str,
     pub file: PathBuf,
     /// The folder that shows the agent is installed.
     pub dir: PathBuf,
+    pub shadowed_by: Option<&'static str>,
 }
 
-pub const AGENT_NAMES: &[&str] = &["claude", "codex", "gemini", "opencode"];
-
-/// Known agents. `home` is the user's home; `env` looks up variables such as CODEX_HOME.
+/// Known agents resolved for `home`; `env` looks up variables such as CODEX_HOME.
 pub fn agents(home: &Path, env: &dyn Fn(&str) -> Option<String>) -> Vec<Agent> {
-    let dir_or = |var: &str, default: PathBuf| {
-        env(var)
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or(default)
-    };
-    let claude = dir_or("CLAUDE_CONFIG_DIR", home.join(".claude"));
-    let codex = dir_or("CODEX_HOME", home.join(".codex"));
-    let gemini = home.join(".gemini");
-    let opencode = home.join(".config").join("opencode");
-    vec![
-        Agent {
-            name: "claude",
-            file: claude.join("CLAUDE.md"),
-            dir: claude,
-        },
-        Agent {
-            name: "codex",
-            file: codex.join("AGENTS.md"),
-            dir: codex,
-        },
-        Agent {
-            name: "gemini",
-            file: gemini.join("GEMINI.md"),
-            dir: gemini,
-        },
-        Agent {
-            name: "opencode",
-            file: opencode.join("AGENTS.md"),
-            dir: opencode,
-        },
-    ]
+    AGENTS
+        .iter()
+        .map(|spec| {
+            let dir = spec
+                .env_dir
+                .and_then(env)
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    spec.home_dir
+                        .iter()
+                        .fold(home.to_path_buf(), |p, part| p.join(part))
+                });
+            Agent {
+                name: spec.name,
+                file: dir.join(spec.file),
+                dir,
+                shadowed_by: spec.shadowed_by,
+            }
+        })
+        .collect()
 }
 
 fn find_block(text: &str) -> Option<(usize, usize)> {
@@ -178,6 +219,7 @@ pub fn unmerge_hook(mut settings: Value) -> Option<Value> {
     Some(settings)
 }
 
+/// What `setup` was asked to do.
 pub struct Options {
     pub write: bool,
     pub remove: bool,
@@ -186,146 +228,169 @@ pub struct Options {
     pub home: PathBuf,
 }
 
+/// Text to print and the exit code.
+#[derive(Default)]
+struct Report {
+    text: String,
+    code: i32,
+}
+
+impl Report {
+    fn line(&mut self, s: String) {
+        self.text.push_str(&s);
+        self.text.push('\n');
+    }
+
+    fn fail(&mut self, s: String) {
+        self.line(s);
+        self.code = 1;
+    }
+}
+
 /// Run setup; returns the report to print and the exit code.
 pub fn run(opts: &Options, env: &dyn Fn(&str) -> Option<String>) -> (String, i32) {
-    let mut out = String::new();
     let all = agents(&opts.home, env);
-    let chosen: Vec<Agent> = match &opts.agents {
-        Some(names) => {
-            let mut v = Vec::new();
-            for n in names {
-                match all.iter().find(|a| a.name == n.as_str()) {
-                    Some(a) => v.push(a.clone()),
-                    None => {
-                        return (
-                            format!(
-                                "calmrun: unknown agent \"{n}\"; known: {}\n",
-                                AGENT_NAMES.join(", ")
-                            ),
-                            2,
-                        )
-                    }
-                }
-            }
-            v
-        }
-        // By default only agents that look installed (their folder exists).
-        None => all.iter().filter(|a| a.dir.is_dir()).cloned().collect(),
+    let chosen = match choose(&all, opts.agents.as_deref()) {
+        Ok(c) => c,
+        Err(msg) => return (msg, 2),
     };
+    let mut r = Report::default();
     if chosen.is_empty() {
-        out += "calmrun: no agent folders found; name them with --agents claude,codex,gemini,opencode\n";
-        return (out, 1);
+        r.fail(
+            "calmrun: no agent folders found; name them with --agents claude,codex,gemini,opencode".into(),
+        );
+        return (r.text, r.code);
     }
-    let verb = if opts.write { "" } else { "would " };
-    let mut code = 0;
     for a in &chosen {
-        let old = std::fs::read_to_string(&a.file).unwrap_or_default();
-        let new = if opts.remove {
-            without_block(&old)
-        } else {
-            with_block(&old)
-        };
-        let action = if new == old {
-            "unchanged".to_string()
-        } else if opts.remove {
-            format!("{verb}remove the calmrun block")
-        } else if find_block(&old).is_some() {
-            format!("{verb}update the calmrun block")
-        } else if a.file.exists() {
-            format!("{verb}append the calmrun block")
-        } else {
-            format!("{verb}create the file with the calmrun block")
-        };
-        out += &format!("{:<9} {}: {action}\n", a.name, a.file.display());
-        // Codex reads AGENTS.override.md instead of AGENTS.md when it exists.
-        let override_md = a.dir.join("AGENTS.override.md");
-        if a.name == "codex" && override_md.is_file() && !opts.remove {
-            out += &format!(
-                "          note: {} exists and Codex reads it instead; copy the block there too\n",
-                override_md.display()
-            );
-        }
-        if opts.write && new != old {
-            let res = a
-                .file
-                .parent()
-                .map_or(Ok(()), std::fs::create_dir_all)
-                .and_then(|_| std::fs::write(&a.file, &new));
-            if let Err(e) = res {
-                out += &format!("calmrun: cannot write {}: {e}\n", a.file.display());
-                code = 1;
-            }
-        }
+        apply_block(&mut r, a, opts);
     }
     if opts.hook {
-        let claude = all.iter().find(|a| a.name == "claude").expect("claude is known");
-        let path = claude.dir.join("settings.json");
-        let text = std::fs::read_to_string(&path).unwrap_or_default();
-        let parsed: Result<Value, _> = if text.trim().is_empty() {
-            Ok(json!({}))
-        } else {
-            serde_json::from_str(&text)
-        };
-        match parsed {
-            Err(e) => {
-                out += &format!(
-                    "calmrun: {} is not valid JSON ({e}); left it alone\n",
-                    path.display()
-                );
-                code = 1;
-            }
-            Ok(v) => {
-                let changed = if opts.remove {
-                    unmerge_hook(v)
-                } else {
-                    merge_hook(v)
-                };
-                match changed {
-                    None => out += &format!("hook      {}: unchanged\n", path.display()),
-                    Some(nv) => {
-                        let what = if opts.remove { "remove" } else { "add" };
-                        out += &format!(
-                            "hook      {}: {verb}{what} the PreToolUse hook (`{HOOK_COMMAND}`, matcher Bash|PowerShell)\n",
-                            path.display()
-                        );
-                        if opts.write {
-                            let backup = path.with_extension("json.calmrun.bak");
-                            let res = (|| -> std::io::Result<()> {
-                                if path.exists() {
-                                    std::fs::copy(&path, &backup)?;
-                                }
-                                if let Some(p) = path.parent() {
-                                    std::fs::create_dir_all(p)?;
-                                }
-                                let mut s =
-                                    serde_json::to_string_pretty(&nv).map_err(std::io::Error::other)?;
-                                s.push('\n');
-                                std::fs::write(&path, s)
-                            })();
-                            match res {
-                                Ok(()) if path.exists() && backup.exists() => {
-                                    out += &format!("          backup: {}\n", backup.display())
-                                }
-                                Ok(()) => {}
-                                Err(e) => {
-                                    out += &format!("calmrun: cannot write {}: {e}\n", path.display());
-                                    code = 1;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        if let Some(a) = all.iter().find(|a| a.name == HOOK_AGENT) {
+            apply_hook(&mut r, &a.dir.join("settings.json"), opts);
         }
     }
     if !opts.write {
         if !opts.remove {
-            out += "\nThe block:\n\n";
-            out += &block();
+            r.text += "\nThe block:\n\n";
+            r.text += &block();
         }
-        out += "\nNothing was changed. Run again with --write to apply.\n";
+        r.text += "\nNothing was changed. Run again with --write to apply.\n";
     }
-    (out, code)
+    (r.text, r.code)
+}
+
+/// The agents named with `--agents`, or by default those whose folder exists.
+fn choose(all: &[Agent], names: Option<&[String]>) -> Result<Vec<Agent>, String> {
+    let Some(names) = names else {
+        return Ok(all.iter().filter(|a| a.dir.is_dir()).cloned().collect());
+    };
+    names
+        .iter()
+        .map(|n| {
+            all.iter().find(|a| a.name == n.as_str()).cloned().ok_or_else(|| {
+                let known: Vec<&str> = AGENTS.iter().map(|s| s.name).collect();
+                format!("calmrun: unknown agent \"{n}\"; known: {}\n", known.join(", "))
+            })
+        })
+        .collect()
+}
+
+fn verb(opts: &Options) -> &'static str {
+    if opts.write {
+        ""
+    } else {
+        "would "
+    }
+}
+
+fn write_file(path: &Path, text: &str) -> std::io::Result<()> {
+    path.parent().map_or(Ok(()), std::fs::create_dir_all)?;
+    std::fs::write(path, text)
+}
+
+fn apply_block(r: &mut Report, a: &Agent, opts: &Options) {
+    let old = std::fs::read_to_string(&a.file).unwrap_or_default();
+    let new = if opts.remove {
+        without_block(&old)
+    } else {
+        with_block(&old)
+    };
+    let v = verb(opts);
+    let action = match () {
+        _ if new == old => "unchanged".to_string(),
+        _ if opts.remove => format!("{v}remove the calmrun block"),
+        _ if find_block(&old).is_some() => format!("{v}update the calmrun block"),
+        _ if a.file.exists() => format!("{v}append the calmrun block"),
+        _ => format!("{v}create the file with the calmrun block"),
+    };
+    r.line(format!("{:<9} {}: {action}", a.name, a.file.display()));
+    if let Some(shadow) = a
+        .shadowed_by
+        .map(|f| a.dir.join(f))
+        .filter(|p| p.is_file() && !opts.remove)
+    {
+        r.line(format!(
+            "          note: {} exists and {} reads it instead; copy the block there too",
+            shadow.display(),
+            a.name
+        ));
+    }
+    if opts.write && new != old {
+        if let Err(e) = write_file(&a.file, &new) {
+            r.fail(format!("calmrun: cannot write {}: {e}", a.file.display()));
+        }
+    }
+}
+
+fn apply_hook(r: &mut Report, path: &Path, opts: &Options) {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let parsed = if text.trim().is_empty() {
+        Ok(json!({}))
+    } else {
+        serde_json::from_str::<Value>(&text)
+    };
+    let settings = match parsed {
+        Ok(v) => v,
+        Err(e) => {
+            return r.fail(format!(
+                "calmrun: {} is not valid JSON ({e}); left it alone",
+                path.display()
+            ))
+        }
+    };
+    let changed = if opts.remove {
+        unmerge_hook(settings)
+    } else {
+        merge_hook(settings)
+    };
+    let Some(new) = changed else {
+        return r.line(format!("hook      {}: unchanged", path.display()));
+    };
+    let what = if opts.remove { "remove" } else { "add" };
+    r.line(format!(
+        "hook      {}: {}{what} the PreToolUse hook (`{HOOK_COMMAND}`, matcher Bash|PowerShell)",
+        path.display(),
+        verb(opts)
+    ));
+    if !opts.write {
+        return;
+    }
+    let backup = path.with_extension("json.calmrun.bak");
+    let res = (|| -> std::io::Result<bool> {
+        let had = path.exists();
+        if had {
+            std::fs::copy(path, &backup)?;
+        }
+        let mut s = serde_json::to_string_pretty(&new).map_err(std::io::Error::other)?;
+        s.push('\n');
+        write_file(path, &s)?;
+        Ok(had)
+    })();
+    match res {
+        Ok(true) => r.line(format!("          backup: {}", backup.display())),
+        Ok(false) => {}
+        Err(e) => r.fail(format!("calmrun: cannot write {}: {e}", path.display())),
+    }
 }
 
 #[cfg(test)]
