@@ -17,7 +17,7 @@ use serde_json::json;
 use state::{Job, State, Store};
 use std::collections::HashSet;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sys::Sys;
@@ -85,14 +85,8 @@ fn main() {
             target: HookTarget::Claude,
         }) => cmd_hook(),
         Some(Sub::Init { force }) => cmd_init(force),
-        Some(Sub::Probe {
-            ref log,
-            ref id,
-            sleep_ms,
-            exit,
-            print_args,
-            ref rest,
-        }) => cmd_probe(log.as_deref(), id, sleep_ms, exit, print_args, rest),
+        Some(Sub::Probe(ref a)) => cmd_probe(a),
+        Some(Sub::CtrlC { pid }) => cmd_ctrl_c(pid),
         None if cli.command.is_empty() => {
             use clap::CommandFactory;
             let _ = Cli::command().print_help();
@@ -124,7 +118,9 @@ fn run_queued(cli: Cli) -> i32 {
     {
         if held != std::process::id() && sys.start_time(held).is_some() {
             return match runner::build(&argv) {
-                Ok(cmd) => runner::run(cmd, false, |_| {}).unwrap_or_else(|e| spawn_error(&argv, e)),
+                Ok(cmd) => runner::run(cmd, false, |_| {}, &mut |_| false)
+                    .map(|e| e.code)
+                    .unwrap_or_else(|e| spawn_error(&argv, e)),
                 Err(e) => spawn_error(&argv, e),
             };
         }
@@ -281,18 +277,24 @@ fn run_queued(cli: Cli) -> i32 {
     let wait_ms = started_ms.saturating_sub(queued_ms);
     let result = runner::build(&argv).and_then(|mut cmd| {
         cmd.env("CALMRUN_HELD", me.to_string());
-        runner::run(cmd, cfg.low_cpu, |child| {
-            let _ = store.with_lock(|s| {
-                if let Some(j) = s.jobs.iter_mut().find(|j| j.id == id) {
-                    j.child_pid = Some(child);
-                }
-            });
-        })
+        runner::run(
+            cmd,
+            cfg.low_cpu,
+            |child| {
+                let _ = store.with_lock(|s| {
+                    if let Some(j) = s.jobs.iter_mut().find(|j| j.id == id) {
+                        j.child_pid = Some(child);
+                    }
+                });
+            },
+            &mut |_| false,
+        )
     });
     let run_ms = now_ms().saturating_sub(started_ms);
     let _ = store.with_lock(|s| s.jobs.retain(|j| j.id != id));
     let (code, status) = match result {
-        Ok(c) => (c, c.to_string()),
+        Ok(e) if runner::INTERRUPTED.load(Ordering::SeqCst) => (e.code, "interrupted".to_string()),
+        Ok(e) => (e.code, e.code.to_string()),
         Err(e) => (spawn_error(&argv, e), "spawn-failed".to_string()),
     };
     let _ = history::append(
@@ -548,27 +550,49 @@ fn cmd_init(force: bool) -> i32 {
     }
 }
 
-fn cmd_probe(
-    log: Option<&Path>,
-    id: &str,
-    sleep_ms: u64,
-    exit: i32,
-    print_args: bool,
-    rest: &[String],
-) -> i32 {
+fn cmd_probe(a: &cli::ProbeArgs) -> i32 {
     use std::io::Write;
-    if print_args {
-        println!("{}", serde_json::to_string(rest).unwrap_or_default());
+    if a.print_args {
+        println!("{}", serde_json::to_string(&a.rest).unwrap_or_default());
+    }
+    if let Some(pidfile) = &a.spawn_daemon {
+        let mut c = std::process::Command::new(std::env::current_exe().unwrap_or_else(|_| "calmrun".into()));
+        c.args(["__probe", "--sleep-ms", "6000"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            c.process_group(0);
+        }
+        if let Ok(child) = c.spawn() {
+            let _ = std::fs::write(pidfile, child.id().to_string());
+        }
     }
     let mark = |what: &str| {
-        if let Some(p) = log {
+        if let Some(p) = &a.log {
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
-                let _ = writeln!(f, "{what} {id} {}", now_ms());
+                // One write per line: concurrent appends must not interleave.
+                let _ = f.write_all(format!("{what} {} {}\n", a.id, now_ms()).as_bytes());
             }
         }
     };
     mark("start");
-    std::thread::sleep(Duration::from_millis(sleep_ms));
+    std::thread::sleep(Duration::from_millis(a.sleep_ms));
     mark("end");
-    exit
+    a.exit
+}
+
+fn cmd_ctrl_c(pid: u32) -> i32 {
+    #[cfg(windows)]
+    let ok = runner::win::send_ctrl_c(pid);
+    #[cfg(unix)]
+    // SAFETY: plain syscall.
+    let ok = unsafe { libc::kill(pid as i32, libc::SIGINT) == 0 };
+    if ok {
+        0
+    } else {
+        1
+    }
 }

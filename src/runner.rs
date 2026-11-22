@@ -13,6 +13,12 @@ pub static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 pub static CHILD_PGID: AtomicI32 = AtomicI32::new(0);
 
 pub fn install_signal_handler() {
+    #[cfg(windows)]
+    // SAFETY: plain console call. A parent may have started us with Ctrl+C ignored (that flag
+    // is inherited); turn processing back on so we and the command can react to it.
+    unsafe {
+        windows_sys::Win32::System::Console::SetConsoleCtrlHandler(None, 0);
+    }
     let _ = ctrlc::set_handler(|| {
         INTERRUPTED.store(true, Ordering::SeqCst);
         #[cfg(unix)]
@@ -196,55 +202,190 @@ pub mod win {
         caret(&caret(&quoted))
     }
 
-    /// Put this process in a job that kills every process in it when the last handle closes,
-    /// so the command's whole tree dies with calmrun. The child inherits the job; a daemon that
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    /// A Job Object holding the command's process tree. While `KILL_ON_JOB_CLOSE` is set, the
+    /// whole tree dies when calmrun's handle closes (calmrun exits or is killed). A daemon that
     /// asks to break away (CREATE_BREAKAWAY_FROM_JOB) may.
-    pub fn join_kill_on_close_job() {
-        use windows_sys::Win32::System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    pub struct Job(HANDLE);
+
+    impl Job {
+        pub fn new() -> Option<Job> {
+            // SAFETY: plain Win32 call; null name and attributes are allowed.
+            let h = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if h.is_null() {
+                return None;
+            }
+            let job = Job(h);
+            job.set_flags(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK);
+            Some(job)
+        }
+
+        fn set_flags(&self, flags: u32) -> bool {
+            // SAFETY: the struct is plain data and the handle is ours.
+            unsafe {
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = flags;
+                SetInformationJobObject(
+                    self.0,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const core::ffi::c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                ) != 0
+            }
+        }
+
+        pub fn assign(&self, process: HANDLE) -> bool {
+            // SAFETY: both handles are valid for the duration of the call.
+            unsafe { AssignProcessToJobObject(self.0, process) != 0 }
+        }
+
+        /// After a normal exit: let processes the command left behind (build daemons) live on.
+        pub fn release(&self) {
+            self.set_flags(JOB_OBJECT_LIMIT_BREAKAWAY_OK);
+        }
+
+        pub fn terminate(&self, code: u32) {
+            // SAFETY: the handle is ours.
+            unsafe {
+                TerminateJobObject(self.0, code);
+            }
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: closing our own handle once.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// Resume every thread of a process started with CREATE_SUSPENDED.
+    pub fn resume_threads(pid: u32) {
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
         };
-        use windows_sys::Win32::System::Threading::GetCurrentProcess;
-        // SAFETY: Win32 calls with valid arguments; the job handle is deliberately kept open
-        // for the life of the process.
+        use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+        // SAFETY: standard Toolhelp walk; every handle opened here is closed here.
         unsafe {
-            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if job.is_null() {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if snap.is_null() || snap == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
                 return;
             }
-            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            info.BasicLimitInformation.LimitFlags =
-                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
-            let ok = SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                &info as *const _ as *const core::ffi::c_void,
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            );
-            if ok != 0 {
-                AssignProcessToJobObject(job, GetCurrentProcess());
+            let mut te: THREADENTRY32 = std::mem::zeroed();
+            te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+            let mut ok = Thread32First(snap, &mut te) != 0;
+            while ok {
+                if te.th32OwnerProcessID == pid {
+                    let t = OpenThread(THREAD_SUSPEND_RESUME, 0, te.th32ThreadID);
+                    if !t.is_null() {
+                        ResumeThread(t);
+                        CloseHandle(t);
+                    }
+                }
+                ok = Thread32Next(snap, &mut te) != 0;
             }
+            CloseHandle(snap);
+        }
+    }
+
+    /// Test helper: deliver Ctrl+C to the console that `pid` is attached to.
+    pub fn send_ctrl_c(pid: u32) -> bool {
+        use windows_sys::Win32::System::Console::{
+            AttachConsole, FreeConsole, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler, CTRL_C_EVENT,
+        };
+        // SAFETY: plain console calls; we ignore Ctrl+C ourselves before raising it.
+        unsafe {
+            FreeConsole();
+            if AttachConsole(pid) == 0 {
+                return false;
+            }
+            SetConsoleCtrlHandler(None, 1);
+            let ok = GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0) != 0;
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            FreeConsole();
+            ok
         }
     }
 }
 
-/// Spawn and wait. Returns the exit code to pass on (128+signal on Unix) and the child pid
-/// via `on_spawn`.
-pub fn run(mut cmd: Command, low_cpu: bool, on_spawn: impl FnOnce(u32)) -> io::Result<i32> {
+/// How the command ended.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ended {
+    /// Exit code to pass on (128+signal on Unix, 130 after Ctrl+C, 137 after a stop).
+    pub code: i32,
+    /// True when `watch` asked to stop the tree.
+    pub stopped: bool,
+}
+
+const WATCH_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+#[cfg(windows)]
+const STATUS_CONTROL_C_EXIT: i32 = 0xC000_013Au32 as i32;
+
+/// Spawn and wait. `on_spawn` gets the child pid; `watch` is asked about every 250 ms and
+/// returns true to stop the whole tree. After a normal exit, processes the command left
+/// running on purpose (build daemons) are left alone; after Ctrl+C, a stop, or calmrun being
+/// killed, the whole tree is ended.
+pub fn run(
+    mut cmd: Command,
+    low_cpu: bool,
+    on_spawn: impl FnOnce(u32),
+    watch: &mut dyn FnMut(u32) -> bool,
+) -> io::Result<Ended> {
     #[cfg(windows)]
     {
+        use std::os::windows::io::AsRawHandle;
         use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::System::Threading::BELOW_NORMAL_PRIORITY_CLASS;
-        win::join_kill_on_close_job();
+        use windows_sys::Win32::System::Threading::{BELOW_NORMAL_PRIORITY_CLASS, CREATE_SUSPENDED};
+        let job = win::Job::new();
+        let mut flags = CREATE_SUSPENDED;
         if low_cpu {
-            cmd.creation_flags(BELOW_NORMAL_PRIORITY_CLASS);
+            flags |= BELOW_NORMAL_PRIORITY_CLASS;
         }
+        cmd.creation_flags(flags);
         let mut child = cmd.spawn()?;
+        if let Some(j) = &job {
+            j.assign(child.as_raw_handle() as _);
+        }
+        win::resume_threads(child.id());
         on_spawn(child.id());
-        // Ctrl+C reaches the child through the shared console; we just wait for it.
-        let status = child.wait()?;
-        Ok(code_of(status))
+        // Ctrl+C reaches the child through the shared console; we only watch.
+        let mut stopped = false;
+        let status = loop {
+            if let Some(st) = child.try_wait()? {
+                break st;
+            }
+            if !stopped && watch(child.id()) {
+                stopped = true;
+                match &job {
+                    Some(j) => j.terminate(137),
+                    None => {
+                        let _ = child.kill();
+                    }
+                }
+            }
+            std::thread::sleep(WATCH_EVERY);
+        };
+        let interrupted = INTERRUPTED.load(Ordering::SeqCst);
+        if let Some(j) = &job {
+            if !interrupted && !stopped {
+                j.release();
+            }
+        }
+        let mut code = code_of(status);
+        if stopped {
+            code = 137;
+        } else if interrupted && code == STATUS_CONTROL_C_EXIT {
+            code = 130;
+        }
+        Ok(Ended { code, stopped })
     }
     #[cfg(unix)]
     {
@@ -272,8 +413,33 @@ pub fn run(mut cmd: Command, low_cpu: bool, on_spawn: impl FnOnce(u32)) -> io::R
         let pid = child.id() as i32;
         CHILD_PGID.store(pid, Ordering::SeqCst);
         on_spawn(child.id());
-        let status = child.wait();
+        let mut stopped_at: Option<std::time::Instant> = None;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break Ok(st),
+                Ok(None) => {}
+                Err(e) => break Err(e),
+            }
+            match stopped_at {
+                None if watch(child.id()) => {
+                    // SAFETY: signalling the process group we created.
+                    unsafe {
+                        libc::killpg(pid, libc::SIGTERM);
+                    }
+                    stopped_at = Some(std::time::Instant::now());
+                }
+                Some(t) if t.elapsed() > std::time::Duration::from_secs(3) => {
+                    // SAFETY: as above.
+                    unsafe {
+                        libc::killpg(pid, libc::SIGKILL);
+                    }
+                }
+                _ => {}
+            }
+            std::thread::sleep(WATCH_EVERY);
+        };
         CHILD_PGID.store(0, Ordering::SeqCst);
+        let stopped = stopped_at.is_some();
         // SAFETY: plain syscalls on our own process group / terminal.
         unsafe {
             if tty {
@@ -281,10 +447,14 @@ pub fn run(mut cmd: Command, low_cpu: bool, on_spawn: impl FnOnce(u32)) -> io::R
                 libc::tcsetpgrp(0, libc::getpgrp());
                 libc::signal(libc::SIGTTOU, libc::SIG_DFL);
             }
-            // Leftover processes of the command's group die with it.
-            libc::killpg(pid, libc::SIGTERM);
+            // After Ctrl+C or a stop, leftovers of the command's group go too. After a normal
+            // exit they stay: they are daemons the command meant to leave running.
+            if stopped || INTERRUPTED.load(Ordering::SeqCst) {
+                libc::killpg(pid, libc::SIGKILL);
+            }
         }
-        Ok(code_of(status?))
+        let code = if stopped { 137 } else { code_of(status?) };
+        Ok(Ended { code, stopped })
     }
 }
 

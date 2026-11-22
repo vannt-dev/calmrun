@@ -19,3 +19,7 @@ All notable changes to this project are documented here. The format follows
 - `status`, `stats`, `bump`, `doctor`, `init` subcommands and `history.jsonl`.
 - `calmrun hook claude`: a Claude Code PreToolUse hook that sends heavy shell commands
   through calmrun.
+- Daemons a command leaves running on purpose (Gradle, Kotlin) survive a normal exit; the
+  tree is ended only after Ctrl+C or when calmrun is killed.
+- A command ended by Ctrl+C on Windows exits 130; Ctrl+C works even when the parent started
+  calmrun with Ctrl+C disabled.

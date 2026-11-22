@@ -80,25 +80,34 @@ pub enum Sub {
     },
     /// Test helper: sleep and log start/end times.
     #[command(name = "__probe", hide = true)]
-    Probe {
-        #[arg(long)]
-        log: Option<std::path::PathBuf>,
-        #[arg(long, default_value = "")]
-        id: String,
-        #[arg(long, default_value_t = 0)]
-        sleep_ms: u64,
-        #[arg(long, default_value_t = 0)]
-        exit: i32,
-        /// Print the received arguments as JSON.
-        #[arg(long)]
-        print_args: bool,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        rest: Vec<String>,
-    },
+    Probe(ProbeArgs),
+    /// Test helper: send Ctrl+C (Windows console event) or SIGINT (Unix) to a process.
+    #[command(name = "__ctrl_c", hide = true)]
+    CtrlC { pid: u32 },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum HookTarget {
     /// Claude Code PreToolUse hook: reads the hook JSON on stdin.
     Claude,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ProbeArgs {
+    #[arg(long)]
+    pub log: Option<std::path::PathBuf>,
+    #[arg(long, default_value = "")]
+    pub id: String,
+    #[arg(long, default_value_t = 0)]
+    pub sleep_ms: u64,
+    #[arg(long, default_value_t = 0)]
+    pub exit: i32,
+    /// Print the received arguments as JSON.
+    #[arg(long)]
+    pub print_args: bool,
+    /// Start a detached helper that outlives this process and write its pid here.
+    #[arg(long)]
+    pub spawn_daemon: Option<std::path::PathBuf>,
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub rest: Vec<String>,
 }

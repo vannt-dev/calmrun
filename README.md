@@ -142,9 +142,14 @@ all-or-nothing.
 (for example a script that calls calmrun again) runs at once instead of queuing behind its own
 parent.
 
-**Low priority.** The command runs below normal priority on Windows (inside a Job Object that
-kills the whole tree when calmrun exits) and with `nice +10` in its own process group on Unix.
-`CALMRUN_LOW_CPU=0` turns the priority change off.
+**Low priority.** The command runs below normal priority on Windows and with `nice +10` in its
+own process group on Unix. `CALMRUN_LOW_CPU=0` turns the priority change off.
+
+**Process tree.** When the command exits normally, processes it deliberately left running
+(a Gradle or Kotlin daemon, a dev server started in the background) are left alone. When the
+run ends abnormally — Ctrl+C, or calmrun itself being killed — the whole tree is ended: on
+Windows the command runs in a Job Object that kills the tree when calmrun's handle closes; on
+Unix the command's process group is killed after Ctrl+C.
 
 **History.** Each run appends one JSON line to `history.jsonl`: `at`, `label`, `kind`, `cost`,
 `wait_ms`, `run_ms`, `status`. The label is `--label` or the tool and subcommand only
@@ -255,12 +260,16 @@ Use `calmrun status` to see what is running or waiting. Do not wrap light comman
   quoted and caret-escaped for both cmd parses a batch shim performs, so arguments such as
   `a&b`, `100%` or `"quoted"` arrive unchanged. `.ps1` files run with
   `powershell -NoProfile -ExecutionPolicy Bypass -File`. Ctrl+C reaches the command through the
-  shared console.
+  shared console; calmrun turns Ctrl+C processing back on if its parent had it disabled. A
+  command ended by Ctrl+C exits 130.
 - **macOS / Linux.** The command gets its own process group. When calmrun runs in the
   foreground of a terminal, that group becomes the terminal's foreground group (so the command
-  can read input and gets Ctrl+C directly) and the terminal is handed back afterwards; other
-  signals calmrun receives are forwarded to the group. Leftover processes in the group get
-  `SIGTERM` when the command exits.
+  can read input and gets Ctrl+C directly) and the terminal is handed back afterwards; SIGINT,
+  SIGTERM and SIGHUP that calmrun receives are forwarded to the group as SIGINT.
+- **What CI covers.** The test suite runs on Windows, macOS and Linux (GitHub-hosted x64 and
+  arm64 runners): queue rules, exit codes, Ctrl+C while running and while waiting, and daemons
+  surviving a normal exit. Killing calmrun ending the tree is tested on Windows only. The
+  terminal hand-over is not covered by CI (runners have no terminal).
 - **Battery.** `calmrun doctor` reports whether the machine runs on battery; consider a smaller
   budget then.
 
