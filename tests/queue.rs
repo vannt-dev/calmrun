@@ -67,6 +67,36 @@ impl Env {
     }
 }
 
+impl Env {
+    fn status(&self) -> serde_json::Value {
+        let out = self
+            .cmd(2)
+            .args(["status", "--json"])
+            .stdout(Stdio::piped())
+            .output()
+            .unwrap();
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+
+    /// Poll `status --json` until `running` and `waiting` have the given lengths.
+    fn wait_queue(&self, running: usize, waiting: usize) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let s = self.status();
+            let r = s["running"].as_array().map_or(0, Vec::len);
+            let w = s["waiting"].as_array().map_or(0, Vec::len);
+            if r == running && w == waiting {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "queue never reached {running}/{waiting}: {s}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
 fn wait_all(children: Vec<Child>, limit: Duration) -> Vec<i32> {
     let deadline = Instant::now() + limit;
     children
@@ -165,10 +195,10 @@ fn exclusive_node_modules_key() {
 #[test]
 fn first_come_first_served() {
     let env = Env::new();
-    let a = env.probe(2, &["--cost", "2"], "a", 1500, None);
-    std::thread::sleep(Duration::from_millis(400));
+    let a = env.probe(2, &["--cost", "2"], "a", 3000, None);
+    env.wait_queue(1, 0);
     let b = env.probe(2, &["--cost", "2"], "b", 200, None);
-    std::thread::sleep(Duration::from_millis(400));
+    env.wait_queue(1, 1);
     let c = env.probe(2, &["--cost", "2"], "c", 200, None);
     assert!(wait_all(vec![a, b, c], Duration::from_secs(60))
         .iter()
@@ -180,10 +210,10 @@ fn first_come_first_served() {
 #[test]
 fn prio_high_jumps_the_queue() {
     let env = Env::new();
-    let a = env.probe(2, &["--cost", "2"], "a", 1500, None);
-    std::thread::sleep(Duration::from_millis(400));
+    let a = env.probe(2, &["--cost", "2"], "a", 3000, None);
+    env.wait_queue(1, 0);
     let b = env.probe(2, &["--cost", "2"], "b", 200, None);
-    std::thread::sleep(Duration::from_millis(400));
+    env.wait_queue(1, 1);
     let c = env.probe(2, &["--cost", "2", "--prio", "high"], "c", 200, None);
     assert!(wait_all(vec![a, b, c], Duration::from_secs(60))
         .iter()
@@ -234,25 +264,16 @@ fn nested_run_does_not_deadlock() {
 #[test]
 fn killed_waiter_leaves_the_queue() {
     let env = Env::new();
-    let a = env.probe(2, &["--cost", "2"], "a", 2500, None);
-    std::thread::sleep(Duration::from_millis(400));
+    let a = env.probe(2, &["--cost", "2"], "a", 4000, None);
+    env.wait_queue(1, 0);
     let mut b = env.probe(2, &["--cost", "2", "--label", "victim"], "b", 100, None);
-    std::thread::sleep(Duration::from_millis(600));
-    let status = |env: &Env| -> serde_json::Value {
-        let out = env
-            .cmd(2)
-            .args(["status", "--json"])
-            .stdout(Stdio::piped())
-            .output()
-            .unwrap();
-        serde_json::from_slice(&out.stdout).unwrap()
-    };
-    let s = status(&env);
+    env.wait_queue(1, 1);
+    let s = env.status();
     assert_eq!(s["running"].as_array().unwrap().len(), 1);
     assert_eq!(s["waiting"][0]["label"], "victim");
     b.kill().unwrap();
     let _ = b.wait();
-    let s = status(&env);
+    let s = env.status();
     assert_eq!(s["waiting"].as_array().unwrap().len(), 0, "{s}");
     assert_eq!(wait_all(vec![a], Duration::from_secs(20)), vec![0]);
 }
@@ -260,12 +281,12 @@ fn killed_waiter_leaves_the_queue() {
 #[test]
 fn bump_moves_a_waiter_forward() {
     let env = Env::new();
-    let a = env.probe(2, &["--cost", "2"], "a", 1500, None);
-    std::thread::sleep(Duration::from_millis(400));
+    let a = env.probe(2, &["--cost", "2"], "a", 3000, None);
+    env.wait_queue(1, 0);
     let b = env.probe(2, &["--cost", "2", "--label", "first"], "b", 200, None);
-    std::thread::sleep(Duration::from_millis(300));
+    env.wait_queue(1, 1);
     let c = env.probe(2, &["--cost", "2", "--label", "urgent-e2e"], "c", 200, None);
-    std::thread::sleep(Duration::from_millis(300));
+    env.wait_queue(1, 2);
     let out = env.cmd(2).args(["bump", "URGENT"]).status().unwrap();
     assert!(out.success());
     assert!(wait_all(vec![a, b, c], Duration::from_secs(60))
