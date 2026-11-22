@@ -7,10 +7,12 @@
 //! `updatedInput` replaces the whole tool input. Printing nothing leaves the call alone.
 
 use crate::config::KindConfig;
-use crate::detect::{detect_words, parse, split_segments, tokenize, tool_name};
+use crate::detect::{detect_words, parse, tool_name};
+use crate::shell::split_segments;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
+/// What the hook does with a heavy command.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Mode {
     Deny,
@@ -18,6 +20,7 @@ pub enum Mode {
 }
 
 impl Mode {
+    /// `CALMRUN_HOOK_MODE=rewrite` rewrites; anything else denies with a suggestion.
     pub fn from_env() -> Mode {
         match std::env::var("CALMRUN_HOOK_MODE").ok().as_deref().map(str::trim) {
             Some("rewrite") => Mode::Rewrite,
@@ -38,13 +41,24 @@ fn already_wrapped(words: &[String]) -> bool {
 
 /// The command with every heavy, unwrapped segment wrapped in place, plus the kinds found.
 /// `None` when nothing needs wrapping.
+#[cfg(test)]
 pub fn wrap_command(cmd: &str, kinds: &BTreeMap<String, KindConfig>) -> Option<(String, Vec<String>)> {
+    wrap_with(cmd, kinds, "calmrun")
+}
+
+/// [`wrap_command`] with the program to insert (`calmrun`, or its absolute path).
+pub fn wrap_with(
+    cmd: &str,
+    kinds: &BTreeMap<String, KindConfig>,
+    program: &str,
+) -> Option<(String, Vec<String>)> {
     let mut out = String::with_capacity(cmd.len() + 16);
     let mut last = 0;
     let mut found = Vec::new();
     for r in split_segments(cmd) {
         let seg = &cmd[r.clone()];
-        let words = tokenize(seg);
+        let spans = crate::shell::words(seg);
+        let words: Vec<String> = spans.iter().map(|w| w.text.clone()).collect();
         if already_wrapped(&words) {
             continue;
         }
@@ -52,13 +66,10 @@ pub fn wrap_command(cmd: &str, kinds: &BTreeMap<String, KindConfig>) -> Option<(
         let Some(kind) = d.kind else { continue };
         let Some(p) = parse(&words) else { continue };
         // Keep leading `VAR=value` assignments in front of calmrun (they reach the child).
-        let insert_at = if p.start == 0 {
-            0
-        } else {
-            nth_word_offset(seg, p.start).unwrap_or(0)
-        };
+        let insert_at = spans.get(p.start).map_or(0, |w| w.start);
         out.push_str(&cmd[last..r.start + insert_at]);
-        out.push_str("calmrun -- ");
+        out.push_str(program);
+        out.push_str(" -- ");
         out.push_str(&cmd[r.start + insert_at..r.end]);
         last = r.end;
         if !found.contains(&kind) {
@@ -72,38 +83,26 @@ pub fn wrap_command(cmd: &str, kinds: &BTreeMap<String, KindConfig>) -> Option<(
     Some((out, found))
 }
 
-/// Byte offset of the n-th word of `seg` (quote-aware, same rules as `tokenize`).
-fn nth_word_offset(seg: &str, n: usize) -> Option<usize> {
-    let mut count = 0;
-    let mut in_word = false;
-    let mut quote: Option<char> = None;
-    for (i, c) in seg.char_indices() {
-        if let Some(q) = quote {
-            if c == q {
-                quote = None;
-            }
-            continue;
-        }
-        if c.is_whitespace() {
-            in_word = false;
-            continue;
-        }
-        if !in_word {
-            if count == n {
-                return Some(i);
-            }
-            count += 1;
-            in_word = true;
-        }
-        if c == '"' || c == '\'' {
-            quote = Some(c);
-        }
+/// `calmrun` when the agent's shell can find it on PATH, else this binary's absolute path,
+/// so a suggested command never fails with "command not found".
+pub fn program_name() -> String {
+    if crate::runner::on_path("calmrun") {
+        return "calmrun".to_string();
     }
-    None
+    std::env::current_exe()
+        .map(|p| crate::runner::quote_for_display(&p.to_string_lossy()))
+        .unwrap_or_else(|_| "calmrun".to_string())
 }
 
 /// Process one hook input. Returns the JSON to print, or `None` to stay silent (allow).
-pub fn handle(input: &str, mode: Mode, kinds: &BTreeMap<String, KindConfig>) -> Option<String> {
+/// `program` is what the suggestion runs: `calmrun`, or its absolute path when `calmrun` is
+/// not on PATH (see [`program_name`]).
+pub fn handle(
+    input: &str,
+    mode: Mode,
+    kinds: &BTreeMap<String, KindConfig>,
+    program: &str,
+) -> Option<String> {
     let v: Value = serde_json::from_str(input).ok()?;
     let tool = v.get("tool_name")?.as_str()?;
     if tool != "Bash" && tool != "PowerShell" {
@@ -111,7 +110,7 @@ pub fn handle(input: &str, mode: Mode, kinds: &BTreeMap<String, KindConfig>) -> 
     }
     let tool_input = v.get("tool_input")?.as_object()?;
     let cmd = tool_input.get("command")?.as_str()?;
-    let (wrapped, found) = wrap_command(cmd, kinds)?;
+    let (wrapped, found) = wrap_with(cmd, kinds, program)?;
     let out = match mode {
         Mode::Deny => json!({
             "hookSpecificOutput": {
@@ -156,7 +155,8 @@ mod tests {
     }
 
     fn run(tool: &str, cmd: &str, mode: Mode) -> Option<Value> {
-        handle(&input(tool, cmd), mode, &BTreeMap::new()).map(|s| serde_json::from_str(&s).unwrap())
+        handle(&input(tool, cmd), mode, &BTreeMap::new(), "calmrun")
+            .map(|s| serde_json::from_str(&s).unwrap())
     }
 
     fn reason(v: &Value) -> &str {
@@ -187,6 +187,11 @@ mod tests {
         assert_eq!(kinds, vec!["tsc", "vitest"]);
         let (w, _) = wrap_command("CI=1 FOO=\"a b\" npx jest", &BTreeMap::new()).unwrap();
         assert_eq!(w, "CI=1 FOO=\"a b\" calmrun -- npx jest");
+        // Words with escapes or escaped quotes keep their exact text.
+        let (w, _) = wrap_command(r"FOO=a\ b npx jest", &BTreeMap::new()).unwrap();
+        assert_eq!(w, r"FOO=a\ b calmrun -- npx jest");
+        let (w, _) = wrap_command(r#"FOO="a\"b c" npx jest"#, &BTreeMap::new()).unwrap();
+        assert_eq!(w, r#"FOO="a\"b c" calmrun -- npx jest"#);
         let (w, _) = wrap_command("time npx vitest run", &BTreeMap::new()).unwrap();
         assert_eq!(w, "time calmrun -- npx vitest run");
         let (w, _) = wrap_command("nice -n 5 cargo build", &BTreeMap::new()).unwrap();
@@ -235,11 +240,11 @@ mod tests {
     #[test]
     fn fails_open() {
         let kinds = BTreeMap::new();
-        assert!(handle("not json", Mode::Deny, &kinds).is_none());
-        assert!(handle("{}", Mode::Deny, &kinds).is_none());
-        assert!(handle(&input("Read", "npx vitest"), Mode::Deny, &kinds).is_none());
+        assert!(handle("not json", Mode::Deny, &kinds, "calmrun").is_none());
+        assert!(handle("{}", Mode::Deny, &kinds, "calmrun").is_none());
+        assert!(handle(&input("Read", "npx vitest"), Mode::Deny, &kinds, "calmrun").is_none());
         let no_cmd = json!({"tool_name": "Bash", "tool_input": {}}).to_string();
-        assert!(handle(&no_cmd, Mode::Deny, &kinds).is_none());
+        assert!(handle(&no_cmd, Mode::Deny, &kinds, "calmrun").is_none());
     }
 
     #[test]

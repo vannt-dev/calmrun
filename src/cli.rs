@@ -11,13 +11,13 @@ use clap::{Parser, Subcommand, ValueEnum};
     args_conflicts_with_subcommands = true,
     after_help = "Examples:\n  calmrun -- npx vitest run\n  calmrun --cost 3 --label e2e -- npx playwright test\n  calmrun status"
 )]
+/// The command line.
 pub struct Cli {
     #[command(subcommand)]
     pub sub: Option<Sub>,
 
-    /// Kind of job (vitest, jest, tsc, capture, docker, eslint, pytest, build, test, or one from
-    /// the config). Detected from the command when omitted.
-    #[arg(long, value_name = "K")]
+    /// Kind of job; detected from the command when omitted.
+    #[arg(long, value_name = "K", help = crate::kinds::kind_help())]
     pub kind: Option<String>,
 
     /// Points this job takes from the budget (clamped to the budget).
@@ -32,17 +32,37 @@ pub struct Cli {
     #[arg(long, value_name = "L")]
     pub label: Option<String>,
 
+    /// Also take a slot of this named resource (repeat or comma-separate: --needs db,gpu).
+    #[arg(long, value_name = "NAME", value_delimiter = ',')]
+    pub needs: Vec<String>,
+
+    /// Use a separate queue with this id instead of the machine-wide one (like GNU sem --id).
+    /// Also selects the queue for status and bump.
+    #[arg(long, value_name = "QUEUE", global = true)]
+    pub id: Option<String>,
+
+    /// Give up waiting after this many seconds: exit 75 and keep the place in line for
+    /// 10 minutes. calmrun prints the command that resumes it.
+    #[arg(long, value_name = "SECS")]
+    pub wait_timeout: Option<f64>,
+
+    /// Resume the place in line kept by an earlier --wait-timeout run.
+    #[arg(long, value_name = "ID")]
+    pub ticket: Option<u64>,
+
     /// The command to run. Separate words run directly; one quoted string runs in the shell.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "COMMAND")]
     pub command: Vec<String>,
 }
 
+/// Queue priority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Prio {
     Normal,
     High,
 }
 
+/// Subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Sub {
     /// Show running and waiting jobs, the budget and free RAM.
@@ -72,6 +92,29 @@ pub enum Sub {
         #[command(subcommand)]
         target: HookTarget,
     },
+    /// Add calmrun instructions to coding agents' global instruction files (dry run unless
+    /// --write).
+    Setup {
+        /// Apply the changes (default: only show them).
+        #[arg(long)]
+        write: bool,
+        /// Take the calmrun block (and with --hook, the hook) out again.
+        #[arg(long)]
+        remove: bool,
+        /// Also add the Claude Code PreToolUse hook to its settings.json (a backup is kept).
+        #[arg(long)]
+        hook: bool,
+        /// Which agents (claude, codex, gemini, opencode). Default: those whose folder exists.
+        #[arg(long, value_delimiter = ',')]
+        agents: Option<Vec<String>>,
+        /// Home directory to use instead of yours (for tests and other users' profiles).
+        #[arg(long, value_name = "DIR")]
+        home: Option<std::path::PathBuf>,
+    },
+    /// Print short instructions for coding agents.
+    Guide,
+    /// Serve the queue to coding agents over MCP (JSON-RPC on stdin/stdout).
+    Mcp,
     /// Write a commented default config file and print its path.
     Init {
         /// Overwrite an existing file.
@@ -80,25 +123,45 @@ pub enum Sub {
     },
     /// Test helper: sleep and log start/end times.
     #[command(name = "__probe", hide = true)]
-    Probe {
-        #[arg(long)]
-        log: Option<std::path::PathBuf>,
-        #[arg(long, default_value = "")]
-        id: String,
-        #[arg(long, default_value_t = 0)]
-        sleep_ms: u64,
-        #[arg(long, default_value_t = 0)]
-        exit: i32,
-        /// Print the received arguments as JSON.
-        #[arg(long)]
-        print_args: bool,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        rest: Vec<String>,
-    },
+    Probe(ProbeArgs),
+    /// Internal (macOS): end a command's process group when its calmrun disappears.
+    #[command(name = "__watchdog", hide = true)]
+    Watchdog { parent: i32, pgid: i32 },
+    /// Test helper: send Ctrl+C (Windows console event) or SIGINT (Unix) to a process.
+    #[command(name = "__ctrl_c", hide = true)]
+    CtrlC { pid: u32 },
 }
 
+/// Agents calmrun has a hook for.
 #[derive(Debug, Subcommand)]
 pub enum HookTarget {
     /// Claude Code PreToolUse hook: reads the hook JSON on stdin.
     Claude,
+}
+
+/// Arguments of the hidden test helper `__probe`.
+#[derive(Debug, clap::Args)]
+pub struct ProbeArgs {
+    #[arg(long)]
+    pub log: Option<std::path::PathBuf>,
+    #[arg(long, default_value = "")]
+    pub name: String,
+    #[arg(long, default_value_t = 0)]
+    pub sleep_ms: u64,
+    #[arg(long, default_value_t = 0)]
+    pub exit: i32,
+    /// Print the received arguments as JSON.
+    #[arg(long)]
+    pub print_args: bool,
+    /// Print the value of this environment variable (empty if unset).
+    #[arg(long)]
+    pub print_env: Option<String>,
+    /// Allocate and touch this many MB before sleeping.
+    #[arg(long, default_value_t = 0)]
+    pub alloc_mb: usize,
+    /// Start a detached helper that outlives this process and write its pid here.
+    #[arg(long)]
+    pub spawn_daemon: Option<std::path::PathBuf>,
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub rest: Vec<String>,
 }

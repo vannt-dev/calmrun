@@ -1,19 +1,18 @@
-//! Command analysis: kind, label, exclusive keys and argv rules.
+//! Command analysis: where the program is in a command line, what to call the job, which
+//! hints and keys apply, and which commands are refused.
 //!
 //! Detection looks only at the command position (after env assignments and launchers such as
 //! `npx` or `pnpm exec`), so `git commit -m "fix vitest"` is not mistaken for a vitest run.
+//! What counts as heavy lives in [`crate::kinds`].
 
 use crate::config::KindConfig;
+use crate::kinds::{self, first_non_flag, Hint, KeyRule, Workers};
+use crate::shell::{is_shell_string, split_segments, tokenize};
 use std::collections::BTreeMap;
-use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-pub const BUILTIN_KINDS: &[&str] = &[
-    "vitest", "jest", "tsc", "capture", "docker", "eslint", "pytest", "build", "test",
-];
-
 /// Result of analysing one command.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Detected {
     /// Heavy kind, or `None` for a command calmrun does not know.
     pub kind: Option<String>,
@@ -24,53 +23,42 @@ pub struct Detected {
 }
 
 impl Detected {
+    /// The kind, or `other` for an unknown command.
     pub fn kind_name(&self) -> &str {
         self.kind.as_deref().unwrap_or("other")
     }
 }
 
-pub fn default_cost(kind: &str) -> u32 {
-    match kind {
-        "vitest" | "jest" | "tsc" | "build" | "capture" | "docker" => 2,
-        _ => 1,
-    }
-}
-
-pub fn kind_cost(kind: &str, kinds: &BTreeMap<String, KindConfig>) -> u32 {
-    kinds
-        .get(kind)
-        .and_then(|k| k.cost)
-        .unwrap_or_else(|| default_cost(kind))
-}
-
-/// Basename, lowercased, without .cmd/.bat/.exe/.ps1/.js-style extensions.
+/// Basename, lowercased, without .cmd/.bat/.exe/.ps1/.js-style extensions and without a
+/// package version (`tsc@5`, `@scope/pkg@1` -> `tsc`, `pkg`).
 pub fn tool_name(word: &str) -> String {
+    const EXTENSIONS: &[&str] = &[".cmd", ".bat", ".exe", ".ps1", ".js", ".mjs", ".cjs"];
     let base = word
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or(word)
         .to_ascii_lowercase();
-    for ext in [".cmd", ".bat", ".exe", ".ps1", ".js", ".mjs", ".cjs"] {
-        if let Some(stripped) = base.strip_suffix(ext) {
-            if !stripped.is_empty() {
-                return stripped.to_string();
-            }
-        }
-    }
-    base
+    // A package spec such as `tsc@5` or `@scope/pkg@1` (the scope is already cut off above).
+    let base = match base.rfind('@') {
+        Some(at) if at > 0 => base[..at].to_string(),
+        _ => base,
+    };
+    EXTENSIONS
+        .iter()
+        .find_map(|ext| base.strip_suffix(ext).filter(|s| !s.is_empty()))
+        .map(str::to_string)
+        .unwrap_or(base)
 }
 
 fn is_assignment(w: &str) -> bool {
-    match w.split_once('=') {
-        Some((name, _)) => {
-            !name.is_empty()
-                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                && !name.starts_with(|c: char| c.is_ascii_digit())
-        }
-        None => false,
-    }
+    w.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+    })
 }
 
+/// Words that run the next word as the command (`time npx vitest`).
 const PREFIX_WRAPPERS: &[&str] = &[
     "env",
     "time",
@@ -81,6 +69,7 @@ const PREFIX_WRAPPERS: &[&str] = &[
     "&",
     "exec",
 ];
+/// Package bins that `pnpm <bin>` / `yarn <bin>` run directly.
 const JS_BINS: &[&str] = &[
     "vitest",
     "jest",
@@ -100,6 +89,8 @@ const JS_BINS: &[&str] = &[
     "rollup",
     "esbuild",
 ];
+/// Launchers whose flags take a value (`npx -p pkg`).
+const PACKAGE_FLAGS: &[&str] = &["-p", "--package"];
 
 /// A command split at its command position.
 #[derive(Debug, Clone, PartialEq)]
@@ -122,7 +113,8 @@ fn skip_flags(words: &[String], mut i: usize, value_flags: &[&str]) -> usize {
     i
 }
 
-pub fn parse(words: &[String]) -> Option<Parsed> {
+/// Index of the first word after env assignments and wrappers.
+fn command_start(words: &[String]) -> Option<usize> {
     let mut i = 0;
     loop {
         let w = words.get(i)?;
@@ -136,215 +128,83 @@ pub fn parse(words: &[String]) -> Option<Parsed> {
             while i < words.len() && (words[i].starts_with('-') || is_assignment(&words[i])) {
                 i += 1;
             }
-            continue;
-        }
-        if t == "nice" {
+        } else if t == "nice" {
             i = skip_flags(words, i + 1, &["-n"]);
-            continue;
+        } else {
+            return Some(i);
         }
-        break;
     }
-    let start = i;
-    let first = tool_name(&words[i]);
-    let next = words.get(i + 1).map(|s| s.to_ascii_lowercase());
-    let mut launcher = Vec::new();
-    let tool_idx;
-    match (first.as_str(), next.as_deref()) {
-        ("npx" | "pnpx" | "bunx", _) => {
-            launcher.push(first.clone());
-            tool_idx = skip_flags(words, i + 1, &["-p", "--package"]);
-        }
-        ("pnpm" | "yarn" | "npm", Some(sub @ ("exec" | "dlx" | "x"))) | ("bun", Some(sub @ "x")) => {
-            launcher.push(first.clone());
-            launcher.push(sub.to_string());
-            let j = skip_flags(words, i + 2, &["-p", "--package"]);
-            tool_idx = if words.get(j).map(String::as_str) == Some("--") {
-                j + 1
-            } else {
-                j
-            };
-        }
-        ("pnpm" | "yarn", Some(n)) if JS_BINS.contains(&n) => {
-            launcher.push(first.clone());
-            tool_idx = i + 1;
-        }
-        ("uv" | "poetry" | "pipenv" | "pdm" | "hatch", Some("run")) => {
-            let inner = parse(&words[i + 2..])?;
-            let mut l = vec![first.clone(), "run".to_string()];
-            l.extend(inner.launcher);
-            return Some(Parsed {
-                launcher: l,
-                tool: inner.tool,
-                rest: inner.rest,
-                start,
-            });
-        }
-        ("python" | "python3" | "py", _) => {
-            let m = words[i + 1..]
-                .iter()
-                .take_while(|w| w.starts_with('-'))
-                .position(|w| w == "-m");
-            if let Some(p) = m {
-                launcher.push(first.clone());
-                launcher.push("-m".to_string());
-                tool_idx = i + 1 + p + 1;
-            } else {
-                tool_idx = i;
-            }
-        }
-        ("node" | "bun" | "deno", Some(n)) if looks_like_script(n) => {
-            launcher.push(first.clone());
-            tool_idx = i + 1;
-        }
-        _ => tool_idx = i,
-    }
-    if tool_idx >= words.len() {
-        // A bare launcher such as `npx --version`: the launcher is the tool.
-        return Some(Parsed {
-            launcher: Vec::new(),
-            tool: first,
-            rest: words[i + 1..].to_vec(),
-            start,
-        });
-    }
-    let tool = tool_name(&words[tool_idx]);
-    Some(Parsed {
-        launcher,
-        tool,
-        rest: words[tool_idx + 1..].to_vec(),
-        start,
-    })
 }
 
 fn looks_like_script(w: &str) -> bool {
     [".js", ".mjs", ".cjs", ".ts"].iter().any(|e| w.ends_with(e)) && (w.contains('/') || w.contains('\\'))
 }
 
-fn first_non_flag(rest: &[String]) -> Option<&str> {
-    rest.iter().map(String::as_str).find(|w| !w.starts_with('-'))
-}
-
-fn only_info_flags(rest: &[String]) -> bool {
-    !rest.is_empty()
-        && rest.iter().all(|w| {
-            matches!(
-                w.as_str(),
-                "--version" | "-v" | "-V" | "--help" | "-h" | "version" | "help"
-            )
-        })
-}
-
-fn script_kind(name: &str) -> Option<&'static str> {
-    let base = name.split(':').next().unwrap_or(name);
-    match base {
-        "test" | "t" => Some("test"),
-        "build" => Some("build"),
-        "lint" => Some("eslint"),
-        "typecheck" | "type-check" | "tsc" => Some("tsc"),
+/// Where the tool is after a launcher at `i`: (launcher words, tool index). `None` means the
+/// word at `i` is itself the tool.
+fn launcher_at(words: &[String], i: usize) -> Option<(Vec<String>, usize)> {
+    let first = tool_name(&words[i]);
+    let next = words.get(i + 1).map(|s| s.to_ascii_lowercase());
+    match (first.as_str(), next.as_deref()) {
+        ("npx" | "pnpx" | "bunx", _) => Some((vec![first.clone()], skip_flags(words, i + 1, PACKAGE_FLAGS))),
+        ("pnpm" | "yarn" | "npm", Some(sub @ ("exec" | "dlx" | "x"))) | ("bun", Some(sub @ "x")) => {
+            let j = skip_flags(words, i + 2, PACKAGE_FLAGS);
+            let j = if words.get(j).map(String::as_str) == Some("--") {
+                j + 1
+            } else {
+                j
+            };
+            Some((vec![first.clone(), sub.to_string()], j))
+        }
+        ("pnpm" | "yarn", Some(n)) if JS_BINS.contains(&n) => Some((vec![first.clone()], i + 1)),
+        ("python" | "python3" | "py", _) => {
+            let m = words[i + 1..]
+                .iter()
+                .take_while(|w| w.starts_with('-'))
+                .position(|w| w == "-m")?;
+            Some((vec![first.clone(), "-m".to_string()], i + 1 + m + 1))
+        }
+        ("node" | "bun" | "deno", Some(n)) if looks_like_script(n) => Some((vec![first.clone()], i + 1)),
         _ => None,
     }
 }
 
-/// Compose subcommand after compose's own flags (`-f file`, `-p name`, `--profile x`).
-fn compose_sub(rest: &[String]) -> Option<String> {
-    let mut i = 0;
-    while i < rest.len() {
-        let w = &rest[i];
-        if w.starts_with('-') {
-            if matches!(
-                w.as_str(),
-                "-f" | "--file"
-                    | "-p"
-                    | "--project-name"
-                    | "--profile"
-                    | "--env-file"
-                    | "--project-directory"
-            ) {
-                i += 1;
-            }
-            i += 1;
-            continue;
-        }
-        return Some(w.to_ascii_lowercase());
+/// Find the program in a list of words.
+pub fn parse(words: &[String]) -> Option<Parsed> {
+    let start = command_start(words)?;
+    let first = tool_name(&words[start]);
+    let next = words.get(start + 1).map(|s| s.to_ascii_lowercase());
+    if matches!(first.as_str(), "uv" | "poetry" | "pipenv" | "pdm" | "hatch")
+        && next.as_deref() == Some("run")
+    {
+        let inner = parse(&words[start + 2..])?;
+        let mut launcher = vec![first, "run".to_string()];
+        launcher.extend(inner.launcher);
+        return Some(Parsed {
+            launcher,
+            tool: inner.tool,
+            rest: inner.rest,
+            start,
+        });
     }
-    None
-}
-
-fn classify_builtin(tool: &str, rest: &[String]) -> Option<&'static str> {
-    if only_info_flags(rest) {
-        return None;
-    }
-    let sub = first_non_flag(rest).map(str::to_ascii_lowercase);
-    let sub = sub.as_deref();
-    match tool {
-        "vitest" => Some("vitest"),
-        "jest" => Some("jest"),
-        "tsc" | "vue-tsc" | "tsgo" => Some("tsc"),
-        "playwright" | "puppeteer" | "cypress" => Some("capture"),
-        "eslint" | "oxlint" | "biome" => Some("eslint"),
-        "pytest" | "py.test" => Some("pytest"),
-        "webpack" | "rollup" | "esbuild" | "gradle" | "gradlew" | "mvn" | "mvnw" => Some("build"),
-        "vite" | "next" | "ng" if sub == Some("build") => Some("build"),
-        "docker-compose" => match compose_sub(rest).as_deref() {
-            Some("up" | "build" | "run" | "create") => Some("docker"),
-            _ => None,
-        },
-        "docker" => match sub {
-            Some("compose") => {
-                let pos = rest.iter().position(|w| w == "compose").unwrap_or(0);
-                match compose_sub(&rest[pos + 1..]).as_deref() {
-                    Some("up" | "build" | "run" | "create") => Some("docker"),
-                    _ => None,
-                }
-            }
-            Some("build" | "run" | "buildx") => Some("docker"),
-            _ => None,
-        },
-        "cargo" => match sub {
-            Some("build" | "b" | "check" | "c" | "clippy") => Some("build"),
-            Some("test" | "t" | "nextest") => Some("test"),
-            _ => None,
-        },
-        "flutter" | "dotnet" | "go" => match sub {
-            Some("build") => Some("build"),
-            Some("test") => Some("test"),
-            Some("publish") if tool == "dotnet" => Some("build"),
-            _ => None,
-        },
-        "npm" | "pnpm" | "yarn" | "bun" => match sub {
-            Some("run" | "run-script") => {
-                let pos = rest
-                    .iter()
-                    .position(|w| w == "run" || w == "run-script")
-                    .unwrap_or(0);
-                first_non_flag(&rest[pos + 1..]).and_then(script_kind)
-            }
-            Some("test" | "t") => Some("test"),
-            Some(s) if tool != "npm" => script_kind(s),
-            _ => None,
-        },
-        _ => None,
+    match launcher_at(words, start) {
+        Some((launcher, idx)) if idx < words.len() => Some(Parsed {
+            launcher,
+            tool: tool_name(&words[idx]),
+            rest: words[idx + 1..].to_vec(),
+            start,
+        }),
+        // A bare launcher such as `npx --version`, or a plain tool.
+        _ => Some(Parsed {
+            launcher: Vec::new(),
+            tool: first,
+            rest: words[start + 1..].to_vec(),
+            start,
+        }),
     }
 }
 
-fn classify(p: &Parsed, kinds: &BTreeMap<String, KindConfig>) -> Option<String> {
-    for (name, kc) in kinds {
-        for pat in &kc.patterns {
-            let mut pw = pat.split_whitespace();
-            let Some(head) = pw.next() else { continue };
-            if tool_name(head) != p.tool {
-                continue;
-            }
-            let tail: Vec<&str> = pw.collect();
-            if tail.len() <= p.rest.len() && tail.iter().zip(&p.rest).all(|(a, b)| a.eq_ignore_ascii_case(b))
-            {
-                return Some(name.clone());
-            }
-        }
-    }
-    classify_builtin(&p.tool, &p.rest).map(str::to_string)
-}
-
+/// Tools whose first plain word is a subcommand worth showing in labels.
 const SUB_TOOLS: &[&str] = &[
     "cargo",
     "go",
@@ -369,14 +229,17 @@ const SUB_TOOLS: &[&str] = &[
     "playwright",
 ];
 const VITEST_SUBS: &[&str] = &["run", "watch", "bench", "dev", "related", "list"];
+/// Longest word shown in a label; longer ones are likely arguments, not subcommands.
+const LABEL_WORD_MAX: usize = 24;
 
 fn safe_word(w: &str) -> bool {
     let mut chars = w.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_lowercase())
-        && w.len() <= 24
+        && w.len() <= LABEL_WORD_MAX
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | ':' | '_'))
 }
 
+/// Label: launcher + tool + subcommand (two words for `npm run x` / `docker compose up`).
 fn label_of(p: &Parsed) -> String {
     let mut parts = p.launcher.clone();
     parts.push(p.tool.clone());
@@ -390,14 +253,13 @@ fn label_of(p: &Parsed) -> String {
             .iter()
             .skip_while(|w| w.as_str() != sub)
             .nth(1)
-            .map(String::as_str)
-            .unwrap_or("");
+            .map(String::as_str);
         let two_word = matches!(
             (p.tool.as_str(), sub),
             ("npm" | "pnpm" | "yarn" | "bun", "run" | "run-script") | ("docker", "compose" | "buildx")
         );
-        if two_word && safe_word(second) {
-            parts.push(second.to_string());
+        if let Some(s) = second.filter(|s| two_word && safe_word(s)) {
+            parts.push(s.to_string());
         }
     }
     parts.join(" ")
@@ -407,21 +269,12 @@ fn label_of(p: &Parsed) -> String {
 pub fn detect_words(words: &[String], kinds: &BTreeMap<String, KindConfig>) -> Detected {
     match parse(words) {
         Some(p) => Detected {
-            kind: classify(&p, kinds),
+            kind: kinds::classify(&p.tool, &p.rest, kinds),
             label: label_of(&p),
             tool: p.tool,
         },
-        None => Detected {
-            kind: None,
-            label: String::new(),
-            tool: String::new(),
-        },
+        None => Detected::default(),
     }
-}
-
-/// True when the argv is one shell string ("npm ci && npm test") rather than separate words.
-pub fn is_shell_string(argv: &[String]) -> bool {
-    argv.len() == 1 && argv[0].trim().contains(char::is_whitespace)
 }
 
 /// Analyse the full command. A shell string is split into segments; the costliest heavy
@@ -439,264 +292,114 @@ pub fn detect(argv: &[String], kinds: &BTreeMap<String, KindConfig>) -> Detected
             continue;
         }
         if let Some(k) = &d.kind {
-            let c = kind_cost(k, kinds);
+            let c = kinds::cost(k, kinds);
             if best.as_ref().is_none_or(|(bc, _)| c > *bc) {
                 best = Some((c, d.clone()));
             }
         }
         first.get_or_insert(d);
     }
-    best.map(|(_, d)| d).or(first).unwrap_or(Detected {
-        kind: None,
-        label: String::new(),
-        tool: String::new(),
-    })
+    best.map(|(_, d)| d).or(first).unwrap_or_default()
 }
 
-/// Split shell words. Quotes group words; backslash escapes only `\"` inside double quotes
-/// and `\ ` outside quotes, so Windows paths keep their backslashes.
-pub fn tokenize(s: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut has = false;
-    let mut quote: Option<char> = None;
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        match quote {
-            Some(q) => {
-                if c == q {
-                    quote = None;
-                } else if c == '\\' && q == '"' && chars.peek() == Some(&'"') {
-                    cur.push(chars.next().unwrap_or('"'));
-                } else {
-                    cur.push(c);
-                }
-            }
-            None => match c {
-                '"' | '\'' => {
-                    quote = Some(c);
-                    has = true;
-                }
-                '\\' if chars.peek() == Some(&' ') => {
-                    cur.push(' ');
-                    chars.next();
-                    has = true;
-                }
-                c if c.is_whitespace() => {
-                    if has {
-                        out.push(std::mem::take(&mut cur));
-                        has = false;
-                    }
-                }
-                _ => {
-                    cur.push(c);
-                    has = true;
-                }
-            },
+/// The changes the tool's hint asks for: new argv (if any) and extra environment.
+#[derive(Debug, Default, PartialEq)]
+pub struct HintChanges {
+    pub argv: Option<Vec<String>>,
+    pub env: Vec<(String, String)>,
+}
+
+/// Apply the [`Hint`] of the detected tool. `workers` turns a [`Workers`] into a number;
+/// `env_set` says whether an environment variable is already set.
+pub fn apply_hints(
+    argv: &[String],
+    tool: &str,
+    cwd: &Path,
+    workers: &dyn Fn(Workers) -> u32,
+    env_set: &dyn Fn(&str) -> bool,
+) -> HintChanges {
+    let mut out = HintChanges::default();
+    match kinds::hint_for(tool) {
+        Some(Hint::Arg {
+            flag,
+            opt_out,
+            launchers,
+            min_args,
+            workers: w,
+        }) => {
+            out.argv = arg_hint(argv, tool, launchers, opt_out, min_args).map(|(mut a, at)| {
+                a.insert(at, format!("{flag}{}", workers(w)));
+                a
+            });
         }
-    }
-    if has {
-        out.push(cur);
+        Some(Hint::Env {
+            var,
+            workers: w,
+            user_limit,
+        }) if !env_set(var) => {
+            let ours = workers(w);
+            let n = user_limit
+                .and_then(|f| f(cwd))
+                .map_or(ours, |theirs| theirs.min(ours));
+            out.env.push((var.to_string(), n.to_string()))
+        }
+        _ => {}
     }
     out
 }
 
-/// Byte ranges of the command segments separated by `&&`, `||`, `;`, `|`, `&` and newlines,
-/// outside quotes. Ranges are trimmed of whitespace and grouping parentheses/braces.
-pub fn split_segments(s: &str) -> Vec<Range<usize>> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::new();
-    let mut quote: Option<u8> = None;
-    let mut seg_start = 0;
-    let mut i = 0;
-    let push = |out: &mut Vec<Range<usize>>, a: usize, b: usize| {
-        let mut a = a;
-        let mut b = b;
-        while a < b && (bytes[a].is_ascii_whitespace() || matches!(bytes[a], b'(' | b'{')) {
-            a += 1;
-        }
-        while b > a && (bytes[b - 1].is_ascii_whitespace() || matches!(bytes[b - 1], b')' | b'}')) {
-            b -= 1;
-        }
-        if a < b {
-            out.push(a..b);
-        }
-    };
-    // Heredoc terminators waiting for the end of the current line.
-    let mut pending: Vec<String> = Vec::new();
-    while i < bytes.len() {
-        let c = bytes[i];
-        // Heredocs (`<<EOF`, `<<-'EOF'`) are found in any quote state, so a heredoc inside
-        // "$(cat <<'EOF' ... )" is skipped too. Their bodies are data, never commands.
-        if c == b'<' && bytes.get(i + 1) == Some(&b'<') && bytes.get(i + 2) != Some(&b'<') {
-            if let Some((delim, used)) = heredoc_delimiter(&s[i + 2..]) {
-                pending.push(delim);
-                i += 2 + used;
-                continue;
-            }
-        }
-        // PowerShell here-strings: `@'` / `@"` at a line end, closed by `'@` / `"@` at the
-        // start of a later line. The body is one string argument, never commands.
-        if c == b'@' && matches!(bytes.get(i + 1), Some(b'\'' | b'"')) {
-            let q = bytes[i + 1];
-            let line_end = s[i + 2..].find('\n').map(|e| i + 2 + e);
-            if let Some(le) = line_end.filter(|&le| s[i + 2..le].trim().is_empty()) {
-                let close = [q, b'@'];
-                let mut pos = le + 1;
-                let mut found = None;
-                while pos < bytes.len() {
-                    if bytes[pos..].starts_with(&close) {
-                        found = Some(pos + 2);
-                        break;
-                    }
-                    pos = s[pos..].find('\n').map_or(bytes.len(), |e| pos + e + 1);
-                }
-                i = found.unwrap_or(bytes.len());
-                continue;
-            }
-        }
-        if c == b'\n' && !pending.is_empty() {
-            if quote.is_none() {
-                push(&mut out, seg_start, i);
-            }
-            let mut pos = i + 1;
-            for d in pending.drain(..) {
-                while pos < bytes.len() {
-                    let end = s[pos..].find('\n').map_or(bytes.len(), |e| pos + e);
-                    let line = s[pos..end].trim_start_matches('\t').trim_end();
-                    pos = end + 1;
-                    if line == d {
-                        break;
-                    }
-                }
-            }
-            i = pos.min(bytes.len());
-            if quote.is_none() {
-                seg_start = i;
-            }
-            continue;
-        }
-        if let Some(q) = quote {
-            if c == b'\\' && q == b'"' {
-                i += 2;
-                continue;
-            }
-            if c == q {
-                quote = None;
-            }
-            i += 1;
-            continue;
-        }
-        match c {
-            b'"' | b'\'' => quote = Some(c),
-            b';' | b'\n' | b'\r' => {
-                push(&mut out, seg_start, i);
-                seg_start = i + 1;
-            }
-            b'|' | b'&' => {
-                let prev = if i > 0 { bytes[i - 1] } else { 0 };
-                let next = bytes.get(i + 1).copied().unwrap_or(0);
-                // Redirections such as 2>&1, &>file, >&2 are not separators.
-                if c == b'&' && (prev == b'>' || prev == b'<' || next == b'>') {
-                    i += 1;
-                    continue;
-                }
-                push(&mut out, seg_start, i);
-                let len = if next == c { 2 } else { 1 };
-                i += len;
-                seg_start = i;
-                continue;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    push(&mut out, seg_start, bytes.len());
-    out
-}
-
-/// The delimiter word after `<<` (with optional `-` and quotes) and the bytes it used.
-fn heredoc_delimiter(rest: &str) -> Option<(String, usize)> {
-    let b = rest.as_bytes();
-    let mut i = 0;
-    if b.first() == Some(&b'-') {
-        i += 1;
-    }
-    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
-        i += 1;
-    }
-    let mut word = String::new();
-    while i < b.len() {
-        let c = b[i];
-        if c == b'\'' || c == b'"' {
-            let close = rest[i + 1..].find(c as char)? + i + 1;
-            word.push_str(&rest[i + 1..close]);
-            i = close + 1;
-        } else if c == b'\\' {
-            i += 1;
-        } else if c.is_ascii_whitespace() || b";|&<>()`".contains(&c) {
-            break;
-        } else {
-            word.push(c as char);
-            i += 1;
-        }
-    }
-    (!word.is_empty()).then_some((word, i))
-}
-
-/// `--maxWorkers=N` rule for vitest invoked directly as separate argv words.
-/// Returns the new argv, or `None` when the rule does not apply.
-pub fn vitest_args(argv: &[String], workers: u32) -> Option<Vec<String>> {
+/// Where to insert an argument hint, if the tool was started directly through one of the
+/// launchers and has not opted out. Returns the argv copy and the insert position.
+fn arg_hint(
+    argv: &[String],
+    tool: &str,
+    launchers: &[&[&str]],
+    opt_out: &[&str],
+    min_args: usize,
+) -> Option<(Vec<String>, usize)> {
     if is_shell_string(argv) || argv.is_empty() {
         return None;
     }
-    let lower: Vec<String> = argv.iter().map(|w| w.to_ascii_lowercase()).collect();
-    let t0 = tool_name(&argv[0]);
-    let vitest_at = if t0 == "vitest" {
-        0
-    } else if matches!(t0.as_str(), "npx" | "pnpx" | "bunx")
-        && lower.get(1).map(|w| tool_name(w)) == Some("vitest".into())
-    {
-        1
-    } else if matches!(t0.as_str(), "pnpm" | "yarn")
-        && lower.get(1).map(String::as_str) == Some("exec")
-        && lower.get(2).map(|w| tool_name(w)) == Some("vitest".into())
-    {
-        2
-    } else {
-        return None;
+    let word = |i: usize| {
+        if i == 0 {
+            tool_name(&argv[0])
+        } else {
+            argv[i].to_ascii_lowercase()
+        }
     };
-    let rest = &argv[vitest_at + 1..];
+    let at = launchers
+        .iter()
+        .find(|l| {
+            argv.len() > l.len()
+                && l.iter().enumerate().all(|(i, w)| word(i) == *w)
+                && tool_name(&argv[l.len()]) == tool
+        })?
+        .len();
+    let rest = &argv[at + 1..];
     let opted_out = rest.iter().any(|w| {
         let w = w.to_ascii_lowercase();
-        w.starts_with("--maxworkers")
-            || w.starts_with("--max-workers")
-            || w.starts_with("--pool")
-            || w == "--no-file-parallelism"
+        opt_out.iter().any(|o| w.starts_with(o))
     });
-    if opted_out || only_info_flags(rest) {
+    if opted_out || rest.len() < min_args || kinds::only_info_flags(rest) {
         return None;
     }
-    let mut out = argv.to_vec();
-    let flag = format!("--maxWorkers={workers}");
-    match rest.iter().position(|w| w == "--") {
-        Some(p) => out.insert(vitest_at + 1 + p, flag),
-        None => out.push(flag),
-    }
-    Some(out)
+    let insert = at + 1 + rest.iter().position(|w| w == "--").unwrap_or(rest.len());
+    Some((argv.to_vec(), insert))
 }
 
 fn compose_up_attached(words: &[String]) -> bool {
-    let Some(p) = parse(words) else { return false };
+    let Some(p) = parse(words) else {
+        return false;
+    };
     let after = match p.tool.as_str() {
         "docker-compose" => &p.rest[..],
-        "docker" if first_non_flag(&p.rest) == Some("compose") => {
-            let pos = p.rest.iter().position(|w| w == "compose").unwrap_or(0);
-            &p.rest[pos + 1..]
-        }
+        "docker" => match kinds::after_docker_compose(&p.rest) {
+            Some(a) => a,
+            None => return false,
+        },
         _ => return false,
     };
-    if compose_sub(after).as_deref() != Some("up") {
+    if kinds::compose_sub(after).as_deref() != Some("up") {
         return false;
     }
     let detached = after.iter().any(|w| {
@@ -708,66 +411,140 @@ fn compose_up_attached(words: &[String]) -> bool {
     !detached
 }
 
-/// A reason to refuse the command outright, if any.
-pub fn refuse_reason(argv: &[String]) -> Option<String> {
-    let attached = if is_shell_string(argv) {
-        split_segments(&argv[0])
+/// What to do with a command before it is queued.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Disposition {
+    /// Wait in the queue as usual.
+    Queue,
+    /// Run at once without the queue (help/version output, dev servers).
+    Light(&'static str),
+    /// Refuse: it would hold its points forever. `fixed` is the one-shot form, if known.
+    Refuse {
+        reason: String,
+        fixed: Option<Vec<String>>,
+    },
+}
+
+/// Decide whether a command is queued, run at once, or refused. `stdin_tty` matters for
+/// tools that watch by default in a terminal (vitest).
+pub fn disposition(argv: &[String], stdin_tty: bool) -> Disposition {
+    if is_shell_string(argv) {
+        let s = &argv[0];
+        return split_segments(s)
             .into_iter()
-            .any(|r| compose_up_attached(&tokenize(&argv[0][r])))
-    } else {
-        compose_up_attached(argv)
+            .find_map(|r| match words_disposition(&tokenize(&s[r]), stdin_tty) {
+                Disposition::Refuse { reason, .. } => Some(Disposition::Refuse { reason, fixed: None }),
+                _ => None,
+            })
+            .unwrap_or(Disposition::Queue);
+    }
+    words_disposition(argv, stdin_tty)
+}
+
+fn words_disposition(words: &[String], stdin_tty: bool) -> Disposition {
+    if compose_up_attached(words) {
+        return Disposition::Refuse {
+            reason: "`docker compose up` without -d would hold queue points forever; run it detached \
+                     (`docker compose up -d`) or outside calmrun"
+                .to_string(),
+            fixed: detached_compose(words),
+        };
+    }
+    let Some(p) = parse(words) else {
+        return Disposition::Queue;
     };
-    attached.then(|| {
-        "`docker compose up` without -d would hold queue points forever; \
-         run it detached (`docker compose up -d`) or outside calmrun"
-            .to_string()
-    })
+    if kinds::asks_for_info(&p.rest) {
+        return Disposition::Light("only prints help or a version");
+    }
+    if let Some(rule) = kinds::endless_rule(&p.tool, &p.rest, stdin_tty) {
+        return Disposition::Refuse {
+            reason: format!(
+                "`{}` is {} and never ends, so it would hold queue points forever; run the one-shot \
+                 form, or run it outside calmrun",
+                label_of(&p),
+                rule.what
+            ),
+            fixed: apply_fix(words, &p, rule.fix),
+        };
+    }
+    match kinds::light_rule(&p.tool, &p.rest) {
+        Some(r) => Disposition::Light(r.kind),
+        None => Disposition::Queue,
+    }
+}
+
+/// The one-shot form of an endless command (argv words only).
+fn apply_fix(words: &[String], p: &Parsed, fix: kinds::Fix) -> Option<Vec<String>> {
+    let tool_at = (p.start..words.len()).find(|&i| tool_name(&words[i]) == p.tool)?;
+    let mut out = words.to_vec();
+    match fix {
+        kinds::Fix::None => return None,
+        kinds::Fix::RemoveFlags(flags) => {
+            let tail = out.split_off(tool_at + 1);
+            out.extend(tail.into_iter().filter(|w| {
+                let lw = w.to_ascii_lowercase();
+                !flags.iter().any(|f| lw == *f || lw.starts_with(&format!("{f}=")))
+            }));
+        }
+        kinds::Fix::SetSub(sub) => {
+            let at = (tool_at + 1..out.len()).find(|&i| !out[i].starts_with('-'))?;
+            out[at] = sub.to_string();
+        }
+        kinds::Fix::InsertSub(sub) => out.insert(tool_at + 1, sub.to_string()),
+    }
+    Some(out)
+}
+
+/// The same compose command with `-d` added after `up` (argv words only).
+pub fn detached_compose(argv: &[String]) -> Option<Vec<String>> {
+    if is_shell_string(argv) || !compose_up_attached(argv) {
+        return None;
+    }
+    let start = argv
+        .iter()
+        .position(|w| matches!(tool_name(w).as_str(), "docker" | "docker-compose"))?;
+    let up = start + argv[start..].iter().position(|w| w == "up")?;
+    let mut out = argv.to_vec();
+    out.insert(up + 1, "-d".to_string());
+    Some(out)
 }
 
 /// FNV-1a 64-bit, stable across builds and platforms.
 pub fn fnv1a(s: &str) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in s.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0100_0000_01b3;
+    let h = s.bytes().fold(OFFSET, |h, b| (h ^ b as u64).wrapping_mul(PRIME));
     format!("{h:016x}")
 }
 
-fn norm_key(prefix: &str, p: &Path) -> String {
-    let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    let mut s = real.to_string_lossy().to_string();
-    if cfg!(windows) {
-        s = s.to_lowercase();
-    }
-    format!("{prefix}:{}", fnv1a(&s))
+fn key_for(prefix: &str, p: &Path) -> String {
+    format!("{prefix}:{}", fnv1a(&crate::sys::path_key(p)))
 }
 
 fn nearest(cwd: &Path, test: impl Fn(&Path) -> bool) -> Option<PathBuf> {
     cwd.ancestors().find(|d| test(d)).map(Path::to_path_buf)
 }
 
-/// Exclusive keys: two jobs sharing a key never run together.
-pub fn exclusive_keys(d: &Detected, cwd: &Path) -> Vec<String> {
-    let kind = d.kind_name();
-    if d.tool == "cargo" && matches!(kind, "build" | "test") {
-        if let Some(t) = std::env::var_os("CARGO_TARGET_DIR").filter(|v| !v.is_empty()) {
-            return vec![norm_key("cargo", Path::new(&t))];
+/// Exclusive keys of a job of `kind` run by `tool` in `cwd`: two jobs sharing a key never
+/// run together.
+pub fn exclusive_keys(kind: &str, tool: &str, cwd: &Path) -> Vec<String> {
+    match kinds::key_rule(kind, tool) {
+        KeyRule::None => Vec::new(),
+        KeyRule::NodeModules => nearest(cwd, |d| d.join("node_modules").is_dir())
+            .map(|d| vec![key_for("nm", &d.join("node_modules"))])
+            .unwrap_or_default(),
+        KeyRule::CargoTarget => {
+            if let Some(t) = std::env::var_os("CARGO_TARGET_DIR").filter(|v| !v.is_empty()) {
+                return vec![key_for("cargo", Path::new(&t))];
+            }
+            nearest(cwd, |d| {
+                d.join("Cargo.toml").is_file() && d.join("target").is_dir()
+            })
+            .or_else(|| nearest(cwd, |d| d.join("Cargo.toml").is_file()))
+            .map(|d| vec![key_for("cargo", &d.join("target"))])
+            .unwrap_or_default()
         }
-        let dir = nearest(cwd, |d| {
-            d.join("Cargo.toml").is_file() && d.join("target").is_dir()
-        })
-        .or_else(|| nearest(cwd, |d| d.join("Cargo.toml").is_file()));
-        return dir
-            .map(|d| vec![norm_key("cargo", &d.join("target"))])
-            .unwrap_or_default();
     }
-    if matches!(kind, "vitest" | "jest" | "build") {
-        if let Some(d) = nearest(cwd, |d| d.join("node_modules").is_dir()) {
-            return vec![norm_key("nm", &d.join("node_modules"))];
-        }
-    }
-    Vec::new()
 }
 
 #[cfg(test)]
@@ -783,6 +560,14 @@ mod tests {
     fn label(s: &str) -> String {
         detect_words(&w(s), &BTreeMap::new()).label
     }
+    fn argv(s: &str) -> Vec<String> {
+        s.split(' ').map(String::from).collect()
+    }
+    fn hinted(s: &str, n: u32) -> Option<Vec<String>> {
+        let a = argv(s);
+        let tool = detect_words(&a, &BTreeMap::new()).tool;
+        apply_hints(&a, &tool, Path::new("."), &|_| n, &|_| false).argv
+    }
 
     #[test]
     fn tool_names() {
@@ -790,37 +575,46 @@ mod tests {
         assert_eq!(tool_name("./node_modules/.bin/vitest"), "vitest");
         assert_eq!(tool_name("ESLINT.EXE"), "eslint");
         assert_eq!(tool_name("run.ps1"), "run");
+        assert_eq!(tool_name("tsc@5"), "tsc");
+        assert_eq!(tool_name("@vitest/browser@3.1"), "browser");
+        assert_eq!(tool_name("eslint@9.0.0"), "eslint");
     }
 
     #[test]
     fn kinds_detected() {
-        assert_eq!(kind("vitest run").as_deref(), Some("vitest"));
-        assert_eq!(kind("npx vitest").as_deref(), Some("vitest"));
-        assert_eq!(kind("npx -y jest --ci").as_deref(), Some("jest"));
-        assert_eq!(kind("pnpm exec vue-tsc --noEmit").as_deref(), Some("tsc"));
-        assert_eq!(kind("pnpm tsgo").as_deref(), Some("tsc"));
-        assert_eq!(kind("npx playwright test").as_deref(), Some("capture"));
-        assert_eq!(kind("docker compose -f a.yml up -d").as_deref(), Some("docker"));
-        assert_eq!(kind("docker-compose build").as_deref(), Some("docker"));
-        assert_eq!(kind("docker build .").as_deref(), Some("docker"));
-        assert_eq!(kind("npx biome check .").as_deref(), Some("eslint"));
-        assert_eq!(kind("python -m pytest -q").as_deref(), Some("pytest"));
-        assert_eq!(kind("uv run pytest").as_deref(), Some("pytest"));
-        assert_eq!(kind("npx vite build").as_deref(), Some("build"));
-        assert_eq!(kind("./gradlew assembleDebug").as_deref(), Some("build"));
-        assert_eq!(kind("cargo build --release").as_deref(), Some("build"));
-        assert_eq!(kind("flutter build apk").as_deref(), Some("build"));
-        assert_eq!(kind("dotnet build").as_deref(), Some("build"));
-        assert_eq!(kind("cargo test").as_deref(), Some("test"));
-        assert_eq!(kind("go test ./...").as_deref(), Some("test"));
-        assert_eq!(kind("npm test").as_deref(), Some("test"));
-        assert_eq!(kind("npm run build").as_deref(), Some("build"));
-        assert_eq!(kind("pnpm lint").as_deref(), Some("eslint"));
-        assert_eq!(kind("FOO=1 CI=true npx vitest").as_deref(), Some("vitest"));
-        assert_eq!(
-            kind("node ./node_modules/vitest/vitest.mjs run").as_deref(),
-            Some("vitest")
-        );
+        for (cmd, k) in [
+            ("vitest run", "vitest"),
+            ("npx vitest", "vitest"),
+            ("npx -y jest --ci", "jest"),
+            ("pnpm exec vue-tsc --noEmit", "tsc"),
+            ("pnpm tsgo", "tsc"),
+            ("npx playwright test", "capture"),
+            ("docker compose -f a.yml up -d", "docker"),
+            ("docker-compose build", "docker"),
+            ("docker build .", "docker"),
+            ("npx biome check .", "eslint"),
+            ("python -m pytest -q", "pytest"),
+            ("uv run pytest", "pytest"),
+            ("npx vite build", "build"),
+            ("./gradlew assembleDebug", "build"),
+            ("cargo build --release", "build"),
+            ("flutter build apk", "build"),
+            ("dotnet build", "build"),
+            ("cargo test", "test"),
+            ("go test ./...", "test"),
+            ("npm test", "test"),
+            ("npm run build", "build"),
+            ("pnpm lint", "eslint"),
+            ("FOO=1 CI=true npx vitest", "vitest"),
+            ("node ./node_modules/vitest/vitest.mjs run", "vitest"),
+            ("npx tsc@5 --noEmit", "tsc"),
+            ("npx vitest@3 run", "vitest"),
+            ("npx -p typescript@5 tsc", "tsc"),
+            ("pnpm dlx eslint@9 .", "eslint"),
+            ("bunx eslint@9 .", "eslint"),
+        ] {
+            assert_eq!(kind(cmd).as_deref(), Some(k), "{cmd}");
+        }
     }
 
     #[test]
@@ -858,20 +652,13 @@ mod tests {
     }
 
     #[test]
-    fn custom_patterns_and_costs() {
+    fn custom_patterns() {
         let mut kinds = BTreeMap::new();
         kinds.insert(
             "heavy".to_string(),
             KindConfig {
                 cost: Some(3),
                 patterns: vec!["make".into(), "bazel build".into()],
-            },
-        );
-        kinds.insert(
-            "vitest".to_string(),
-            KindConfig {
-                cost: Some(4),
-                patterns: vec![],
             },
         );
         assert_eq!(
@@ -883,11 +670,7 @@ mod tests {
             Some("heavy")
         );
         assert_eq!(detect_words(&w("bazel query x"), &kinds).kind, None);
-        assert_eq!(kind_cost("heavy", &kinds), 3);
-        assert_eq!(kind_cost("vitest", &kinds), 4);
-        assert_eq!(kind_cost("jest", &kinds), 2);
-        assert_eq!(kind_cost("eslint", &kinds), 1);
-        assert_eq!(kind_cost("other", &kinds), 1);
+        assert_eq!(kinds::cost("heavy", &kinds), 3);
     }
 
     #[test]
@@ -901,86 +684,128 @@ mod tests {
     }
 
     #[test]
-    fn segments() {
-        let s = "cd a && npx vitest run 2>&1 | tee \"x|y\"; echo 'a;b' & ls";
-        let parts: Vec<&str> = split_segments(s).into_iter().map(|r| &s[r]).collect();
+    fn vitest_hint() {
+        assert_eq!(hinted("vitest run", 2), Some(argv("vitest run --maxWorkers=2")));
+        assert_eq!(hinted("npx vitest", 1), Some(argv("npx vitest --maxWorkers=1")));
         assert_eq!(
-            parts,
-            vec!["cd a", "npx vitest run 2>&1", "tee \"x|y\"", "echo 'a;b'", "ls"]
-        );
-        let s = "(cd x && vitest)";
-        let parts: Vec<&str> = split_segments(s).into_iter().map(|r| &s[r]).collect();
-        assert_eq!(parts, vec!["cd x", "vitest"]);
-    }
-
-    #[test]
-    fn heredoc_bodies_are_not_commands() {
-        let s = "cat > run.sh <<'EOF'\nnpm test\nnpx vitest run\nEOF\nls";
-        let parts: Vec<&str> = split_segments(s).into_iter().map(|r| &s[r]).collect();
-        assert_eq!(parts, vec!["cat > run.sh <<'EOF'", "ls"]);
-        let s = "git commit -m \"$(cat <<'EOF'\nfix: run npm test in CI\n\nnpx vitest \"x\"\nEOF\n)\" && git push";
-        let parts: Vec<&str> = split_segments(s).into_iter().map(|r| &s[r]).collect();
-        assert_eq!(parts.len(), 2, "{parts:?}");
-        assert!(parts[0].starts_with("git commit"));
-        assert_eq!(parts[1], "git push");
-        let s = "git commit -m @'\nfix: don't skip\n\neslint cleanup\n'@; npm test";
-        let parts: Vec<&str> = split_segments(s).into_iter().map(|r| &s[r]).collect();
-        assert_eq!(parts.len(), 2, "{parts:?}");
-        assert!(parts[0].starts_with("git commit") && parts[0].ends_with("'@"));
-        assert_eq!(parts[1], "npm test");
-        let s = "cat <<-END >x\n\tcargo build\n\tEND\ncargo test";
-        let parts: Vec<&str> = split_segments(s).into_iter().map(|r| &s[r]).collect();
-        assert_eq!(parts, vec!["cat <<-END >x", "cargo test"]);
-    }
-
-    #[test]
-    fn tokenize_quotes() {
-        assert_eq!(
-            tokenize(r#"a "b c" 'd e' C:\x\y "q\"t""#),
-            vec!["a", "b c", "d e", r"C:\x\y", "q\"t"]
-        );
-    }
-
-    fn argv(s: &str) -> Vec<String> {
-        s.split(' ').map(String::from).collect()
-    }
-
-    #[test]
-    fn vitest_rule() {
-        assert_eq!(
-            vitest_args(&argv("vitest run"), 2),
-            Some(argv("vitest run --maxWorkers=2"))
-        );
-        assert_eq!(
-            vitest_args(&argv("npx vitest"), 1),
-            Some(argv("npx vitest --maxWorkers=1"))
-        );
-        assert_eq!(
-            vitest_args(&argv("pnpm exec vitest run"), 3),
+            hinted("pnpm exec vitest run", 3),
             Some(argv("pnpm exec vitest run --maxWorkers=3"))
         );
         assert_eq!(
-            vitest_args(&argv("yarn exec vitest -- a"), 1),
+            hinted("yarn exec vitest -- a", 1),
             Some(argv("yarn exec vitest --maxWorkers=1 -- a"))
         );
-        assert_eq!(vitest_args(&argv("vitest --maxWorkers=4"), 1), None);
-        assert_eq!(vitest_args(&argv("vitest --pool=forks"), 1), None);
-        assert_eq!(vitest_args(&argv("vitest --no-file-parallelism"), 1), None);
-        assert_eq!(vitest_args(&argv("npm run test"), 1), None);
-        assert_eq!(vitest_args(&argv("npx jest"), 1), None);
-        assert_eq!(vitest_args(&["npx vitest run".to_string()], 1), None);
+        assert_eq!(hinted("vitest --maxWorkers=4", 1), None);
+        assert_eq!(hinted("vitest --pool=forks", 1), None);
+        assert_eq!(hinted("vitest --no-file-parallelism", 1), None);
+        assert_eq!(hinted("npm run test", 1), None);
+        assert_eq!(hinted("npx jest", 1), None);
+        assert_eq!(hinted("FOO=1 vitest", 1), None);
+        let shell = vec!["npx vitest run".to_string()];
+        assert_eq!(
+            apply_hints(&shell, "vitest", Path::new("."), &|_| 1, &|_| false).argv,
+            None
+        );
+    }
+
+    #[test]
+    fn gradle_and_cargo_hints() {
+        assert_eq!(
+            hinted("./gradlew build", 4),
+            Some(argv("./gradlew build --max-workers=4"))
+        );
+        assert_eq!(hinted("gradle test --max-workers=2", 4), None);
+        assert_eq!(hinted("gradlew build -Dorg.gradle.workers.max=2", 4), None);
+        assert_eq!(hinted("gradlew --version", 4), None);
+        assert_eq!(hinted("gradlew", 4), None);
+        assert_eq!(hinted("mvn package", 4), None);
+        let c = apply_hints(
+            &argv("cargo build"),
+            "cargo",
+            Path::new("/nonexistent-cwd"),
+            &|_| 5,
+            &|_| false,
+        );
+        // At most ours; lower if this machine's ~/.cargo config sets build.jobs.
+        assert_eq!(c.env.len(), 1);
+        assert_eq!(c.env[0].0, "CARGO_BUILD_JOBS");
+        assert!((1..=5).contains(&c.env[0].1.parse::<u32>().unwrap()));
+        assert!(
+            apply_hints(&argv("cargo build"), "cargo", Path::new("."), &|_| 5, &|_| true)
+                .env
+                .is_empty()
+        );
+    }
+
+    fn refused(a: &[String]) -> bool {
+        matches!(disposition(a, false), Disposition::Refuse { .. })
     }
 
     #[test]
     fn compose_up_refused() {
-        assert!(refuse_reason(&argv("docker compose up")).is_some());
-        assert!(refuse_reason(&argv("docker-compose -f x.yml up --build")).is_some());
-        assert!(refuse_reason(&["cd a && docker compose up".to_string()]).is_some());
-        assert!(refuse_reason(&argv("docker compose up -d")).is_none());
-        assert!(refuse_reason(&argv("docker compose up --detach")).is_none());
-        assert!(refuse_reason(&argv("docker-compose up -dV")).is_none());
-        assert!(refuse_reason(&argv("docker compose up --wait")).is_none());
-        assert!(refuse_reason(&argv("docker compose build")).is_none());
+        assert!(refused(&argv("docker compose up")));
+        assert!(refused(&argv("docker-compose -f x.yml up --build")));
+        assert!(refused(&["cd a && docker compose up".to_string()]));
+        assert!(!refused(&argv("docker compose up -d")));
+        assert!(!refused(&argv("docker compose up --detach")));
+        assert!(!refused(&argv("docker-compose up -dV")));
+        assert!(!refused(&argv("docker compose up --wait")));
+        assert!(!refused(&argv("docker compose build")));
+        assert_eq!(
+            detached_compose(&argv("docker compose -f a.yml up --build")),
+            Some(argv("docker compose -f a.yml up -d --build"))
+        );
+        assert_eq!(detached_compose(&argv("docker compose up -d")), None);
+    }
+
+    #[test]
+    fn watch_modes_are_refused_with_the_one_shot_form() {
+        let fixed = |s: &str, tty: bool| match disposition(&argv(s), tty) {
+            Disposition::Refuse { fixed, .. } => fixed.map(|f| f.join(" ")),
+            other => panic!("{s}: {other:?}"),
+        };
+        assert_eq!(fixed("npx tsc --watch", false).as_deref(), Some("npx tsc"));
+        assert_eq!(fixed("npx tsc -w -p .", false).as_deref(), Some("npx tsc -p ."));
+        assert_eq!(fixed("npx jest --watchAll", false).as_deref(), Some("npx jest"));
+        assert_eq!(
+            fixed("npx vitest watch", false).as_deref(),
+            Some("npx vitest run")
+        );
+        assert_eq!(fixed("vitest", true).as_deref(), Some("vitest run"));
+        assert_eq!(
+            fixed("npx vitest --coverage", true).as_deref(),
+            Some("npx vitest run --coverage")
+        );
+        assert_eq!(fixed("docker run -it ubuntu", false), None);
+        // Not endless: one-shot forms, and vitest without a terminal (it runs once then).
+        for ok in [
+            "npx tsc -p .",
+            "npx vitest run",
+            "vitest",
+            "docker build -t x .",
+            "docker run --rm x",
+        ] {
+            assert_eq!(disposition(&argv(ok), false), Disposition::Queue, "{ok}");
+        }
+    }
+
+    #[test]
+    fn dev_servers_and_help_run_without_the_queue() {
+        for c in [
+            "npx vite",
+            "npm run dev",
+            "pnpm dev",
+            "next dev",
+            "ng serve",
+            "cargo build --help",
+            "npx tsc --version",
+        ] {
+            assert!(
+                matches!(disposition(&argv(c), false), Disposition::Light(_)),
+                "{c}"
+            );
+        }
+        assert_eq!(disposition(&argv("npx vite build"), false), Disposition::Queue);
     }
 
     #[test]
@@ -989,18 +814,13 @@ mod tests {
         let proj = tmp.path().join("proj");
         std::fs::create_dir_all(proj.join("node_modules")).unwrap();
         std::fs::create_dir_all(proj.join("src/deep")).unwrap();
-        let d = detect_words(&w("npx vitest"), &BTreeMap::new());
-        let k1 = exclusive_keys(&d, &proj.join("src/deep"));
-        let k2 = exclusive_keys(&d, &proj);
+        let k1 = exclusive_keys("vitest", "vitest", &proj.join("src/deep"));
         assert_eq!(k1.len(), 1);
-        assert_eq!(k1, k2);
-        let lint = detect_words(&w("npx eslint ."), &BTreeMap::new());
-        assert!(exclusive_keys(&lint, &proj).is_empty());
-
+        assert_eq!(k1, exclusive_keys("vitest", "vitest", &proj));
+        assert!(exclusive_keys("eslint", "eslint", &proj).is_empty());
         std::fs::write(proj.join("Cargo.toml"), "").unwrap();
         std::fs::create_dir_all(proj.join("target")).unwrap();
-        let c = detect_words(&w("cargo build"), &BTreeMap::new());
-        let ck = exclusive_keys(&c, &proj.join("src"));
+        let ck = exclusive_keys("build", "cargo", &proj.join("src"));
         assert_eq!(ck.len(), 1);
         assert!(ck[0].starts_with("cargo:"));
     }

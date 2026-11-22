@@ -32,8 +32,14 @@ pub struct FileConfig {
     pub min_free_gb: Option<f64>,
     pub pass_limit_min: Option<f64>,
     pub vitest_workers: Option<u32>,
+    pub ceiling_gb: Option<f64>,
+    pub min_free_disk_gb: Option<f64>,
+    pub critical_free_gb: Option<f64>,
     #[serde(default)]
     pub kinds: BTreeMap<String, KindConfig>,
+    /// Named resources and their slots (`[resources] db = 1`).
+    #[serde(default)]
+    pub resources: BTreeMap<String, u32>,
 }
 
 /// Effective settings after defaults, file and env are merged.
@@ -44,19 +50,73 @@ pub struct Config {
     pub pass_limit_ms: u64,
     pub vitest_workers: u32,
     pub low_cpu: bool,
+    /// Stop a job whose process tree uses more than this (0 = off).
+    pub ceiling_bytes: u64,
+    /// Stop the biggest job when free RAM stays below this for a few seconds (0 = off).
+    pub critical_free_bytes: u64,
+    /// A job waits while its cwd's drive has less free space than this (0 = off).
+    pub min_free_disk_bytes: u64,
     pub kinds: BTreeMap<String, KindConfig>,
+    pub resources: BTreeMap<String, u32>,
 }
 
+/// `db=1,gpu=2` -> map.
+pub fn parse_resources(s: &str) -> BTreeMap<String, u32> {
+    s.split(',')
+        .filter_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            Some((k.trim().to_string(), v.trim().parse().ok()?))
+        })
+        .filter(|(k, _): &(String, u32)| !k.is_empty())
+        .collect()
+}
+
+/// Cores kept free for the editor, the agents and the OS.
+const RESERVED_CORES: usize = 2;
+/// RAM per budget point.
+const GB_PER_POINT: f64 = 4.0;
+/// The budget never goes below this.
+const MIN_BUDGET: u64 = 2;
+/// Free-RAM gate: a fraction of the RAM, at least this many GB.
+const MIN_FREE_RAM_FRACTION: f64 = 1.0 / 8.0;
+const MIN_FREE_FLOOR_GB: f64 = 3.0;
+/// Memory ceiling for one job's tree, as a fraction of the RAM.
+const CEILING_FRACTION: f64 = 0.5;
+/// Critical free-RAM floor: a fraction of the RAM, at most this many GB.
+const CRITICAL_FRACTION: f64 = 0.05;
+const CRITICAL_MAX_GB: f64 = 1.0;
+/// Free space needed on the cwd's drive.
+pub const DEFAULT_MIN_FREE_DISK_GB: f64 = 5.0;
+/// Minutes a waiter may be passed.
+pub const DEFAULT_PASS_LIMIT_MIN: f64 = 10.0;
+
+fn ram_gb(m: Machine) -> f64 {
+    m.total_ram as f64 / GB
+}
+
+/// Logical cores − 2, capped at floor(RAM GB / 4), at least 2.
 pub fn default_budget(m: Machine) -> u32 {
-    let by_cores = m.logical_cores.saturating_sub(2) as u64;
-    let by_ram = (m.total_ram as f64 / GB / 4.0).floor() as u64;
-    by_cores.min(by_ram).max(2) as u32
+    let by_cores = m.logical_cores.saturating_sub(RESERVED_CORES) as u64;
+    let by_ram = (ram_gb(m) / GB_PER_POINT).floor() as u64;
+    by_cores.min(by_ram).max(MIN_BUDGET) as u32
 }
 
+/// max(3, RAM / 8) GB.
 pub fn default_min_free_gb(m: Machine) -> f64 {
-    (m.total_ram as f64 / GB / 8.0).max(3.0)
+    (ram_gb(m) * MIN_FREE_RAM_FRACTION).max(MIN_FREE_FLOOR_GB)
 }
 
+/// Half of the RAM.
+pub fn default_ceiling_gb(m: Machine) -> f64 {
+    ram_gb(m) * CEILING_FRACTION
+}
+
+/// 5% of the RAM, at most 1 GB.
+pub fn default_critical_free_gb(m: Machine) -> f64 {
+    (ram_gb(m) * CRITICAL_FRACTION).min(CRITICAL_MAX_GB)
+}
+
+/// 1 worker up to 4 cores, 2 below 12, else 3.
 pub fn default_vitest_workers(m: Machine) -> u32 {
     match m.logical_cores {
         0..=4 => 1,
@@ -70,18 +130,12 @@ pub fn home_dir() -> PathBuf {
     if let Some(h) = std::env::var_os("CALMRUN_HOME").filter(|v| !v.is_empty()) {
         return PathBuf::from(h);
     }
-    let base = if cfg!(target_os = "linux") {
-        dirs::state_dir()
-    } else if cfg!(target_os = "macos") {
-        dirs::data_dir()
-    } else {
-        dirs::data_local_dir()
-    };
-    base.or_else(|| dirs::home_dir().map(|h| h.join(".local").join("state")))
+    crate::sys::state_base_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("calmrun")
 }
 
+/// The config file: `CALMRUN_CONFIG`, else `config.toml` in the state directory.
 pub fn config_path(home: &Path) -> PathBuf {
     match std::env::var_os("CALMRUN_CONFIG").filter(|v| !v.is_empty()) {
         Some(p) => PathBuf::from(p),
@@ -89,6 +143,7 @@ pub fn config_path(home: &Path) -> PathBuf {
     }
 }
 
+/// Parse the config file; a missing file is an empty config.
 pub fn read_file_config(path: &Path) -> Result<FileConfig, String> {
     match std::fs::read_to_string(path) {
         Ok(text) => toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display())),
@@ -111,13 +166,25 @@ pub fn resolve(m: Machine, file: FileConfig, env: &dyn Fn(&str) -> Option<String
         .max(0.0);
     let pass_min = num("CALMRUN_PASS_MIN")
         .or(file.pass_limit_min)
-        .unwrap_or(10.0)
+        .unwrap_or(DEFAULT_PASS_LIMIT_MIN)
         .max(0.0);
     let vitest_workers = num("CALMRUN_VITEST_WORKERS")
         .map(|v| v as u32)
         .or(file.vitest_workers)
         .unwrap_or_else(|| default_vitest_workers(m))
         .max(1);
+    let ceiling_gb = num("CALMRUN_CEILING_GB")
+        .or(file.ceiling_gb)
+        .unwrap_or_else(|| default_ceiling_gb(m))
+        .max(0.0);
+    let critical_gb = num("CALMRUN_CRITICAL_FREE_GB")
+        .or(file.critical_free_gb)
+        .unwrap_or_else(|| default_critical_free_gb(m))
+        .max(0.0);
+    let disk_gb = num("CALMRUN_MIN_FREE_DISK_GB")
+        .or(file.min_free_disk_gb)
+        .unwrap_or(DEFAULT_MIN_FREE_DISK_GB)
+        .max(0.0);
     let low_cpu = !matches!(
         env("CALMRUN_LOW_CPU").as_deref().map(str::trim),
         Some("0" | "false" | "no" | "off")
@@ -128,10 +195,21 @@ pub fn resolve(m: Machine, file: FileConfig, env: &dyn Fn(&str) -> Option<String
         pass_limit_ms: (pass_min * 60_000.0) as u64,
         vitest_workers,
         low_cpu,
+        ceiling_bytes: (ceiling_gb * GB) as u64,
+        critical_free_bytes: (critical_gb * GB) as u64,
+        min_free_disk_bytes: (disk_gb * GB) as u64,
         kinds: file.kinds,
+        resources: {
+            let mut r = file.resources;
+            if let Some(v) = env("CALMRUN_RESOURCES") {
+                r.extend(parse_resources(&v));
+            }
+            r
+        },
     }
 }
 
+/// Bytes to (binary) gigabytes.
 pub fn bytes_to_gb(b: u64) -> f64 {
     b as f64 / GB
 }
@@ -154,8 +232,25 @@ pub fn default_config_text(m: Machine) -> String {
 # (env CALMRUN_PASS_MIN). 0 = always strict first-come order.
 # pass_limit_min = 10
 
+# Stop a job whose whole process tree uses more memory than this (env CALMRUN_CEILING_GB).
+# 0 turns it off. Default: half the RAM.
+# ceiling_gb = {ceiling:.1}
+
+# When free RAM stays below this for a few seconds, stop the running job that uses the most
+# memory (env CALMRUN_CRITICAL_FREE_GB). 0 turns it off. Default: 5% of RAM, at most 1 GB.
+# critical_free_gb = {critical:.2}
+
+# A job waits while the drive of its working directory has less free space than this
+# (env CALMRUN_MIN_FREE_DISK_GB). 0 turns it off. If nothing else runs it starts anyway.
+# min_free_disk_gb = 5
+
 # --maxWorkers value appended to direct vitest calls (env CALMRUN_VITEST_WORKERS).
 # vitest_workers = {workers}
+
+# Named resources and how many jobs may hold each at once (env CALMRUN_RESOURCES="db=1").
+# A job takes a slot with --needs db. A resource that is not listed has 1 slot.
+# [resources]
+# db = 1
 
 # Override the cost of a built-in kind, or add your own kind with command patterns.
 # A pattern is the command's first words, e.g. "make" or "bazel build".
@@ -169,6 +264,8 @@ pub fn default_config_text(m: Machine) -> String {
         budget = default_budget(m),
         min_free = default_min_free_gb(m),
         workers = default_vitest_workers(m),
+        ceiling = default_ceiling_gb(m),
+        critical = default_critical_free_gb(m),
     )
 }
 
@@ -198,6 +295,9 @@ mod tests {
         assert_eq!(default_vitest_workers(m(4, 8)), 1);
         assert_eq!(default_vitest_workers(m(8, 8)), 2);
         assert_eq!(default_vitest_workers(m(12, 8)), 3);
+        assert_eq!(default_ceiling_gb(m(8, 16)), 8.0);
+        assert_eq!(default_critical_free_gb(m(8, 16)), 0.8);
+        assert_eq!(default_critical_free_gb(m(8, 64)), 1.0);
     }
 
     #[test]
@@ -216,6 +316,17 @@ mod tests {
         assert_eq!(c.pass_limit_ms, 120_000);
         assert!(!c.low_cpu);
         assert_eq!(c.kinds["vitest"].cost, Some(3));
+    }
+
+    #[test]
+    fn resources_from_file_and_env() {
+        let file: FileConfig = toml::from_str("[resources]\ndb = 1\ngpu = 2\n").unwrap();
+        let env = |k: &str| (k == "CALMRUN_RESOURCES").then(|| "gpu=4, cache = 3,bad".to_string());
+        let c = resolve(m(8, 16), file, &env);
+        assert_eq!(c.resources["db"], 1);
+        assert_eq!(c.resources["gpu"], 4);
+        assert_eq!(c.resources["cache"], 3);
+        assert_eq!(c.resources.len(), 3);
     }
 
     #[test]

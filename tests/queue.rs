@@ -28,6 +28,8 @@ impl Env {
         c.env("CALMRUN_HOME", self.home.path())
             .env("CALMRUN_BUDGET", budget.to_string())
             .env("CALMRUN_MIN_FREE_GB", "0")
+            .env("CALMRUN_MIN_FREE_DISK_GB", "0")
+            .env("CALMRUN_CRITICAL_FREE_GB", "0")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         c
@@ -39,7 +41,7 @@ impl Env {
         c.args(flags)
             .arg("--")
             .arg(EXE)
-            .args(["__probe", "--id", id, "--sleep-ms", &ms.to_string(), "--log"])
+            .args(["__probe", "--name", id, "--sleep-ms", &ms.to_string(), "--log"])
             .arg(&self.log);
         if let Some(d) = cwd {
             c.current_dir(d);
@@ -253,7 +255,7 @@ fn nested_run_does_not_deadlock() {
     let env = Env::new();
     let mut c = env.cmd(2);
     c.args([
-        "--cost", "2", "--", EXE, "--cost", "2", "--", EXE, "__probe", "--id", "inner", "--log",
+        "--cost", "2", "--", EXE, "--cost", "2", "--", EXE, "__probe", "--name", "inner", "--log",
     ])
     .arg(&env.log);
     let child = c.spawn().unwrap();
@@ -356,4 +358,227 @@ fn windows_cmd_shim_arguments_survive() {
     assert!(out.status.success());
     let got: Vec<String> = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(got, args);
+}
+
+#[test]
+fn wait_timeout_keeps_the_place_with_a_ticket() {
+    let env = Env::new();
+    let holder = env.probe(2, &["--cost", "2"], "holder", 6000, None);
+    env.wait_queue(1, 0);
+    // B gives up after 1 s and gets a ticket.
+    let out = env
+        .cmd(2)
+        .args([
+            "--cost",
+            "2",
+            "--wait-timeout",
+            "1",
+            "--",
+            EXE,
+            "__probe",
+            "--name",
+            "b",
+            "--log",
+        ])
+        .arg(&env.log)
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(75));
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    let next = err
+        .lines()
+        .find_map(|l| l.strip_prefix("calmrun: next: "))
+        .unwrap_or_else(|| panic!("no next line in: {err}"))
+        .to_string();
+    assert!(next.starts_with("calmrun --ticket "), "{next}");
+    let ticket = next.split_whitespace().nth(2).unwrap().to_string();
+    let s = env.status();
+    assert_eq!(s["parked"][0]["ticket"].to_string(), ticket);
+    assert_eq!(s["waiting"].as_array().unwrap().len(), 0);
+    // C queues normally; then B comes back with its ticket and is still ahead of C.
+    let c = env.probe(2, &["--cost", "2"], "c", 200, None);
+    env.wait_queue(1, 1);
+    let b = env.probe(2, &["--cost", "2", "--ticket", &ticket], "b", 200, None);
+    env.wait_queue(1, 2);
+    assert!(wait_all(vec![holder, b, c], Duration::from_secs(60))
+        .iter()
+        .all(|&x| x == 0));
+    let order: Vec<String> = env.intervals().into_iter().map(|x| x.0).collect();
+    assert_eq!(order, vec!["holder", "b", "c"]);
+    assert_eq!(env.status()["parked"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn refusal_prints_the_next_command() {
+    let env = Env::new();
+    let out = env
+        .cmd(2)
+        .args(["--", "docker", "compose", "up"])
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("calmrun: next: calmrun -- docker compose up -d"),
+        "{err}"
+    );
+}
+
+#[test]
+fn guide_prints_instructions() {
+    let env = Env::new();
+    let out = env.cmd(2).arg("guide").stdout(Stdio::piped()).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("calmrun -- npx vitest run") && text.contains("--wait-timeout"));
+}
+
+#[test]
+fn short_disk_waits_and_says_why() {
+    let env = Env::new();
+    // Ask for far more free disk than any machine has.
+    let mut holder_cmd = env.cmd(2);
+    holder_cmd
+        .env("CALMRUN_MIN_FREE_DISK_GB", "999999")
+        .args([
+            "--cost",
+            "1",
+            "--label",
+            "holder",
+            "--",
+            EXE,
+            "__probe",
+            "--sleep-ms",
+            "5000",
+        ])
+        .stderr(Stdio::piped());
+    let holder = holder_cmd.spawn().unwrap();
+    env.wait_queue(1, 0);
+    let out = env
+        .cmd(2)
+        .env("CALMRUN_MIN_FREE_DISK_GB", "999999")
+        .args(["--cost", "1", "--wait-timeout", "2", "--", EXE, "__probe"])
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(75));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("waiting for disk space"), "{err}");
+    assert!(err.contains("; running: holder in "), "{err}");
+    let h = holder.wait_with_output().unwrap();
+    assert!(h.status.success());
+    let herr = String::from_utf8_lossy(&h.stderr);
+    assert!(herr.contains("starting anyway"), "{herr}");
+}
+
+#[test]
+fn cargo_gets_a_job_count() {
+    let env = Env::new();
+    let dir = env.home.path().join("bin");
+    std::fs::create_dir_all(&dir).unwrap();
+    let fake = dir.join(if cfg!(windows) { "cargo.exe" } else { "cargo" });
+    std::fs::copy(EXE, &fake).unwrap();
+    let out = env
+        .cmd(4)
+        .env_remove("CARGO_BUILD_JOBS")
+        .arg("--")
+        .arg(&fake)
+        .args(["__probe", "--print-env", "CARGO_BUILD_JOBS"])
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let n: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+    assert!(n >= 1);
+    // An explicit setting wins.
+    let out = env
+        .cmd(4)
+        .env("CARGO_BUILD_JOBS", "7")
+        .arg("--")
+        .arg(&fake)
+        .args(["__probe", "--print-env", "CARGO_BUILD_JOBS"])
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "7");
+}
+
+#[test]
+fn named_resource_is_held_by_one_job_at_a_time() {
+    let env = Env::new();
+    let kids = vec![
+        env.probe(4, &["--cost", "1", "--needs", "db"], "db1", 600, None),
+        env.probe(4, &["--cost", "1", "--needs", "db"], "db2", 600, None),
+        env.probe(4, &["--cost", "1"], "free", 600, None),
+    ];
+    assert!(wait_all(kids, Duration::from_secs(60)).iter().all(|&c| c == 0));
+    let iv = env.intervals();
+    let db: Vec<_> = iv.iter().filter(|x| x.0.starts_with("db")).cloned().collect();
+    assert_eq!(max_overlap(&db, |_| 1), 1, "db holders overlapped: {db:?}");
+    assert!(
+        max_overlap(&iv, |_| 1) >= 2,
+        "the job without needs should run alongside: {iv:?}"
+    );
+}
+
+#[test]
+fn separate_queues_do_not_share_points() {
+    let env = Env::new();
+    let a = env.probe(2, &["--cost", "2", "--id", "alpha"], "a", 1500, None);
+    let b = env.probe(2, &["--cost", "2", "--id", "beta"], "b", 1500, None);
+    // Each queue has its own budget, so both run at once.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let out = env
+            .cmd(2)
+            .args(["status", "--json", "--id", "alpha"])
+            .stdout(Stdio::piped())
+            .output()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        if v["running"].as_array().is_some_and(|r| r.len() == 1) {
+            assert_eq!(v["queue"], "alpha");
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(wait_all(vec![a, b], Duration::from_secs(60))
+        .iter()
+        .all(|&c| c == 0));
+    assert_eq!(max_overlap(&env.intervals(), |_| 1), 2);
+    // The default queue never saw them.
+    assert_eq!(env.status()["running"].as_array().unwrap().len(), 0);
+    let bad = env
+        .cmd(2)
+        .args(["--id", "../x", "--", EXE, "__probe"])
+        .status()
+        .unwrap();
+    assert_eq!(bad.code(), Some(2));
+}
+
+#[cfg(windows)]
+#[test]
+fn relative_cmd_path_runs_from_its_folder() {
+    let env = Env::new();
+    let dir = env.home.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("gradlew.bat"),
+        format!("@\"{EXE}\" __probe --print-args -- %*\r\n"),
+    )
+    .unwrap();
+    let out = env
+        .cmd(2)
+        .current_dir(&dir)
+        .args(["--", "./gradlew", "build"])
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    // The gradle rule adds --max-workers to a direct gradlew call.
+    let got: Vec<String> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(got[0], "build");
+    assert!(got[1].starts_with("--max-workers="), "{got:?}");
 }
