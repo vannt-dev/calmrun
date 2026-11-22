@@ -115,6 +115,8 @@ fn run_queued(cli: Cli) -> i32 {
         argv = a;
     }
 
+    // Installed before the nested shortcut so an inner calmrun also forwards signals.
+    runner::install_signal_handler();
     // Nested: an outer calmrun already holds points for us.
     if let Some(held) = std::env::var("CALMRUN_HELD")
         .ok()
@@ -182,7 +184,6 @@ fn run_queued(cli: Cli) -> i32 {
         started_ms: None,
         child_pid: None,
     };
-    runner::install_signal_handler();
     let enq = store.with_lock(|s| {
         prune_dead(s, &mut sys);
         s.next_id += 1;

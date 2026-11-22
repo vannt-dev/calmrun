@@ -198,6 +198,8 @@ mod tests {
     fn powershell_tool_too() {
         let v = run("PowerShell", "npm test; echo $LASTEXITCODE", Mode::Deny).unwrap();
         assert!(reason(&v).contains("calmrun -- npm test; echo $LASTEXITCODE"));
+        let here = "git commit -m @'\nfix: don't skip the queue\n\neslint config cleanup\n'@";
+        assert!(run("PowerShell", here, Mode::Deny).is_none());
     }
 
     #[test]

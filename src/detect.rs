@@ -535,6 +535,26 @@ pub fn split_segments(s: &str) -> Vec<Range<usize>> {
                 continue;
             }
         }
+        // PowerShell here-strings: `@'` / `@"` at a line end, closed by `'@` / `"@` at the
+        // start of a later line. The body is one string argument, never commands.
+        if c == b'@' && matches!(bytes.get(i + 1), Some(b'\'' | b'"')) {
+            let q = bytes[i + 1];
+            let line_end = s[i + 2..].find('\n').map(|e| i + 2 + e);
+            if let Some(le) = line_end.filter(|&le| s[i + 2..le].trim().is_empty()) {
+                let close = [q, b'@'];
+                let mut pos = le + 1;
+                let mut found = None;
+                while pos < bytes.len() {
+                    if bytes[pos..].starts_with(&close) {
+                        found = Some(pos + 2);
+                        break;
+                    }
+                    pos = s[pos..].find('\n').map_or(bytes.len(), |e| pos + e + 1);
+                }
+                i = found.unwrap_or(bytes.len());
+                continue;
+            }
+        }
         if c == b'\n' && !pending.is_empty() {
             if quote.is_none() {
                 push(&mut out, seg_start, i);
@@ -903,6 +923,11 @@ mod tests {
         assert_eq!(parts.len(), 2, "{parts:?}");
         assert!(parts[0].starts_with("git commit"));
         assert_eq!(parts[1], "git push");
+        let s = "git commit -m @'\nfix: don't skip\n\neslint cleanup\n'@; npm test";
+        let parts: Vec<&str> = split_segments(s).into_iter().map(|r| &s[r]).collect();
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert!(parts[0].starts_with("git commit") && parts[0].ends_with("'@"));
+        assert_eq!(parts[1], "npm test");
         let s = "cat <<-END >x\n\tcargo build\n\tEND\ncargo test";
         let parts: Vec<&str> = split_segments(s).into_iter().map(|r| &s[r]).collect();
         assert_eq!(parts, vec!["cat <<-END >x", "cargo test"]);
