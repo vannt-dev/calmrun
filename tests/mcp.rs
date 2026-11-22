@@ -144,11 +144,17 @@ fn lists_tools_and_runs_a_task() {
     assert!(text.contains("[\"hello\",\"world\"]"), "{text}");
     let log = s["log_path"].as_str().unwrap();
     assert!(std::fs::read_to_string(log).unwrap().contains("hello"));
+    // The output also travels in structuredContent, for clients that show only that.
+    let tail = s["output_tail"].as_str().unwrap();
+    assert!(tail.contains("[\"hello\",\"world\"]"), "{tail}");
 
     let r = c.call(4, "queue_status", json!({}), None);
     assert_eq!(r["result"]["structuredContent"]["budget"], 2);
     let r = c.call(5, "bump", json!({"label": "nothing-matches"}), None);
     assert_eq!(r["result"]["structuredContent"]["moved"], 0);
+    // Nothing matching is a normal answer, not a tool error.
+    assert_eq!(r["result"]["structuredContent"]["matched"], 0);
+    assert_eq!(r["result"]["isError"], false);
 
     c.send(json!({"jsonrpc": "2.0", "id": 6, "method": "no/such"}));
     assert_eq!(c.response(6, Duration::from_secs(10))["error"]["code"], -32601);
@@ -276,7 +282,7 @@ fn relative_program_resolves_in_the_task_cwd() {
     .unwrap();
     let mut c = Client::start(home.path());
     init(&mut c);
-    for (i, cmd) in ["./tool x", "tool x", ".\\tool x"].iter().enumerate() {
+    for (i, cmd) in ["./tool x", ".\\tool x"].iter().enumerate() {
         let r = c.call(
             10 + i as i64,
             "run_task",
@@ -287,5 +293,64 @@ fn relative_program_resolves_in_the_task_cwd() {
         assert_eq!(s["exit_code"], 0, "{cmd}: {r}");
         let text = r["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("[\"x\"]"), "{cmd}: {text}");
+    }
+    // A bare name is never taken from the working directory (it could be a planted shim).
+    let r = c.call(
+        20,
+        "run_task",
+        json!({"command": "tool x", "cwd": dir.to_string_lossy()}),
+        None,
+    );
+    assert_eq!(r["result"]["structuredContent"]["exit_code"], 127, "{r}");
+}
+
+#[test]
+fn leading_env_assignments_work_on_every_os() {
+    let home = tempfile::tempdir().unwrap();
+    let mut c = Client::start(home.path());
+    init(&mut c);
+    let cmd = format!(
+        "CALMRUN_PROBE_VALUE=hi-there {}",
+        probe_cmd("--print-env CALMRUN_PROBE_VALUE")
+    );
+    let r = c.call(2, "run_task", json!({"command": cmd}), None);
+    let s = &r["result"]["structuredContent"];
+    assert_eq!(s["exit_code"], 0, "{r}");
+    assert!(s["output_tail"].as_str().unwrap().contains("hi-there"), "{r}");
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_stops_the_server_and_its_tasks() {
+    let home = tempfile::tempdir().unwrap();
+    let mut c = Client::start(home.path());
+    init(&mut c);
+    c.send(json!({
+        "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+        "params": {"name": "run_task", "arguments": {"command": probe_cmd("--sleep-ms 60000")}}
+    }));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let child = loop {
+        let out = calmrun(home.path()).args(["status", "--json"]).output().unwrap();
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        if let Some(p) = v["running"][0]["child_pid"].as_u64() {
+            break p as i32;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // SAFETY: plain syscalls on processes this test started.
+    unsafe {
+        libc::kill(c.child.id() as i32, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while c.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the server ignored SIGTERM");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while unsafe { libc::kill(child, 0) } == 0 {
+        assert!(Instant::now() < deadline, "the task outlived the server");
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
