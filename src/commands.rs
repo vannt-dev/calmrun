@@ -153,6 +153,13 @@ fn print_jobs(state: &State, now: u64) {
     for (i, j) in waiting.iter().enumerate() {
         row(j, format!("{}{}", i + 1, if j.high { "!" } else { "" }));
     }
+    let kept: Vec<&Job> = state.jobs.iter().filter(|j| j.parked()).collect();
+    if !kept.is_empty() {
+        println!("kept for a ticket ({}):", kept.len());
+    }
+    for j in kept {
+        println!("  {}", crate::messages::kept_line(j, now));
+    }
     for w in crate::messages::stuck_warnings(state, now, status::STUCK_MS) {
         println!("warning: {w}");
     }
@@ -239,7 +246,7 @@ pub fn hook() -> i32 {
     let kinds = config::read_file_config(&config::config_path(&home))
         .map(|f| f.kinds)
         .unwrap_or_default();
-    if let Some(out) = hook::handle(&input, hook::Mode::from_env(), &kinds) {
+    if let Some(out) = hook::handle(&input, hook::Mode::from_env(), &kinds, &hook::program_name()) {
         println!("{out}");
     }
     0

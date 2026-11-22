@@ -15,6 +15,27 @@ pub struct Limits {
     pub min_free_bytes: u64,
     /// A waiter older than this may no longer be passed (0 = strict order).
     pub pass_limit_ms: u64,
+    /// RAM assumed taken per point by a job that has just started, before it shows up in
+    /// the free-RAM reading (0 = no reservation).
+    pub ram_per_point: u64,
+    /// How long that assumption fades out over.
+    pub reserve_window_ms: u64,
+}
+
+/// RAM assumed taken by jobs started in the last `reserve_window_ms`, fading linearly.
+pub fn recent_reservation(jobs: &[Job], now_ms: u64, limits: &Limits) -> u64 {
+    if limits.reserve_window_ms == 0 {
+        return 0;
+    }
+    jobs.iter()
+        .filter_map(|j| j.started_ms.map(|s| (j, now_ms.saturating_sub(s))))
+        .filter(|(_, age)| *age < limits.reserve_window_ms)
+        .map(|(j, age)| {
+            let full = limits.ram_per_point * effective_cost(j.cost, limits.budget) as u64;
+            (full as u128 * (limits.reserve_window_ms - age) as u128 / limits.reserve_window_ms as u128)
+                as u64
+        })
+        .sum()
 }
 
 /// Everything besides the jobs that a scheduling pass looks at.
@@ -177,6 +198,8 @@ mod tests {
         budget: 4,
         min_free_bytes: 3 * GB,
         pass_limit_ms: 600_000,
+        ram_per_point: 0,
+        reserve_window_ms: 0,
     };
 
     fn job(id: u64, cost: u32, running: bool) -> Job {
@@ -361,6 +384,26 @@ mod tests {
         let plan = schedule_with(&jobs, &inputs, gates);
         assert_eq!(plan.admitted, vec![2, 4]);
         assert_eq!(plan.reason(1), Block::Key);
+    }
+
+    #[test]
+    fn just_started_jobs_reserve_ram_for_the_whole_pass() {
+        let lim = Limits {
+            ram_per_point: GB,
+            reserve_window_ms: 20_000,
+            ..LIM
+        };
+        // 4.5 GB free, gate needs 3 GB. One job started 0 s ago with cost 1 reserves 1 GB:
+        // 3.5 GB left, so one more cost-1 job may start (taking 1 GB), the next may not.
+        let mut started = job(1, 1, true);
+        started.started_ms = Some(2_000);
+        let jobs = vec![started, job(2, 1, false), job(3, 1, false)];
+        let (adm, blocked) = plan(&jobs, 2_000, 4 * GB + GB / 2, lim);
+        assert_eq!(adm, vec![2]);
+        assert!(matches!(blocked[0], (3, Block::Ram { .. })), "{blocked:?}");
+        // The reservation fades: half way through the window only half is reserved.
+        assert_eq!(recent_reservation(&jobs, 12_000, &lim), GB / 2);
+        assert_eq!(recent_reservation(&jobs, 30_000, &lim), 0);
     }
 
     #[test]

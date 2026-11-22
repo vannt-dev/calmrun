@@ -62,8 +62,10 @@ Add one entry to `RULES` in `src/kinds.rs`:
 rule(&["bazel"], When::Sub(&["build", "test"]), "build"),
 ```
 
-`When` covers the usual shapes: always, a subcommand, `docker compose <sub>`, and package
-scripts. A brand-new kind also needs one entry in `KINDS` (name, default cost, exclusive-key
+`When` covers the usual shapes: always, a subcommand, `docker compose <sub>`, package
+scripts, and "no subcommand or one of these". A command that never ends belongs in `ENDLESS`
+(refused, with a `Fix` to its one-shot form); a dev server belongs in `LIGHT` (runs at once,
+outside the queue). A brand-new kind also needs one entry in `KINDS` (name, default cost, exclusive-key
 rule). The test `every_rule_names_a_known_kind` checks this. To size the tool's workers,
 set `hint`. A `Hint::Arg` appends a flag when the tool is started directly as words; a
 `Hint::Env` sets a variable. Nothing outside `kinds.rs` matches on tool names.

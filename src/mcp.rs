@@ -168,18 +168,47 @@ fn bump_schema() -> Value {
 /// Whether a command line needs the shell to mean what it says.
 fn needs_shell(cmd: &str) -> bool {
     cmd.contains(runner::SHELL_CHARS)
-        || shell::tokenize(cmd)
-            .first()
-            .is_some_and(|w| w.contains('=') && !w.starts_with('-'))
 }
 
-/// argv for a command line, plus whether it must run through the shell.
-pub fn command_argv(cmd: &str) -> (Vec<String>, bool) {
+/// A command line split for spawning.
+#[derive(Debug, PartialEq)]
+pub struct CommandLine {
+    pub argv: Vec<String>,
+    /// Run `argv[0]` through the platform shell.
+    pub shell: bool,
+    /// Leading `VAR=value` words, set for the command instead of passed to a shell (so
+    /// `CI=1 npm test` works on Windows too, where cmd has no such syntax).
+    pub env: Vec<(String, String)>,
+}
+
+/// Split a command line: plain words run the program directly, shell syntax runs in the shell.
+pub fn command_argv(cmd: &str) -> CommandLine {
     if needs_shell(cmd) {
-        (vec![cmd.trim().to_string()], true)
-    } else {
-        (shell::tokenize(cmd), false)
+        return CommandLine {
+            argv: vec![cmd.trim().to_string()],
+            shell: true,
+            env: Vec::new(),
+        };
     }
+    let mut words = shell::tokenize(cmd);
+    let assignments = words.iter().take_while(|w| is_assignment(w)).count();
+    let env = words
+        .drain(..assignments)
+        .filter_map(|w| w.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+        .collect();
+    CommandLine {
+        argv: words,
+        shell: false,
+        env,
+    }
+}
+
+fn is_assignment(w: &str) -> bool {
+    w.split_once('=').is_some_and(|(k, _)| {
+        !k.is_empty()
+            && !k.starts_with(|c: char| c.is_ascii_digit())
+            && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
 }
 
 /// Sends `notifications/progress` while a task waits, if the client gave a token.
@@ -257,10 +286,10 @@ fn string(args: &Value, key: &str) -> Option<String> {
 static LOG_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn request_for(args: &Value, command: &str, log: PathBuf, cancel: Arc<AtomicBool>) -> Request {
-    let (argv, shell) = command_argv(command);
+    let line = command_argv(command);
     Request {
-        argv,
-        shell,
+        argv: line.argv,
+        shell: line.shell,
         cwd: string(args, "cwd").map(PathBuf::from),
         kind: string(args, "kind"),
         cost: args.get("cost").and_then(Value::as_u64).map(|c| c.max(1) as u32),
@@ -272,7 +301,7 @@ fn request_for(args: &Value, command: &str, log: PathBuf, cancel: Arc<AtomicBool
         wait_timeout: secs(args, "wait_timeout_s"),
         ticket: args.get("ticket").and_then(Value::as_u64),
         rerun_hint: Some("call run_task again with the same arguments plus \"ticket\": {ticket}".into()),
-        env: Vec::new(),
+        env: line.env,
         needs: args
             .get("needs")
             .and_then(Value::as_array)
@@ -333,12 +362,10 @@ fn task_result(o: &queue::Outcome, log: Option<PathBuf>) -> Value {
         text.push_str(m);
         text.push('\n');
     }
-    if let Some(l) = &log {
+    let tail = log.as_ref().map(|l| queue::tail_lines(l, TAIL_LINES));
+    if let (Some(l), Some(t)) = (&log, &tail) {
         text.push_str(&format!("full log: {}\n", l.display()));
-        text.push_str(&format!(
-            "--- last {TAIL_LINES} lines ---\n{}",
-            queue::tail_lines(l, TAIL_LINES)
-        ));
+        text.push_str(&format!("--- last {TAIL_LINES} lines of output ---\n{t}"));
     }
     let structured = json!({
         "exit_code": o.code,
@@ -351,6 +378,8 @@ fn task_result(o: &queue::Outcome, log: Option<PathBuf>) -> Value {
         "log_path": log.map(|l| l.to_string_lossy().to_string()),
         "message": o.message,
         "ticket": o.ticket,
+        // Clients that show structured content instead of the text still get the output.
+        "output_tail": tail,
     });
     text_result(text, o.code != 0, Some(structured))
 }
@@ -389,8 +418,8 @@ fn bump(c: &Call) -> Value {
     match status::bump(&mut ctx, label) {
         Ok(n) => text_result(
             format!("moved {n} waiting job(s) matching \"{label}\" to the front"),
-            n == 0,
-            Some(json!({"moved": n})),
+            false,
+            Some(json!({"moved": n, "matched": n})),
         ),
         Err(e) => error_result(&e),
     }
@@ -521,6 +550,24 @@ impl Server {
     }
 }
 
+/// How long running tasks get to stop after SIGTERM/Ctrl+C before the server exits.
+const SIGNAL_GRACE: Duration = Duration::from_secs(5);
+
+/// On Ctrl+C / SIGTERM: cancel every task (their process trees are stopped like any
+/// cancelled task), give them a moment, then exit.
+fn stop_tasks_on_signal(running: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>) {
+    let _ = ctrlc::set_handler(move || {
+        if let Ok(m) = running.lock() {
+            m.values().for_each(|f| f.store(true, Ordering::SeqCst));
+        }
+        let deadline = Instant::now() + SIGNAL_GRACE;
+        while Instant::now() < deadline && running.lock().is_ok_and(|m| !m.is_empty()) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        std::process::exit(runner::EXIT_INTERRUPTED);
+    });
+}
+
 /// Serve until stdin closes. Returns the process exit code.
 pub fn serve() -> i32 {
     let mut server = Server {
@@ -528,6 +575,7 @@ pub fn serve() -> i32 {
         running: Arc::default(),
         threads: Vec::new(),
     };
+    stop_tasks_on_signal(server.running.clone());
     for line in io::stdin().lock().lines() {
         let Ok(line) = line else {
             break;
@@ -546,15 +594,26 @@ mod tests {
 
     #[test]
     fn plain_words_run_directly() {
+        let l = command_argv("npx vitest run");
         assert_eq!(
-            command_argv("npx vitest run"),
+            (l.argv, l.shell),
             (vec!["npx".into(), "vitest".into(), "run".into()], false)
         );
-        let (argv, shell) = command_argv("npm ci && npm test");
-        assert!(shell);
-        assert_eq!(argv, vec!["npm ci && npm test".to_string()]);
-        assert!(command_argv("CI=1 npm test").1);
-        assert!(!command_argv("cargo test --features=x").1);
+        let l = command_argv("npm ci && npm test");
+        assert!(l.shell);
+        assert_eq!(l.argv, vec!["npm ci && npm test".to_string()]);
+        assert!(!command_argv("cargo test --features=x").shell);
+    }
+
+    #[test]
+    fn leading_assignments_become_environment() {
+        let l = command_argv("CI=1 NODE_ENV=test npm test");
+        assert!(!l.shell);
+        assert_eq!(l.argv, vec!["npm".to_string(), "test".to_string()]);
+        assert_eq!(
+            l.env,
+            vec![("CI".into(), "1".into()), ("NODE_ENV".into(), "test".into())]
+        );
     }
 
     #[test]

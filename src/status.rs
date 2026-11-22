@@ -1,7 +1,7 @@
 //! Reading and nudging the queue: `status`, `queue_status`, `bump`.
 
-use crate::error::{Error, Result};
-use crate::queue::{now_ms, prune_dead, Ctx};
+use crate::error::Result;
+use crate::queue::{locked, now_ms, Ctx};
 use crate::scheduler;
 use crate::state::{Job, State};
 use serde_json::{json, Value};
@@ -12,13 +12,7 @@ pub const STUCK_MS: u64 = 30 * 60_000;
 /// A pruned snapshot of the queue.
 pub fn snapshot(ctx: &mut Ctx) -> Result<State> {
     let store = ctx.store()?;
-    let sys = &mut ctx.sys;
-    store
-        .with_lock(|s| {
-            prune_dead(s, sys);
-            s.clone()
-        })
-        .map_err(Error::State)
+    locked(&store, &mut ctx.sys, |s| s.clone())
 }
 
 fn job_json(j: &Job, now: u64, place: Option<usize>) -> Value {
@@ -48,6 +42,7 @@ fn parked_json(j: &Job, now: u64) -> Value {
         "cost": j.cost,
         "cwd": j.cwd,
         "expires_in_ms": j.parked_until.unwrap_or(0).saturating_sub(now),
+        "text": crate::messages::kept_line(j, now),
     })
 }
 
@@ -90,24 +85,20 @@ pub fn status_json(ctx: &mut Ctx, state: &State) -> Value {
 pub fn bump(ctx: &mut Ctx, needle: &str) -> Result<usize> {
     let needle = needle.to_lowercase();
     let store = ctx.store()?;
-    let sys = &mut ctx.sys;
-    store
-        .with_lock(|s| {
-            prune_dead(s, sys);
-            let min = s.jobs.iter().map(|j| j.order).min().unwrap_or(0);
-            let ids: Vec<u64> = scheduler::waiting_in_order(&s.jobs)
-                .into_iter()
-                .filter(|j| j.label.to_lowercase().contains(&needle))
-                .map(|j| j.id)
-                .collect();
-            let n = ids.len() as i64;
-            for (i, id) in ids.iter().enumerate() {
-                if let Some(j) = s.jobs.iter_mut().find(|j| j.id == *id) {
-                    j.high = true;
-                    j.order = min - n + i as i64;
-                }
+    locked(&store, &mut ctx.sys, |s| {
+        let min = s.jobs.iter().map(|j| j.order).min().unwrap_or(0);
+        let ids: Vec<u64> = scheduler::waiting_in_order(&s.jobs)
+            .into_iter()
+            .filter(|j| j.label.to_lowercase().contains(&needle))
+            .map(|j| j.id)
+            .collect();
+        let n = ids.len() as i64;
+        for (i, id) in ids.iter().enumerate() {
+            if let Some(j) = s.jobs.iter_mut().find(|j| j.id == *id) {
+                j.high = true;
+                j.order = min - n + i as i64;
             }
-            ids.len()
-        })
-        .map_err(Error::State)
+        }
+        ids.len()
+    })
 }

@@ -64,6 +64,16 @@ pub struct State {
     pub next_id: u64,
     #[serde(default)]
     pub jobs: Vec<Job>,
+    /// The last free-RAM reading, shared so every waiter decides on the same number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ram_sample: Option<RamSample>,
+}
+
+/// Free RAM as read by some calmrun at a moment.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct RamSample {
+    pub free: u64,
+    pub at_ms: u64,
 }
 
 impl State {
@@ -81,6 +91,8 @@ impl State {
 /// Rename retries when Windows briefly holds the target open (a reader or a scanner).
 const RENAME_RETRIES: u64 = 20;
 const RENAME_BACKOFF_MS: u64 = 10;
+/// Attempts to read a state file that exists but cannot be read right now.
+const READ_RETRIES: u64 = 20;
 
 /// A queue's files: `state.json`, `state.lock`, and the shared `history.jsonl`.
 pub struct Store {
@@ -117,6 +129,15 @@ impl Store {
         &self.history
     }
 
+    /// The state without the lock, for work that must not happen under it (refreshing
+    /// process information). May be a moment stale; empty on any error.
+    pub fn peek(&self) -> State {
+        std::fs::read(self.state_path())
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
     /// Run `f` on the state with the lock held; writes the state back only if `f` changed
     /// it. The state file is read once per call. The lock is an OS lock (LockFileEx /
     /// flock), so a crashed holder frees it. Never sleep or spawn inside `f`.
@@ -128,8 +149,8 @@ impl Store {
             .write(true)
             .open(self.dir.join("state.lock"))?;
         lock.lock()?;
-        let before = std::fs::read(self.state_path()).unwrap_or_default();
-        let mut state: State = serde_json::from_slice(&before).unwrap_or_default();
+        let before = self.read_bytes()?;
+        let mut state = self.parse_or_set_aside(&before);
         let out = f(&mut state);
         let after = serde_json::to_vec_pretty(&state).map_err(io::Error::other)?;
         if after != before {
@@ -137,6 +158,47 @@ impl Store {
         }
         drop(lock);
         Ok(out)
+    }
+
+    /// The state file's bytes (empty if it does not exist). Other read errors (a scanner
+    /// holding the file on Windows) are retried; if they persist the call fails instead of
+    /// treating the queue as empty.
+    fn read_bytes(&self) -> io::Result<Vec<u8>> {
+        let mut attempt = 0;
+        loop {
+            match std::fs::read(self.state_path()) {
+                Ok(b) => return Ok(b),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(e) if attempt + 1 >= READ_RETRIES => return Err(e),
+                Err(_) => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(RENAME_BACKOFF_MS * attempt));
+                }
+            }
+        }
+    }
+
+    /// Parse the state. A corrupt file is moved aside (`state.json.corrupt-<ms>`) so it can
+    /// be inspected, and the queue starts empty.
+    fn parse_or_set_aside(&self, bytes: &[u8]) -> State {
+        if bytes.is_empty() {
+            return State::default();
+        }
+        match serde_json::from_slice(bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                let ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis());
+                let aside = self.dir.join(format!("state.json.corrupt-{ms}"));
+                let _ = std::fs::rename(self.state_path(), &aside);
+                eprintln!(
+                    "calmrun: warning: the queue state was unreadable ({e}); kept it as {}",
+                    aside.display()
+                );
+                State::default()
+            }
+        }
     }
 
     fn write(&self, bytes: &[u8]) -> io::Result<()> {
@@ -235,5 +297,22 @@ mod tests {
         std::fs::write(tmp.path().join("state.json"), "{not json").unwrap();
         let store = Store::open(tmp.path()).unwrap();
         assert!(store.with_lock(|s| s.jobs.is_empty()).unwrap());
+        let kept: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("state.json.corrupt-"))
+            .collect();
+        assert_eq!(kept.len(), 1, "the corrupt file is kept for inspection");
+        assert_eq!(std::fs::read_to_string(kept[0].path()).unwrap(), "{not json");
+    }
+
+    #[test]
+    fn unreadable_state_is_an_error_not_an_empty_queue() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A directory where the file should be: reading fails with something other than
+        // "not found" on every OS.
+        std::fs::create_dir_all(tmp.path().join("state.json")).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        assert!(store.with_lock(|s| s.jobs.len()).is_err());
     }
 }

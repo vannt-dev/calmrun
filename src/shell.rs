@@ -15,44 +15,55 @@ pub fn is_shell_string(argv: &[String]) -> bool {
 /// Split shell words. Quotes group words; backslash escapes only `\"` inside double quotes
 /// and `\ ` outside quotes, so Windows paths keep their backslashes.
 pub fn tokenize(s: &str) -> Vec<String> {
+    words(s).into_iter().map(|w| w.text).collect()
+}
+
+/// A word and the byte offset where it starts in the input.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Word {
+    pub text: String,
+    pub start: usize,
+}
+
+/// [`tokenize`] with each word's start offset, so callers can edit the original text.
+pub fn words(s: &str) -> Vec<Word> {
     let mut out = Vec::new();
     let mut cur = String::new();
-    let mut has = false;
+    let mut start: Option<usize> = None;
     let mut quote: Option<char> = None;
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        let next = chars.peek().map(|&(_, n)| n);
         match quote {
             Some(q) if c == q => quote = None,
-            Some('"') if c == '\\' && chars.peek() == Some(&'"') => {
+            Some('"') if c == '\\' && next == Some('"') => {
                 chars.next();
                 cur.push('"');
             }
             Some(_) => cur.push(c),
-            None => match c {
-                '"' | '\'' => {
-                    quote = Some(c);
-                    has = true;
+            None if c.is_whitespace() => {
+                if let Some(st) = start.take() {
+                    out.push(Word {
+                        text: std::mem::take(&mut cur),
+                        start: st,
+                    });
                 }
-                '\\' if chars.peek() == Some(&' ') => {
-                    chars.next();
-                    cur.push(' ');
-                    has = true;
-                }
-                c if c.is_whitespace() => {
-                    if has {
-                        out.push(std::mem::take(&mut cur));
-                        has = false;
+            }
+            None => {
+                start.get_or_insert(i);
+                match c {
+                    '"' | '\'' => quote = Some(c),
+                    '\\' if next == Some(' ') => {
+                        chars.next();
+                        cur.push(' ');
                     }
+                    _ => cur.push(c),
                 }
-                _ => {
-                    cur.push(c);
-                    has = true;
-                }
-            },
+            }
         }
     }
-    if has {
-        out.push(cur);
+    if let Some(st) = start {
+        out.push(Word { text: cur, start: st });
     }
     out
 }
@@ -270,6 +281,17 @@ mod tests {
             parts("cat <<-END >x\n\tcargo build\n\tEND\ncargo test"),
             vec!["cat <<-END >x", "cargo test"]
         );
+    }
+
+    #[test]
+    fn word_offsets_follow_escapes() {
+        let s = r#"FOO=a\ b BAR="x\"y z" npx jest"#;
+        let w = words(s);
+        assert_eq!(
+            w.iter().map(|w| w.text.as_str()).collect::<Vec<_>>(),
+            ["FOO=a b", "BAR=x\"y z", "npx", "jest"]
+        );
+        assert_eq!(&s[w[2].start..], "npx jest");
     }
 
     #[test]

@@ -29,7 +29,8 @@ impl Detected {
     }
 }
 
-/// Basename, lowercased, without .cmd/.bat/.exe/.ps1/.js-style extensions.
+/// Basename, lowercased, without .cmd/.bat/.exe/.ps1/.js-style extensions and without a
+/// package version (`tsc@5`, `@scope/pkg@1` -> `tsc`, `pkg`).
 pub fn tool_name(word: &str) -> String {
     const EXTENSIONS: &[&str] = &[".cmd", ".bat", ".exe", ".ps1", ".js", ".mjs", ".cjs"];
     let base = word
@@ -37,6 +38,11 @@ pub fn tool_name(word: &str) -> String {
         .next()
         .unwrap_or(word)
         .to_ascii_lowercase();
+    // A package spec such as `tsc@5` or `@scope/pkg@1` (the scope is already cut off above).
+    let base = match base.rfind('@') {
+        Some(at) if at > 0 => base[..at].to_string(),
+        _ => base,
+    };
     EXTENSIONS
         .iter()
         .find_map(|ext| base.strip_suffix(ext).filter(|s| !s.is_empty()))
@@ -308,6 +314,7 @@ pub struct HintChanges {
 pub fn apply_hints(
     argv: &[String],
     tool: &str,
+    cwd: &Path,
     workers: &dyn Fn(Workers) -> u32,
     env_set: &dyn Fn(&str) -> bool,
 ) -> HintChanges {
@@ -325,8 +332,16 @@ pub fn apply_hints(
                 a
             });
         }
-        Some(Hint::Env { var, workers: w }) if !env_set(var) => {
-            out.env.push((var.to_string(), workers(w).to_string()))
+        Some(Hint::Env {
+            var,
+            workers: w,
+            user_limit,
+        }) if !env_set(var) => {
+            let ours = workers(w);
+            let n = user_limit
+                .and_then(|f| f(cwd))
+                .map_or(ours, |theirs| theirs.min(ours));
+            out.env.push((var.to_string(), n.to_string()))
         }
         _ => {}
     }
@@ -396,20 +411,88 @@ fn compose_up_attached(words: &[String]) -> bool {
     !detached
 }
 
-/// A reason to refuse the command outright, if any.
-pub fn refuse_reason(argv: &[String]) -> Option<String> {
-    let attached = if is_shell_string(argv) {
-        split_segments(&argv[0])
+/// What to do with a command before it is queued.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Disposition {
+    /// Wait in the queue as usual.
+    Queue,
+    /// Run at once without the queue (help/version output, dev servers).
+    Light(&'static str),
+    /// Refuse: it would hold its points forever. `fixed` is the one-shot form, if known.
+    Refuse {
+        reason: String,
+        fixed: Option<Vec<String>>,
+    },
+}
+
+/// Decide whether a command is queued, run at once, or refused. `stdin_tty` matters for
+/// tools that watch by default in a terminal (vitest).
+pub fn disposition(argv: &[String], stdin_tty: bool) -> Disposition {
+    if is_shell_string(argv) {
+        let s = &argv[0];
+        return split_segments(s)
             .into_iter()
-            .any(|r| compose_up_attached(&tokenize(&argv[0][r])))
-    } else {
-        compose_up_attached(argv)
+            .find_map(|r| match words_disposition(&tokenize(&s[r]), stdin_tty) {
+                Disposition::Refuse { reason, .. } => Some(Disposition::Refuse { reason, fixed: None }),
+                _ => None,
+            })
+            .unwrap_or(Disposition::Queue);
+    }
+    words_disposition(argv, stdin_tty)
+}
+
+fn words_disposition(words: &[String], stdin_tty: bool) -> Disposition {
+    if compose_up_attached(words) {
+        return Disposition::Refuse {
+            reason: "`docker compose up` without -d would hold queue points forever; run it detached \
+                     (`docker compose up -d`) or outside calmrun"
+                .to_string(),
+            fixed: detached_compose(words),
+        };
+    }
+    let Some(p) = parse(words) else {
+        return Disposition::Queue;
     };
-    attached.then(|| {
-        "`docker compose up` without -d would hold queue points forever; \
-         run it detached (`docker compose up -d`) or outside calmrun"
-            .to_string()
-    })
+    if kinds::asks_for_info(&p.rest) {
+        return Disposition::Light("only prints help or a version");
+    }
+    if let Some(rule) = kinds::endless_rule(&p.tool, &p.rest, stdin_tty) {
+        return Disposition::Refuse {
+            reason: format!(
+                "`{}` is {} and never ends, so it would hold queue points forever; run the one-shot \
+                 form, or run it outside calmrun",
+                label_of(&p),
+                rule.what
+            ),
+            fixed: apply_fix(words, &p, rule.fix),
+        };
+    }
+    match kinds::light_rule(&p.tool, &p.rest) {
+        Some(r) => Disposition::Light(r.kind),
+        None => Disposition::Queue,
+    }
+}
+
+/// The one-shot form of an endless command (argv words only).
+fn apply_fix(words: &[String], p: &Parsed, fix: kinds::Fix) -> Option<Vec<String>> {
+    let tool_at = (p.start..words.len()).find(|&i| tool_name(&words[i]) == p.tool)?;
+    let mut out = words.to_vec();
+    match fix {
+        kinds::Fix::None => return None,
+        kinds::Fix::RemoveFlags(flags) => {
+            let tail = out.split_off(tool_at + 1);
+            out.extend(tail.into_iter().filter(|w| {
+                let lw = w.to_ascii_lowercase();
+                !flags.iter().any(|f| lw == *f || lw.starts_with(&format!("{f}=")))
+            }));
+        }
+        kinds::Fix::SetSub(sub) => {
+            let at = (tool_at + 1..out.len()).find(|&i| !out[i].starts_with('-'))?;
+            out[at] = sub.to_string();
+        }
+        kinds::Fix::InsertSub(sub) => out.insert(tool_at + 1, sub.to_string()),
+    }
+    Some(out)
 }
 
 /// The same compose command with `-d` added after `up` (argv words only).
@@ -483,7 +566,7 @@ mod tests {
     fn hinted(s: &str, n: u32) -> Option<Vec<String>> {
         let a = argv(s);
         let tool = detect_words(&a, &BTreeMap::new()).tool;
-        apply_hints(&a, &tool, &|_| n, &|_| false).argv
+        apply_hints(&a, &tool, Path::new("."), &|_| n, &|_| false).argv
     }
 
     #[test]
@@ -492,6 +575,9 @@ mod tests {
         assert_eq!(tool_name("./node_modules/.bin/vitest"), "vitest");
         assert_eq!(tool_name("ESLINT.EXE"), "eslint");
         assert_eq!(tool_name("run.ps1"), "run");
+        assert_eq!(tool_name("tsc@5"), "tsc");
+        assert_eq!(tool_name("@vitest/browser@3.1"), "browser");
+        assert_eq!(tool_name("eslint@9.0.0"), "eslint");
     }
 
     #[test]
@@ -521,6 +607,11 @@ mod tests {
             ("pnpm lint", "eslint"),
             ("FOO=1 CI=true npx vitest", "vitest"),
             ("node ./node_modules/vitest/vitest.mjs run", "vitest"),
+            ("npx tsc@5 --noEmit", "tsc"),
+            ("npx vitest@3 run", "vitest"),
+            ("npx -p typescript@5 tsc", "tsc"),
+            ("pnpm dlx eslint@9 .", "eslint"),
+            ("bunx eslint@9 .", "eslint"),
         ] {
             assert_eq!(kind(cmd).as_deref(), Some(k), "{cmd}");
         }
@@ -611,7 +702,10 @@ mod tests {
         assert_eq!(hinted("npx jest", 1), None);
         assert_eq!(hinted("FOO=1 vitest", 1), None);
         let shell = vec!["npx vitest run".to_string()];
-        assert_eq!(apply_hints(&shell, "vitest", &|_| 1, &|_| false).argv, None);
+        assert_eq!(
+            apply_hints(&shell, "vitest", Path::new("."), &|_| 1, &|_| false).argv,
+            None
+        );
     }
 
     #[test]
@@ -625,28 +719,93 @@ mod tests {
         assert_eq!(hinted("gradlew --version", 4), None);
         assert_eq!(hinted("gradlew", 4), None);
         assert_eq!(hinted("mvn package", 4), None);
-        let c = apply_hints(&argv("cargo build"), "cargo", &|_| 5, &|_| false);
-        assert_eq!(c.env, vec![("CARGO_BUILD_JOBS".to_string(), "5".to_string())]);
-        assert!(apply_hints(&argv("cargo build"), "cargo", &|_| 5, &|_| true)
-            .env
-            .is_empty());
+        let c = apply_hints(
+            &argv("cargo build"),
+            "cargo",
+            Path::new("/nonexistent-cwd"),
+            &|_| 5,
+            &|_| false,
+        );
+        // At most ours; lower if this machine's ~/.cargo config sets build.jobs.
+        assert_eq!(c.env.len(), 1);
+        assert_eq!(c.env[0].0, "CARGO_BUILD_JOBS");
+        assert!((1..=5).contains(&c.env[0].1.parse::<u32>().unwrap()));
+        assert!(
+            apply_hints(&argv("cargo build"), "cargo", Path::new("."), &|_| 5, &|_| true)
+                .env
+                .is_empty()
+        );
+    }
+
+    fn refused(a: &[String]) -> bool {
+        matches!(disposition(a, false), Disposition::Refuse { .. })
     }
 
     #[test]
     fn compose_up_refused() {
-        assert!(refuse_reason(&argv("docker compose up")).is_some());
-        assert!(refuse_reason(&argv("docker-compose -f x.yml up --build")).is_some());
-        assert!(refuse_reason(&["cd a && docker compose up".to_string()]).is_some());
-        assert!(refuse_reason(&argv("docker compose up -d")).is_none());
-        assert!(refuse_reason(&argv("docker compose up --detach")).is_none());
-        assert!(refuse_reason(&argv("docker-compose up -dV")).is_none());
-        assert!(refuse_reason(&argv("docker compose up --wait")).is_none());
-        assert!(refuse_reason(&argv("docker compose build")).is_none());
+        assert!(refused(&argv("docker compose up")));
+        assert!(refused(&argv("docker-compose -f x.yml up --build")));
+        assert!(refused(&["cd a && docker compose up".to_string()]));
+        assert!(!refused(&argv("docker compose up -d")));
+        assert!(!refused(&argv("docker compose up --detach")));
+        assert!(!refused(&argv("docker-compose up -dV")));
+        assert!(!refused(&argv("docker compose up --wait")));
+        assert!(!refused(&argv("docker compose build")));
         assert_eq!(
             detached_compose(&argv("docker compose -f a.yml up --build")),
             Some(argv("docker compose -f a.yml up -d --build"))
         );
         assert_eq!(detached_compose(&argv("docker compose up -d")), None);
+    }
+
+    #[test]
+    fn watch_modes_are_refused_with_the_one_shot_form() {
+        let fixed = |s: &str, tty: bool| match disposition(&argv(s), tty) {
+            Disposition::Refuse { fixed, .. } => fixed.map(|f| f.join(" ")),
+            other => panic!("{s}: {other:?}"),
+        };
+        assert_eq!(fixed("npx tsc --watch", false).as_deref(), Some("npx tsc"));
+        assert_eq!(fixed("npx tsc -w -p .", false).as_deref(), Some("npx tsc -p ."));
+        assert_eq!(fixed("npx jest --watchAll", false).as_deref(), Some("npx jest"));
+        assert_eq!(
+            fixed("npx vitest watch", false).as_deref(),
+            Some("npx vitest run")
+        );
+        assert_eq!(fixed("vitest", true).as_deref(), Some("vitest run"));
+        assert_eq!(
+            fixed("npx vitest --coverage", true).as_deref(),
+            Some("npx vitest run --coverage")
+        );
+        assert_eq!(fixed("docker run -it ubuntu", false), None);
+        // Not endless: one-shot forms, and vitest without a terminal (it runs once then).
+        for ok in [
+            "npx tsc -p .",
+            "npx vitest run",
+            "vitest",
+            "docker build -t x .",
+            "docker run --rm x",
+        ] {
+            assert_eq!(disposition(&argv(ok), false), Disposition::Queue, "{ok}");
+        }
+    }
+
+    #[test]
+    fn dev_servers_and_help_run_without_the_queue() {
+        for c in [
+            "npx vite",
+            "npm run dev",
+            "pnpm dev",
+            "next dev",
+            "ng serve",
+            "cargo build --help",
+            "npx tsc --version",
+        ] {
+            assert!(
+                matches!(disposition(&argv(c), false), Disposition::Light(_)),
+                "{c}"
+            );
+        }
+        assert_eq!(disposition(&argv("npx vite build"), false), Disposition::Queue);
     }
 
     #[test]

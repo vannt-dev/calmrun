@@ -6,6 +6,7 @@
 
 use crate::config::KindConfig;
 use std::collections::BTreeMap;
+use std::path::Path;
 
 /// A kind of job and its defaults.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -41,6 +42,8 @@ pub enum When {
     /// A package-manager script: `run <name>` / `run-script <name>` (also `<name>:suffix`), or
     /// `<name>` directly for pnpm, yarn and bun (npm only runs its own commands directly).
     Script(&'static [&'static str]),
+    /// No subcommand at all, or one of these.
+    NoSubOr(&'static [&'static str]),
 }
 
 /// How many workers a hint asks for.
@@ -53,7 +56,7 @@ pub enum Workers {
 }
 
 /// A change calmrun makes so a tool does not take the whole machine.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub enum Hint {
     /// Append `<flag><N>` when the tool was started directly as separate words through one of
     /// `launchers` (an empty launcher means the tool itself is the program). Skipped when any
@@ -66,12 +69,17 @@ pub enum Hint {
         min_args: usize,
         workers: Workers,
     },
-    /// Set this environment variable unless it is already set.
-    Env { var: &'static str, workers: Workers },
+    /// Set this environment variable unless it is already set. `user_limit` reads a limit
+    /// the user configured elsewhere (from the working directory); the lower one wins.
+    Env {
+        var: &'static str,
+        workers: Workers,
+        user_limit: Option<fn(&Path) -> Option<u32>>,
+    },
 }
 
 /// A detection rule: these tools, under this condition, are this kind.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub struct Rule {
     pub tools: &'static [&'static str],
     pub when: When,
@@ -171,7 +179,28 @@ const GRADLE_HINT: Hint = Hint::Arg {
 const CARGO_HINT: Hint = Hint::Env {
     var: "CARGO_BUILD_JOBS",
     workers: Workers::CoreShare,
+    user_limit: Some(cargo_config_jobs),
 };
+
+/// `build.jobs` from the cargo config that applies in `cwd`: the nearest `.cargo/config.toml`
+/// (or `.cargo/config`) up the tree, then the one in `CARGO_HOME` (default `~/.cargo`).
+pub fn cargo_config_jobs(cwd: &Path) -> Option<u32> {
+    let home = std::env::var_os("CARGO_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".cargo")));
+    let project = cwd.ancestors().map(|d| d.join(".cargo"));
+    project.chain(home).find_map(|dir| {
+        ["config.toml", "config"].iter().find_map(|f| {
+            let text = std::fs::read_to_string(dir.join(f)).ok()?;
+            let v: toml::Value = toml::from_str(&text).ok()?;
+            v.get("build")?
+                .get("jobs")?
+                .as_integer()
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n > 0)
+        })
+    })
+}
 
 /// Detection rules, tried in order after the user's own `[kinds]` patterns.
 pub const RULES: &[Rule] = &[
@@ -225,6 +254,160 @@ pub const RULES: &[Rule] = &[
     ),
 ];
 
+/// How to turn a never-ending command into its one-shot form.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Fix {
+    /// Drop these flags (also `flag=value`).
+    RemoveFlags(&'static [&'static str]),
+    /// Replace the subcommand with this one.
+    SetSub(&'static str),
+    /// Put this subcommand right after the tool.
+    InsertSub(&'static str),
+    /// No automatic fix.
+    None,
+}
+
+/// When a command never ends on its own.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Endless {
+    /// Any of these flags (exact, `flag=…`, or a short flag inside a cluster like `-it`).
+    Flags(&'static [&'static str]),
+    /// The subcommand is one of these.
+    Sub(&'static [&'static str]),
+    /// No subcommand from `one_shot` and stdin is a terminal (vitest watches then).
+    InteractiveDefault { one_shot: &'static [&'static str] },
+}
+
+/// A command that would hold its points forever: refused with a fix.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EndlessRule {
+    pub tools: &'static [&'static str],
+    /// Only for these subcommands (e.g. `docker run`), if set.
+    pub sub: Option<&'static [&'static str]>,
+    pub when: Endless,
+    pub fix: Fix,
+    /// What to tell the user it is.
+    pub what: &'static str,
+}
+
+/// Watch modes and interactive sessions. They are refused: a job in the queue must end.
+pub const ENDLESS: &[EndlessRule] = &[
+    EndlessRule {
+        tools: &["tsc", "vue-tsc", "tsgo"],
+        sub: None,
+        when: Endless::Flags(&["--watch", "-w"]),
+        fix: Fix::RemoveFlags(&["--watch", "-w"]),
+        what: "watch mode",
+    },
+    EndlessRule {
+        tools: &["jest"],
+        sub: None,
+        when: Endless::Flags(&["--watch", "--watchall"]),
+        fix: Fix::RemoveFlags(&["--watch", "--watchall"]),
+        what: "watch mode",
+    },
+    EndlessRule {
+        tools: &["vitest"],
+        sub: None,
+        when: Endless::Sub(&["watch", "dev"]),
+        fix: Fix::SetSub("run"),
+        what: "watch mode",
+    },
+    EndlessRule {
+        tools: &["vitest"],
+        sub: None,
+        when: Endless::Flags(&["--watch", "-w"]),
+        fix: Fix::RemoveFlags(&["--watch", "-w"]),
+        what: "watch mode",
+    },
+    EndlessRule {
+        tools: &["vitest"],
+        sub: None,
+        when: Endless::InteractiveDefault {
+            one_shot: &["run", "bench", "list", "related"],
+        },
+        fix: Fix::InsertSub("run"),
+        what: "watch mode (vitest watches by default in a terminal)",
+    },
+    EndlessRule {
+        tools: &["docker"],
+        sub: Some(&["run", "exec"]),
+        when: Endless::Flags(&["-i", "-t", "--interactive", "--tty"]),
+        fix: Fix::None,
+        what: "an interactive container",
+    },
+];
+
+/// Commands that never end by design but are not heavy (dev servers): they run at once,
+/// outside the queue.
+pub const LIGHT: &[Rule] = &[
+    rule(
+        &["vite"],
+        When::NoSubOr(&["dev", "serve", "preview"]),
+        "dev server",
+    ),
+    rule(
+        &["next", "nuxt", "astro"],
+        When::Sub(&["dev", "start", "preview"]),
+        "dev server",
+    ),
+    rule(&["ng"], When::Sub(&["serve"]), "dev server"),
+    rule(&["webpack"], When::Sub(&["serve"]), "dev server"),
+    rule(
+        PACKAGE_MANAGERS,
+        When::Script(&["dev", "start", "serve", "preview"]),
+        "dev server",
+    ),
+];
+
+/// Whether `rest` (the words after the tool) matches an endless rule.
+pub fn endless_rule(tool: &str, rest: &[String], stdin_tty: bool) -> Option<&'static EndlessRule> {
+    ENDLESS.iter().find(|r| {
+        r.tools.contains(&tool)
+            && r.sub
+                .is_none_or(|subs| first_non_flag(rest).is_some_and(|s| subs.contains(&s)))
+            && match r.when {
+                Endless::Flags(flags) => rest.iter().any(|w| has_flag(w, flags)),
+                Endless::Sub(list) => {
+                    first_non_flag(rest).is_some_and(|s| list.contains(&s.to_ascii_lowercase().as_str()))
+                }
+                Endless::InteractiveDefault { one_shot } => {
+                    stdin_tty && !first_non_flag(rest).is_some_and(|s| one_shot.contains(&s))
+                }
+            }
+    })
+}
+
+/// `w` is one of `flags` (lowercase), `flag=…`, or a short-flag cluster containing one.
+pub fn has_flag(w: &str, flags: &[&str]) -> bool {
+    let lw = w.to_ascii_lowercase();
+    flags.iter().any(|f| {
+        lw == *f
+            || lw.starts_with(&format!("{f}="))
+            || (f.len() == 2
+                && !f.starts_with("--")
+                && w.starts_with('-')
+                && !w.starts_with("--")
+                && w[1..].contains(&f[1..]))
+    })
+}
+
+/// The light (unqueued) rule for this tool, if any.
+pub fn light_rule(tool: &str, rest: &[String]) -> Option<&'static Rule> {
+    LIGHT
+        .iter()
+        .find(|r| r.tools.contains(&tool) && r.when.matches(tool, rest))
+}
+
+/// The `--kind` help text, listing the built-in kinds from [`KINDS`].
+pub fn kind_help() -> String {
+    let names: Vec<&str> = builtin_names().collect();
+    format!(
+        "Kind of job ({}, or one from the config). Detected from the command when omitted.",
+        names.join(", ")
+    )
+}
+
 /// Built-in kind names.
 pub fn builtin_names() -> impl Iterator<Item = &'static str> {
     KINDS.iter().map(|k| k.name)
@@ -253,6 +436,16 @@ pub fn only_info_flags(rest: &[String]) -> bool {
                 "--version" | "-v" | "-V" | "--help" | "-h" | "version" | "help"
             )
         })
+}
+
+/// The first word that is not a flag.
+/// `--help`, `-h`, `--version` or `-V` before any `--`: the tool only prints and exits.
+pub fn asks_for_info(rest: &[String]) -> bool {
+    only_info_flags(rest)
+        || rest
+            .iter()
+            .take_while(|w| w.as_str() != "--")
+            .any(|w| matches!(w.as_str(), "--help" | "-h" | "--version" | "-V"))
 }
 
 /// The first word that is not a flag.
@@ -318,6 +511,7 @@ impl When {
                 .and_then(compose_sub)
                 .is_some_and(|s| list.contains(&s.as_str())),
             When::Script(names) => script_matches(tool, rest, names),
+            When::NoSubOr(list) => sub().is_none_or(|s| list.contains(&s.as_str())),
         }
     }
 }
@@ -425,9 +619,31 @@ mod tests {
     }
 
     #[test]
+    fn cargo_config_jobs_found_up_the_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deep = tmp.path().join("ws/crates/a");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(tmp.path().join("ws/.cargo")).unwrap();
+        std::fs::write(tmp.path().join("ws/.cargo/config.toml"), "[build]\njobs = 3\n").unwrap();
+        assert_eq!(cargo_config_jobs(&deep), Some(3));
+    }
+
+    #[test]
     fn hints_by_tool() {
-        assert_eq!(hint_for("vitest"), Some(VITEST_HINT));
-        assert_eq!(hint_for("cargo"), Some(CARGO_HINT));
-        assert_eq!(hint_for("jest"), None);
+        assert!(matches!(
+            hint_for("vitest"),
+            Some(Hint::Arg {
+                flag: "--maxWorkers=",
+                ..
+            })
+        ));
+        assert!(matches!(
+            hint_for("cargo"),
+            Some(Hint::Env {
+                var: "CARGO_BUILD_JOBS",
+                ..
+            })
+        ));
+        assert!(hint_for("jest").is_none());
     }
 }

@@ -11,7 +11,7 @@ use crate::scheduler::{self, Inputs, Limits};
 use crate::state::{self, Job, State, Store};
 use crate::sys::{DiskCheck, Sys};
 use crate::{history, runner};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +26,12 @@ const POLL_MAX: Duration = Duration::from_millis(1500);
 const CANCEL_CHECK: Duration = Duration::from_millis(100);
 /// The CLI repeats the waiting line this often.
 const MESSAGE_EVERY: Duration = Duration::from_secs(30);
+/// A free-RAM reading in the state is reused for this long by every waiter.
+const RAM_SAMPLE_TTL_MS: u64 = 1_000;
+/// RAM a just-started job is assumed to take per point until it shows in the reading.
+const RAM_RESERVE_PER_POINT: u64 = 1 << 30;
+/// How long that assumption fades out over.
+const RAM_RESERVE_WINDOW_MS: u64 = 20_000;
 /// Publish the tree's memory to the state every this many samples.
 const MEM_PUBLISH_EVERY: u64 = 2;
 
@@ -104,6 +110,8 @@ impl Ctx {
             budget: self.cfg.budget,
             min_free_bytes: self.cfg.min_free_bytes,
             pass_limit_ms: self.cfg.pass_limit_ms,
+            ram_per_point: RAM_RESERVE_PER_POINT,
+            reserve_window_ms: RAM_RESERVE_WINDOW_MS,
         }
     }
 
@@ -120,20 +128,42 @@ impl Ctx {
     }
 }
 
-/// Drop entries whose owner died (pid gone or reused), and expired tickets.
-pub fn prune_dead(s: &mut State, sys: &mut Sys) {
-    let pairs: Vec<(u32, u64)> = s
-        .jobs
-        .iter()
-        .filter(|j| !j.parked())
-        .map(|j| (j.pid, j.pid_start))
-        .collect();
-    let alive: HashSet<(u32, u64)> = pairs
-        .iter()
-        .zip(sys.alive_set(&pairs))
-        .filter_map(|(p, ok)| ok.then_some(*p))
-        .collect();
-    state::prune(s, now_ms(), |pid, start| alive.contains(&(pid, start)));
+/// Which (pid, start time) pairs are alive, read *before* taking the lock so the slow
+/// process refresh never happens while other calmruns wait for it.
+pub struct Liveness(HashMap<(u32, u64), bool>);
+
+impl Liveness {
+    /// Check the owners of the entries currently in `store` (an unlocked peek).
+    pub fn check(store: &Store, sys: &mut Sys) -> Liveness {
+        let pairs: Vec<(u32, u64)> = store
+            .peek()
+            .jobs
+            .iter()
+            .filter(|j| !j.parked())
+            .map(|j| (j.pid, j.pid_start))
+            .collect();
+        let alive = sys.alive_set(&pairs);
+        Liveness(pairs.into_iter().zip(alive).collect())
+    }
+
+    /// Drop entries whose owner died (pid gone or reused) and expired tickets. An entry that
+    /// appeared after the check is kept until the next one.
+    pub fn prune(&self, s: &mut State) {
+        state::prune(s, now_ms(), |pid, start| {
+            self.0.get(&(pid, start)).copied().unwrap_or(true)
+        });
+    }
+}
+
+/// Run `f` on the pruned state under the lock.
+pub fn locked<R>(store: &Store, sys: &mut Sys, f: impl FnOnce(&mut State) -> R) -> Result<R> {
+    let live = Liveness::check(store, sys);
+    store
+        .with_lock(|s| {
+            live.prune(s);
+            f(s)
+        })
+        .map_err(Error::State)
 }
 
 /// One job to run.
@@ -238,6 +268,8 @@ impl Notify for StderrNotify {
 /// A request after detection: what will run and how it is booked.
 struct Prepared {
     req: Request,
+    /// Runs at once without the queue (dev server, help output): why.
+    light: Option<&'static str>,
     det: Detected,
     kind: String,
     cost: u32,
@@ -270,6 +302,13 @@ pub fn run(ctx: &mut Ctx, req: Request, notify: &mut dyn Notify) -> Outcome {
         Ok(p) => p,
         Err(out) => return *out,
     };
+    if let Some(what) = p.light {
+        notify.note(&format!(
+            "calmrun: {} ({what}): runs now, outside the queue",
+            p.label
+        ));
+        return run_nested(&p);
+    }
     if held_by_outer(ctx) {
         return run_nested(&p);
     }
@@ -293,13 +332,20 @@ pub fn run(ctx: &mut Ctx, req: Request, notify: &mut dyn Notify) -> Outcome {
 /// Refusals, detection, hints and booking details.
 fn prepare(ctx: &Ctx, mut req: Request) -> std::result::Result<Prepared, Box<Outcome>> {
     let cfg = &ctx.cfg;
-    if let Some(reason) = detect::refuse_reason(&req.argv) {
-        let fixed = detect::detached_compose(&req.argv);
-        return Err(Box::new(Outcome::default().ended(
-            EXIT_REFUSED,
-            "refused",
-            Some(messages::refused(&reason, fixed.as_deref())),
-        )));
+    // Only the CLI shares our stdin with the command (and the MCP server holds its lock).
+    let tty = req.log.is_none() && std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let mut light = None;
+    match detect::disposition(&req.argv, tty) {
+        detect::Disposition::Queue => {}
+        detect::Disposition::Light(what) => light = Some(what),
+        detect::Disposition::Refuse { reason, fixed } => {
+            let msg = messages::refused(&reason, fixed.as_deref());
+            return Err(Box::new(Outcome::default().ended(
+                EXIT_REFUSED,
+                "refused",
+                Some(msg),
+            )));
+        }
     }
     let det = detect::detect(&req.argv, &cfg.kinds);
     let kind = req.kind.clone().unwrap_or_else(|| det.kind_name().to_string());
@@ -316,19 +362,22 @@ fn prepare(ctx: &Ctx, mut req: Request) -> std::result::Result<Prepared, Box<Out
         Workers::Vitest => cfg.vitest_workers,
         Workers::CoreShare => tool_workers(ctx.machine.logical_cores, cost, cfg.budget),
     };
-    let hints = detect::apply_hints(&req.argv, &det.tool, &workers, &|v| std::env::var_os(v).is_some());
-    if let Some(a) = hints.argv {
-        req.argv = a;
-    }
-    req.env.extend(hints.env);
-    req.needs = normalized(&req.needs);
     let cwd = req
         .cwd
         .clone()
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
+    let hints = detect::apply_hints(&req.argv, &det.tool, &cwd, &workers, &|v| {
+        std::env::var_os(v).is_some()
+    });
+    if let Some(a) = hints.argv {
+        req.argv = a;
+    }
+    req.env.extend(hints.env);
+    req.needs = normalized(&req.needs);
     Ok(Prepared {
         req,
+        light,
         det,
         kind,
         cost,
@@ -364,11 +413,27 @@ fn held_by_outer(ctx: &mut Ctx) -> bool {
 /// Nested run: no queueing, no history (the outer run records it).
 fn run_nested(p: &Prepared) -> Outcome {
     let t0 = Instant::now();
-    let mut watch = Watcher::new(p, None, None, 0);
-    let result = command(p).and_then(|c| runner::run(c, false, |_| {}, &mut |pid| watch.check(pid)));
-    let mut out = finish(p, result, watch.reason);
+    let mut out = spawn_and_finish(p, Watcher::new(p, None, None, 0), false, None, |_| {});
     out.run_ms = t0.elapsed().as_millis() as u64;
     out
+}
+
+/// Spawn the command, watch it, and turn how it ended into an outcome. `held_by` marks the
+/// command as running inside our points (`CALMRUN_HELD`).
+fn spawn_and_finish(
+    p: &Prepared,
+    mut watch: Watcher,
+    low_cpu: bool,
+    held_by: Option<u32>,
+    on_spawn: impl FnOnce(u32),
+) -> Outcome {
+    let result = command(p).and_then(|mut cmd| {
+        if let Some(pid) = held_by {
+            cmd.env("CALMRUN_HELD", pid.to_string());
+        }
+        runner::run(cmd, low_cpu, on_spawn, &mut |pid| watch.check(pid))
+    });
+    finish(p, result, watch.reason)
 }
 
 /// The command, ready to spawn.
@@ -411,26 +476,22 @@ fn enqueue(ctx: &mut Ctx, store: &Store, p: &Prepared, notify: &mut dyn Notify) 
         ..Job::default()
     };
     let ticket = p.req.ticket;
-    let sys = &mut ctx.sys;
-    let resumed = store
-        .with_lock(|s| {
-            prune_dead(s, sys);
-            if let Some(j) = ticket.and_then(|t| s.jobs.iter_mut().find(|j| j.id == t && j.parked())) {
-                // Resume the kept place: same id, order and queue time.
-                entry.id = j.id;
-                entry.order = j.order;
-                entry.queued_ms = j.queued_ms;
-                entry.high |= j.high;
-                *j = entry.clone();
-                return true;
-            }
-            s.next_id += 1;
-            entry.id = s.next_id;
-            entry.order = s.next_order();
-            s.jobs.push(entry.clone());
-            false
-        })
-        .map_err(Error::State)?;
+    let resumed = locked(store, &mut ctx.sys, |s| {
+        if let Some(j) = ticket.and_then(|t| s.jobs.iter_mut().find(|j| j.id == t && j.parked())) {
+            // Resume the kept place: same id, order and queue time.
+            entry.id = j.id;
+            entry.order = j.order;
+            entry.queued_ms = j.queued_ms;
+            entry.high |= j.high;
+            *j = entry.clone();
+            return true;
+        }
+        s.next_id += 1;
+        entry.id = s.next_id;
+        entry.order = s.next_order();
+        s.jobs.push(entry.clone());
+        false
+    })?;
     if let (Some(t), false) = (ticket, resumed) {
         notify.note(&format!(
             "calmrun: ticket {t} has expired or is unknown; joining the end of the line"
@@ -457,7 +518,6 @@ fn wait_turn(
     entry: &Job,
     notify: &mut dyn Notify,
 ) -> std::result::Result<u64, Box<Outcome>> {
-    let limits = ctx.limits();
     let wait_started = Instant::now();
     let mut disk = DiskCheck::new(&p.cwd, ctx.cfg.min_free_disk_bytes);
     let mut last_line = String::from("waiting");
@@ -475,10 +535,15 @@ fn wait_turn(
         }
         let timed_out = p.req.wait_timeout.is_some_and(|t| wait_started.elapsed() >= t);
         let want_line = timed_out || notify.wants_line();
-        let free_ram = ctx.sys.free_ram();
         let short = disk.short();
-        let tick = tick(ctx, store, entry, &disk, short, free_ram, limits, want_line)
-            .map_err(|e| Box::new(p.outcome().error(&e)))?;
+        let input = TickInput {
+            store,
+            entry,
+            disk: &disk,
+            short,
+            want_line,
+        };
+        let tick = tick(ctx, &input).map_err(|e| Box::new(p.outcome().error(&e)))?;
         match tick {
             Tick::Started(t) => {
                 if short {
@@ -506,32 +571,34 @@ fn wait_turn(
     }
 }
 
-/// One locked look at the queue: prune, publish our disk state, schedule.
-#[allow(clippy::too_many_arguments)]
-fn tick(
-    ctx: &mut Ctx,
-    store: &Store,
-    entry: &Job,
-    disk: &DiskCheck,
+/// What one poll needs besides the context.
+struct TickInput<'a> {
+    store: &'a Store,
+    entry: &'a Job,
+    disk: &'a DiskCheck,
     short: bool,
-    free_ram: u64,
-    limits: Limits,
     want_line: bool,
-) -> Result<Tick> {
+}
+
+/// One locked look at the queue: prune, publish our disk state, read (or reuse) the shared
+/// free-RAM sample, schedule.
+fn tick(ctx: &mut Ctx, t: &TickInput) -> Result<Tick> {
     let now = now_ms();
-    let caps = &ctx.cfg.resources;
-    let sys = &mut ctx.sys;
-    store
+    let limits = ctx.limits();
+    let live = Liveness::check(t.store, &mut ctx.sys);
+    let (caps, sys, entry) = (&ctx.cfg.resources, &mut ctx.sys, t.entry);
+    t.store
         .with_lock(|s| {
-            prune_dead(s, sys);
+            live.prune(s);
             match s.jobs.iter_mut().find(|j| j.id == entry.id) {
-                Some(j) => j.disk_short = short,
+                Some(j) => j.disk_short = t.short,
                 // Our entry vanished (state file removed by hand); put it back.
                 None => s.jobs.push(Job {
-                    disk_short: short,
+                    disk_short: t.short,
                     ..entry.clone()
                 }),
             }
+            let free_ram = shared_ram_sample(s, sys, now);
             let plan = scheduler::schedule(
                 &s.jobs,
                 &Inputs {
@@ -551,11 +618,11 @@ fn tick(
             let waiting = scheduler::waiting_in_order(&s.jobs);
             let place = waiting.iter().position(|j| j.id == entry.id).unwrap_or(0);
             let running = s.jobs.len() - waiting.len();
-            let line = want_line.then(|| {
+            let line = t.want_line.then(|| {
                 let c = WaitContext {
                     me: entry,
                     budget: limits.budget,
-                    disk,
+                    disk: t.disk,
                     caps,
                     now_ms: now,
                 };
@@ -567,6 +634,19 @@ fn tick(
             }
         })
         .map_err(Error::State)
+}
+
+/// The free-RAM reading every waiter uses: refreshed (under the lock) when older than a
+/// second, so waiters polling at the same time decide on the same number.
+fn shared_ram_sample(s: &mut State, sys: &mut Sys, now: u64) -> u64 {
+    match s.ram_sample {
+        Some(r) if now.saturating_sub(r.at_ms) < RAM_SAMPLE_TTL_MS => r.free,
+        _ => {
+            let free = sys.free_ram();
+            s.ram_sample = Some(state::RamSample { free, at_ms: now });
+            free
+        }
+    }
 }
 
 fn sleep_unless_cancelled(total: Duration, p: &Prepared) {
@@ -669,7 +749,7 @@ impl<'a> Watcher<'a> {
                     s.jobs
                         .iter()
                         .filter(|j| j.running() && j.id != id)
-                        .all(|j| j.mem_bytes.unwrap_or(0) <= mine)
+                        .all(|j| beats(mine, id, j.mem_bytes.unwrap_or(0), j.id))
                 })
                 .unwrap_or(true)
             })
@@ -692,6 +772,12 @@ impl<'a> Watcher<'a> {
     }
 }
 
+/// Whether a job (`mine`, `id`) is bigger than another one: only the single biggest job is
+/// stopped for low free RAM, and on a tie the newer one (higher id) goes.
+fn beats(mine: u64, id: u64, other: u64, other_id: u64) -> bool {
+    other < mine || (other == mine && other_id < id)
+}
+
 /// Run the admitted command, then leave the queue.
 fn execute(
     ctx: &Ctx,
@@ -704,8 +790,12 @@ fn execute(
     let wait_ms = started_ms.saturating_sub(entry.queued_ms);
     notify.started(wait_ms);
     let cfg = &ctx.cfg;
-    let mem = MemWatch::new(cfg.ceiling_bytes, cfg.critical_free_bytes);
-    let mut watch = Watcher::new(p, mem, Some(store), entry.id);
+    let mem = MemWatch::new(memwatch::Limits {
+        ceiling: cfg.ceiling_bytes,
+        floor: cfg.critical_free_bytes,
+        min_stop: memwatch::min_stop_bytes(ctx.machine.total_ram),
+    });
+    let watch = Watcher::new(p, mem, Some(store), entry.id);
     let id = entry.id;
     let set_child = |child: u32| {
         let _ = store.with_lock(|s| {
@@ -714,12 +804,8 @@ fn execute(
             }
         });
     };
-    let result = command(p).and_then(|mut cmd| {
-        cmd.env("CALMRUN_HELD", std::process::id().to_string());
-        runner::run(cmd, cfg.low_cpu, set_child, &mut |pid| watch.check(pid))
-    });
+    let mut out = spawn_and_finish(p, watch, cfg.low_cpu, Some(std::process::id()), set_child);
     let _ = store.with_lock(|s| s.jobs.retain(|j| j.id != id));
-    let mut out = finish(p, result, watch.reason);
     out.wait_ms = wait_ms;
     out.run_ms = now_ms().saturating_sub(started_ms);
     out
@@ -812,6 +898,15 @@ mod tests {
         assert_eq!(tool_workers(20, 2, 3), 13);
         assert_eq!(tool_workers(8, 1, 6), 1);
         assert_eq!(tool_workers(2, 1, 4), 1);
+    }
+
+    #[test]
+    fn only_the_single_biggest_job_counts_as_biggest() {
+        assert!(beats(5, 2, 4, 1));
+        assert!(!beats(4, 2, 5, 1));
+        // A tie: the newer job (higher id) is the one to stop, never both.
+        assert!(beats(5, 2, 5, 1));
+        assert!(!beats(5, 1, 5, 2));
     }
 
     #[test]

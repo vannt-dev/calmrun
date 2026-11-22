@@ -141,9 +141,22 @@ pub fn wait_timeout(
 pub fn refused(reason: &str, fixed: Option<&[String]>) -> String {
     let next = match fixed {
         Some(f) => format!("calmrun -- {}", f.join(" ")),
-        None => "add -d after `up`, or run `docker compose up` outside calmrun".to_string(),
+        None => "run it outside calmrun".to_string(),
     };
     format!("calmrun: refused: {reason}.\ncalmrun: next: {next}")
+}
+
+/// `kept (ticket 17, expires in 9:12) npx vitest run  /src/web`.
+pub fn kept_line(j: &Job, now: u64) -> String {
+    let left = j.parked_until.unwrap_or(now).saturating_sub(now) / 1000;
+    format!(
+        "kept (ticket {}, expires in {}:{:02}) {}  {}",
+        j.id,
+        left / 60,
+        left % 60,
+        j.label,
+        j.cwd
+    )
 }
 
 /// Warnings for waiters older than `stuck_ms`.
@@ -181,6 +194,7 @@ mod tests {
     #[test]
     fn running_summary_names_jobs_and_folders() {
         let s = State {
+            ram_sample: None,
             next_id: 9,
             jobs: vec![
                 job(1, "npx vitest", "/src/web", 10_000),
@@ -195,6 +209,21 @@ mod tests {
         assert_eq!(
             running_summary(&s, 200_000),
             "npx vitest in web (3m10s), cargo build in api (2m20s)"
+        );
+    }
+
+    #[test]
+    fn kept_line_shows_ticket_and_time_left() {
+        let j = Job {
+            id: 17,
+            label: "npx vitest run".into(),
+            cwd: "/w".into(),
+            parked_until: Some(553_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            kept_line(&j, 1_000),
+            "kept (ticket 17, expires in 9:12) npx vitest run  /w"
         );
     }
 
@@ -219,6 +248,7 @@ mod tests {
             ..Default::default()
         };
         let s = State {
+            ram_sample: None,
             next_id: 2,
             jobs: vec![job(1, "npx vitest", "/w/web", 0), me.clone()],
         };

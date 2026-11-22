@@ -84,10 +84,13 @@ impl<'a> Gate<'a> for Disk {
     fn admit(&mut self, _: &'a Job) {}
 }
 
-/// Free RAM. Skipped when nothing runs, so an idle machine always starts a job.
+/// Free RAM, minus what recently started jobs and jobs admitted in this pass are assumed to
+/// take. Skipped when nothing runs, so an idle machine always starts a job.
 struct Ram {
     free: u64,
     needs: u64,
+    per_point: u64,
+    budget: u32,
 }
 
 impl<'a> Gate<'a> for Ram {
@@ -97,7 +100,10 @@ impl<'a> Gate<'a> for Ram {
             needs: self.needs,
         })
     }
-    fn admit(&mut self, _: &'a Job) {}
+    fn admit(&mut self, w: &'a Job) {
+        let take = self.per_point * effective_cost(w.cost, self.budget) as u64;
+        self.free = self.free.saturating_sub(take);
+    }
 }
 
 /// The standard gates, primed with what already runs, in reporting order.
@@ -121,8 +127,16 @@ pub fn standard<'a>(jobs: &'a [Job], inputs: &Inputs<'a>) -> Vec<Box<dyn Gate<'a
         Box::new(resources),
         Box::new(Disk),
         Box::new(Ram {
-            free: inputs.free_ram,
+            free: inputs
+                .free_ram
+                .saturating_sub(crate::scheduler::recent_reservation(
+                    jobs,
+                    inputs.now_ms,
+                    &inputs.limits,
+                )),
             needs: inputs.limits.min_free_bytes,
+            per_point: inputs.limits.ram_per_point,
+            budget: inputs.limits.budget,
         }),
     ]
 }

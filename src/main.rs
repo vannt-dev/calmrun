@@ -76,6 +76,7 @@ fn dispatch(cli: Cli) -> i32 {
         }
         Some(Sub::Probe(ref a)) => commands::probe(a),
         Some(Sub::CtrlC { pid }) => commands::ctrl_c(pid),
+        Some(Sub::Watchdog { parent, pgid }) => runner::watchdog(parent, pgid),
         None if cli.command.is_empty() => {
             use clap::CommandFactory;
             let _ = Cli::command().print_help();

@@ -52,21 +52,57 @@ impl Stop {
 
 /// The decision, kept pure for tests. `low_for` is how long free RAM has been below the floor;
 /// `biggest` says whether this job's tree is the largest of the running jobs.
-pub fn decide(
-    used: u64,
-    free: u64,
-    ceiling: u64,
-    floor: u64,
-    low_for: Option<Duration>,
-    biggest: bool,
-) -> Option<Stop> {
-    if ceiling > 0 && used > ceiling {
-        return Some(Stop::Ceiling { used, ceiling });
+/// What the guard decided about one sample.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Verdict {
+    Fine,
+    Stop(Stop),
+    /// Free RAM is critical, but this job is too small to be the cause: say so, once.
+    Warn {
+        free: u64,
+        floor: u64,
+        used: u64,
+    },
+}
+
+/// The limits the guard applies.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    pub ceiling: u64,
+    pub floor: u64,
+    /// A tree smaller than this is never stopped for low free RAM.
+    pub min_stop: u64,
+}
+
+/// The decision, kept pure for tests. `low_for` is how long free RAM has been below the floor;
+/// `biggest` says whether this job's tree is the single largest of the running jobs.
+pub fn decide(used: u64, free: u64, lim: Limits, low_for: Option<Duration>, biggest: bool) -> Verdict {
+    if lim.ceiling > 0 && used > lim.ceiling {
+        return Verdict::Stop(Stop::Ceiling {
+            used,
+            ceiling: lim.ceiling,
+        });
     }
-    if floor > 0 && free < floor && biggest && low_for.is_some_and(|d| d >= CRITICAL_FOR) {
-        return Some(Stop::LowMemory { free, floor, used });
+    let critical = lim.floor > 0 && free < lim.floor && low_for.is_some_and(|d| d >= CRITICAL_FOR);
+    match () {
+        _ if !critical || !biggest => Verdict::Fine,
+        _ if used < lim.min_stop => Verdict::Warn {
+            free,
+            floor: lim.floor,
+            used,
+        },
+        _ => Verdict::Stop(Stop::LowMemory {
+            free,
+            floor: lim.floor,
+            used,
+        }),
     }
-    None
+}
+
+/// Smallest tree the floor may stop: max(1 GB, 10% of RAM).
+pub fn min_stop_bytes(total_ram: u64) -> u64 {
+    const ONE_GB: u64 = 1 << 30;
+    (total_ram / 10).max(ONE_GB)
 }
 
 /// Sum of memory over `root` and all its descendants, from (pid, parent, bytes) rows.
@@ -99,8 +135,8 @@ pub fn tree_bytes(rows: &[(u32, Option<u32>, u64)], root: u32) -> u64 {
 /// Samples one job's process tree and the free RAM.
 pub struct MemWatch {
     sys: System,
-    pub ceiling: u64,
-    pub floor: u64,
+    lim: Limits,
+    warned: bool,
     last: Option<Instant>,
     low_since: Option<Instant>,
     /// Latest tree size.
@@ -109,14 +145,14 @@ pub struct MemWatch {
 
 impl MemWatch {
     /// A watcher, or `None` when both limits are off.
-    pub fn new(ceiling: u64, floor: u64) -> Option<MemWatch> {
-        if ceiling == 0 && floor == 0 {
+    pub fn new(lim: Limits) -> Option<MemWatch> {
+        if lim.ceiling == 0 && lim.floor == 0 {
             return None;
         }
         Some(MemWatch {
             sys: System::new().ok()?,
-            ceiling,
-            floor,
+            lim,
+            warned: false,
             last: None,
             low_since: None,
             used: 0,
@@ -145,7 +181,7 @@ impl MemWatch {
         self.sys
             .refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
         let free = self.sys.available_memory();
-        let low = self.floor > 0 && free < self.floor;
+        let low = self.lim.floor > 0 && free < self.lim.floor;
         if low {
             self.low_since.get_or_insert_with(Instant::now);
         } else {
@@ -153,10 +189,21 @@ impl MemWatch {
         }
         let low_for = self.low_since.map(|t| t.elapsed());
         let is_biggest = low && low_for.is_some_and(|d| d >= CRITICAL_FOR) && biggest(self.used);
-        (
-            true,
-            decide(self.used, free, self.ceiling, self.floor, low_for, is_biggest),
-        )
+        match decide(self.used, free, self.lim, low_for, is_biggest) {
+            Verdict::Stop(s) => (true, Some(s)),
+            Verdict::Warn { free, floor, used } if !self.warned => {
+                self.warned = true;
+                eprintln!(
+                    "calmrun: warning: free RAM is {:.1} GB (critical floor {:.1} GB), but this job uses \
+                     only {:.1} GB, so it keeps running; something outside the queue needs the memory",
+                    crate::config::bytes_to_gb(free),
+                    crate::config::bytes_to_gb(floor),
+                    crate::config::bytes_to_gb(used)
+                );
+                (true, None)
+            }
+            _ => (true, None),
+        }
     }
 }
 
@@ -166,34 +213,57 @@ mod tests {
 
     const GB: u64 = 1 << 30;
 
+    const LIM: Limits = Limits {
+        ceiling: 8 * GB,
+        floor: GB,
+        min_stop: GB,
+    };
+
     #[test]
     fn ceiling_wins_first() {
         assert_eq!(
-            decide(9 * GB, 10 * GB, 8 * GB, GB, None, false),
-            Some(Stop::Ceiling {
+            decide(9 * GB, 10 * GB, LIM, None, false),
+            Verdict::Stop(Stop::Ceiling {
                 used: 9 * GB,
                 ceiling: 8 * GB
             })
         );
-        assert_eq!(decide(7 * GB, 10 * GB, 8 * GB, GB, None, false), None);
-        assert_eq!(decide(90 * GB, 10 * GB, 0, 0, None, false), None);
+        assert_eq!(decide(7 * GB, 10 * GB, LIM, None, false), Verdict::Fine);
+        let off = Limits {
+            ceiling: 0,
+            floor: 0,
+            min_stop: 0,
+        };
+        assert_eq!(decide(90 * GB, 10 * GB, off, None, false), Verdict::Fine);
     }
 
     #[test]
-    fn low_memory_needs_time_and_biggest() {
+    fn low_memory_needs_time_biggest_and_size() {
         let short = Some(Duration::from_secs(1));
         let long = Some(Duration::from_secs(4));
-        assert_eq!(decide(GB, GB / 2, 0, GB, short, true), None);
-        assert_eq!(decide(GB, GB / 2, 0, GB, long, false), None);
+        let lim = Limits { ceiling: 0, ..LIM };
+        assert_eq!(decide(2 * GB, GB / 2, lim, short, true), Verdict::Fine);
+        assert_eq!(decide(2 * GB, GB / 2, lim, long, false), Verdict::Fine);
         assert_eq!(
-            decide(GB, GB / 2, 0, GB, long, true),
-            Some(Stop::LowMemory {
+            decide(2 * GB, GB / 2, lim, long, true),
+            Verdict::Stop(Stop::LowMemory {
                 free: GB / 2,
                 floor: GB,
-                used: GB
+                used: 2 * GB
             })
         );
-        assert_eq!(decide(GB, 2 * GB, 0, GB, long, true), None);
+        // Too small to be the cause: warn, never stop.
+        assert_eq!(
+            decide(GB / 4, GB / 2, lim, long, true),
+            Verdict::Warn {
+                free: GB / 2,
+                floor: GB,
+                used: GB / 4
+            }
+        );
+        assert_eq!(decide(2 * GB, 2 * GB, lim, long, true), Verdict::Fine);
+        assert_eq!(min_stop_bytes(16 * GB), 16 * GB / 10);
+        assert_eq!(min_stop_bytes(4 * GB), GB);
     }
 
     #[test]

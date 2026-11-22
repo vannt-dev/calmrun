@@ -131,10 +131,14 @@ pub fn with_block(text: &str) -> String {
     let blk = block();
     match find_block(text) {
         Some((a, b)) => format!("{}{blk}{}", &text[..a], &text[b..]),
-        None if text.trim().is_empty() => blk,
+        None if text.trim().is_empty() => format!("{text}{blk}"),
         None => {
-            let mut out = text.trim_end_matches(['\n', '\r']).to_string();
-            out.push_str("\n\n");
+            // Keep every byte of the user's text; only add a separator before the block.
+            let mut out = text.to_string();
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push('\n');
             out.push_str(&blk);
             out
         }
@@ -303,13 +307,62 @@ fn verb(opts: &Options) -> &'static str {
     }
 }
 
-fn write_file(path: &Path, text: &str) -> std::io::Result<()> {
+/// Suffix of the copy setup keeps of every file before it rewrites it.
+const BACKUP_SUFFIX: &str = "calmrun.bak";
+
+/// The file's text: empty when it does not exist; an error (and the file left alone) when
+/// it cannot be read or is not UTF-8, so no byte of it can be lost.
+fn read_existing(path: &Path) -> Result<String, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
+            format!(
+                "calmrun: {} is not UTF-8 text; left it alone (convert it to UTF-8 first)",
+                path.display()
+            )
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!(
+            "calmrun: cannot read {}: {e}; left it alone",
+            path.display()
+        )),
+    }
+}
+
+/// `file.ext` -> `file.ext.calmrun.bak`.
+pub fn backup_path(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".");
+    s.push(BACKUP_SUFFIX);
+    PathBuf::from(s)
+}
+
+/// Write `text`, first copying an existing file to its backup. Returns the backup made.
+fn write_with_backup(path: &Path, text: &str) -> std::io::Result<Option<PathBuf>> {
     path.parent().map_or(Ok(()), std::fs::create_dir_all)?;
-    std::fs::write(path, text)
+    let backup = if path.exists() {
+        let b = backup_path(path);
+        std::fs::copy(path, &b)?;
+        Some(b)
+    } else {
+        None
+    };
+    std::fs::write(path, text)?;
+    Ok(backup)
+}
+
+fn report_write(r: &mut Report, path: &Path, res: std::io::Result<Option<PathBuf>>) {
+    match res {
+        Ok(Some(b)) => r.line(format!("          backup: {}", b.display())),
+        Ok(None) => {}
+        Err(e) => r.fail(format!("calmrun: cannot write {}: {e}", path.display())),
+    }
 }
 
 fn apply_block(r: &mut Report, a: &Agent, opts: &Options) {
-    let old = std::fs::read_to_string(&a.file).unwrap_or_default();
+    let old = match read_existing(&a.file) {
+        Ok(t) => t,
+        Err(msg) => return r.fail(msg),
+    };
     let new = if opts.remove {
         without_block(&old)
     } else {
@@ -336,14 +389,15 @@ fn apply_block(r: &mut Report, a: &Agent, opts: &Options) {
         ));
     }
     if opts.write && new != old {
-        if let Err(e) = write_file(&a.file, &new) {
-            r.fail(format!("calmrun: cannot write {}: {e}", a.file.display()));
-        }
+        report_write(r, &a.file, write_with_backup(&a.file, &new));
     }
 }
 
 fn apply_hook(r: &mut Report, path: &Path, opts: &Options) {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let text = match read_existing(path) {
+        Ok(t) => t,
+        Err(msg) => return r.fail(msg),
+    };
     let parsed = if text.trim().is_empty() {
         Ok(json!({}))
     } else {
@@ -375,22 +429,12 @@ fn apply_hook(r: &mut Report, path: &Path, opts: &Options) {
     if !opts.write {
         return;
     }
-    let backup = path.with_extension("json.calmrun.bak");
-    let res = (|| -> std::io::Result<bool> {
-        let had = path.exists();
-        if had {
-            std::fs::copy(path, &backup)?;
-        }
-        let mut s = serde_json::to_string_pretty(&new).map_err(std::io::Error::other)?;
-        s.push('\n');
-        write_file(path, &s)?;
-        Ok(had)
-    })();
-    match res {
-        Ok(true) => r.line(format!("          backup: {}", backup.display())),
-        Ok(false) => {}
-        Err(e) => r.fail(format!("calmrun: cannot write {}: {e}", path.display())),
-    }
+    let mut s = match serde_json::to_string_pretty(&new) {
+        Ok(s) => s,
+        Err(e) => return r.fail(format!("calmrun: cannot write {}: {e}", path.display())),
+    };
+    s.push('\n');
+    report_write(r, path, write_with_backup(path, &s));
 }
 
 #[cfg(test)]

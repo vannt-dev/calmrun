@@ -36,6 +36,16 @@ All notable changes to this project are documented here. The format follows
 - Separate queues: `--id QUEUE` for running, `status` and `bump` (GNU sem style).
 - Relative programs (`./gradlew`, `tool`) are looked up in the job's working directory, also for
   MCP tasks with a `cwd`.
+- Endless commands (watch modes, attached `docker compose up`, interactive `docker run`) are
+  refused with the one-shot form; dev servers and `--help` / `--version` run outside the queue.
+- Safety: bare program names never come from the working directory on Windows; `setup` backs
+  up every file it rewrites and refuses non-UTF-8 or unreadable files; a corrupt
+  `state.json` is set aside, an unreadable one is an error instead of an empty queue.
+- The RAM gate shares one reading per second across waiters and reserves memory for jobs
+  that just started. Unix: the command dies with calmrun (Linux parent-death signal, macOS
+  watchdog), Ctrl+Z suspends both, and `calmrun mcp` stops its tasks on SIGTERM.
+- `npx tsc@5`-style package specs are detected; `status` shows places kept by a ticket; the
+  hook suggests calmrun's absolute path when it is not on PATH.
 - `calmrun mcp`: an MCP server over stdio with `run_task` (same queue as the CLI, captured
   log, last 200 lines, progress notifications, timeout, cancellation), `queue_status` and
   `bump`.

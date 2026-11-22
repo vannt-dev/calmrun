@@ -89,7 +89,9 @@ calmrun init [--force]
 
 - Separate words (`calmrun -- npx vitest run`) run the program directly. On Windows calmrun
   looks the name up on `PATH` with `PATHEXT`, so `npm`, `npx` and other `.cmd` shims work, and
-  arguments are escaped for `cmd.exe`.
+  arguments are escaped for `cmd.exe`. A bare name is never taken from the working directory
+  (a repository's own `npm.cmd` cannot stand in for npm); `./gradlew` or `.\tool.cmd` with a
+  path runs from the job's folder.
 - One string containing spaces (`calmrun "a && b"`) runs through the shell: `cmd /d /s /c` on
   Windows, `sh -c` on Unix. calmrun never rewrites such a string.
 - The exit code is the command's exit code (on Unix a signal `n` becomes `128 + n`). A missing
@@ -175,15 +177,25 @@ all-or-nothing.
 
 **Command rules.**
 
-- `docker compose up` / `docker-compose up` without `-d`, `--detach` or `--wait` is refused:
-  it would hold points for as long as the containers run.
+- Commands that never end would hold their points forever, so they are refused with the
+  one-shot form to run instead (`calmrun: next: …`):
+  - `docker compose up` / `docker-compose up` without `-d`, `--detach` or `--wait` → add `-d`;
+  - `tsc --watch` / `-w`, `jest --watch` / `--watchAll` → without the flag;
+  - `vitest watch` / `vitest dev`, and plain `vitest` when stdin is a terminal (it watches
+    then) → `vitest run`;
+  - `docker run -it` / `-i` / `-t` (interactive containers) → run it outside calmrun.
+- Dev servers (`vite`, `next dev`, `ng serve`, `npm run dev|start|serve|preview`, …) and
+  commands that only print help or a version (`--help`, `-h`, `--version`, `-V`) run at once,
+  outside the queue.
 - vitest started directly as separate words (`vitest …`, `npx|pnpx|bunx vitest …`,
   `pnpm|yarn exec vitest …`) gets `--maxWorkers=N` appended unless it already passes
   `--maxWorkers`, `--pool` or `--no-file-parallelism`. N is `vitest_workers` (default 1 for
   up to 4 cores, 2 below 12, else 3). `npm run …` scripts and shell strings are never changed.
 - gradle / gradlew started directly as words gets `--max-workers=N` unless it already sets
   `--max-workers` or `-Dorg.gradle.workers.max`.
-- Cargo commands get `CARGO_BUILD_JOBS=N` unless it is already set.
+- Cargo commands get `CARGO_BUILD_JOBS=N` unless it is already set. If a cargo config
+  (`.cargo/config.toml` up from the working directory, then `$CARGO_HOME/config.toml`) sets a
+  lower `build.jobs`, that lower number is used.
 - For both, N is the job's share of the machine: logical cores × cost ÷ budget (at least 1).
 
 **Nesting.** calmrun sets `CALMRUN_HELD=<pid>` for the command. A calmrun started inside it
@@ -197,8 +209,10 @@ own process group on Unix. `CALMRUN_LOW_CPU=0` turns the priority change off.
 (the command and every process below it, including nested calmrun runs) about once a second.
 If the tree goes above `ceiling_gb` (default half the RAM; `0` turns it off), or free RAM
 stays below `critical_free_gb` (default 5% of RAM, at most 1 GB) for 3 seconds and this job's
-tree is the largest of the running jobs, calmrun stops the tree (gracefully, then forced) and
-exits **137** with a message like:
+tree is the single largest of the running jobs (on a tie, the newer one), calmrun stops the
+tree (gracefully, then forced) and exits **137**. A tree smaller than max(1 GB, 10% of RAM)
+is never stopped for low free RAM: calmrun warns once instead, since something outside the
+queue is using the memory. A ceiling stop looks like:
 
 ```
 calmrun: stopped npx vitest run: its processes used 9.1 GB, above the 8.0 GB ceiling
@@ -324,8 +338,10 @@ speak MCP can queue work without a shell wrapper. It offers three tools:
 | `bump` | `{label}`: move matching waiting jobs to the front. |
 
 A `command` made of plain words runs the program directly (and gets the vitest
-`--maxWorkers` rule); one that uses shell syntax (`&&`, pipes, redirects, `$VAR`, …) runs in
-`sh -c` on macOS/Linux and `cmd /d /s /c` on Windows.
+`--maxWorkers` rule); leading `VAR=value` words become the command's environment, so
+`CI=1 npm test` works on Windows too. One that uses shell syntax (`&&`, pipes, redirects,
+`$VAR`, …) runs in `sh -c` on macOS/Linux and `cmd /d /s /c` on Windows. The output tail is in
+the text content and, for clients that show structured results, in `output_tail`.
 
 Register it with your agent:
 
@@ -387,9 +403,10 @@ calmrun setup --write --remove --hook # take both out again
 
 The block sits between `<!-- calmrun:start … -->` and `<!-- calmrun:end -->`. Running setup
 again replaces the block in place instead of adding a second one, and `--remove` deletes it
-and leaves the rest of the file as it was. `--hook` merges the PreToolUse entry into
-`settings.json`, keeps every other setting, writes a backup to `settings.json.calmrun.bak`
-first, and leaves a file it cannot parse untouched.
+and leaves the rest of the file as it was. Every file setup rewrites is first copied to
+`<file>.calmrun.bak`; a file that cannot be read or is not UTF-8 text is left alone (exit 1).
+`--hook` merges the PreToolUse entry into `settings.json`, keeps every other setting, and
+leaves a file it cannot parse untouched.
 
 ### Instructions for agents
 
@@ -418,20 +435,22 @@ Use `calmrun status` to see what is running or waiting. Do not wrap light comman
 - **macOS / Linux.** The command gets its own process group. When calmrun runs in the
   foreground of a terminal, that group becomes the terminal's foreground group (so the command
   can read input and gets Ctrl+C directly) and the terminal is handed back afterwards; SIGINT,
-  SIGTERM and SIGHUP that calmrun receives are forwarded to the group as SIGINT.
+  SIGTERM and SIGHUP that calmrun receives are forwarded to the group as SIGINT. Ctrl+Z stops
+  the command and calmrun together; `fg` continues both.
 - **When calmrun itself is killed hard.** On Windows the Job Object ends the command's tree
-  even after `taskkill /F`. On macOS and Linux a `kill -9` of calmrun (or of `calmrun mcp`)
-  cannot be caught: the command keeps running, and its queue points are freed as soon as
-  another calmrun notices the dead pid. The same holds for any signal to `calmrun mcp`. Stop
-  calmrun with Ctrl+C or SIGTERM instead; an MCP server stops its tasks when its client
-  closes stdin.
+  even after `taskkill /F`. On Linux the command gets SIGTERM when calmrun dies, even by
+  `kill -9` (parent-death signal). On macOS a small `calmrun __watchdog` process does the same
+  within a second. `calmrun mcp` stops its running tasks on Ctrl+C / SIGTERM and when its
+  client closes stdin, then exits.
 - **Memory figures.** calmrun counts resident memory: the working set on Windows and the
   resident set size (RSS) on macOS and Linux. Shared pages count once per process, so the
   tree total can be higher than what the OS reports as used; the default ceiling leaves room.
 - **What CI covers.** The test suite runs on Windows, macOS and Linux (GitHub-hosted x64 and
-  arm64 runners): queue rules, exit codes, Ctrl+C while running and while waiting, and daemons
+  arm64 runners): queue rules, exit codes, Ctrl+C while running and while waiting, a SIGKILLed
+  calmrun taking its command with it (Unix), SIGTERM to the MCP server (Unix), and daemons
   surviving a normal exit, and the memory ceiling stopping a nested tree. The critical
-  free-RAM floor is covered by unit tests only (it depends on the machine).
+  free-RAM floor is covered by unit tests only (it depends on the machine). Ctrl+Z is not
+  covered by CI (runners have no terminal).
   The MCP server, tickets, the disk gate, named resources, separate queues and `setup` run
   their integration tests on all three systems as well. Killing calmrun ending the tree is tested on Windows only. The
   terminal hand-over is not covered by CI (runners have no terminal).

@@ -16,9 +16,8 @@ pub struct Cli {
     #[command(subcommand)]
     pub sub: Option<Sub>,
 
-    /// Kind of job (vitest, jest, tsc, capture, docker, eslint, pytest, build, test, or one from
-    /// the config). Detected from the command when omitted.
-    #[arg(long, value_name = "K")]
+    /// Kind of job; detected from the command when omitted.
+    #[arg(long, value_name = "K", help = crate::kinds::kind_help())]
     pub kind: Option<String>,
 
     /// Points this job takes from the budget (clamped to the budget).
@@ -125,6 +124,9 @@ pub enum Sub {
     /// Test helper: sleep and log start/end times.
     #[command(name = "__probe", hide = true)]
     Probe(ProbeArgs),
+    /// Internal (macOS): end a command's process group when its calmrun disappears.
+    #[command(name = "__watchdog", hide = true)]
+    Watchdog { parent: i32, pgid: i32 },
     /// Test helper: send Ctrl+C (Windows console event) or SIGINT (Unix) to a process.
     #[command(name = "__ctrl_c", hide = true)]
     CtrlC { pid: u32 },

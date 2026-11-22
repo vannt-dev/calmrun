@@ -32,6 +32,11 @@ pub fn install_signal_handler() {
     });
 }
 
+/// The macOS parent-death watchdog (`calmrun __watchdog <parent> <pgid>`); a no-op elsewhere.
+pub fn watchdog(parent: i32, pgid: i32) -> i32 {
+    imp::watchdog(parent, pgid)
+}
+
 /// Test helper: deliver Ctrl+C to `pid` (a console event on Windows, SIGINT on Unix).
 pub fn send_ctrl_c(pid: u32) -> bool {
     imp::send_ctrl_c(pid)
@@ -74,6 +79,11 @@ pub fn run(
     watch: &mut dyn FnMut(u32) -> bool,
 ) -> io::Result<Ended> {
     imp::run(cmd, low_cpu, on_spawn, watch)
+}
+
+/// Whether a bare program name is found on PATH (with PATHEXT on Windows).
+pub fn on_path(name: &str) -> bool {
+    imp::find_on_path(name).is_some()
 }
 
 /// Quote a word for display so it can be pasted back into this OS's usual shell.
@@ -134,6 +144,16 @@ mod imp {
         status.signal()
     }
 
+    /// An executable file named `name` in a PATH directory.
+    pub fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path).map(|d| d.join(name)).find(|p| {
+            p.metadata()
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+    }
+
     /// Quote a word for this OS's usual shell.
     pub fn quote(w: &str) -> String {
         format!("'{}'", w.replace('\'', "'\\''"))
@@ -189,10 +209,13 @@ mod imp {
         watch: &mut dyn FnMut(u32) -> bool,
     ) -> io::Result<Ended> {
         let tty = owns_terminal();
+        // SAFETY: plain syscall.
+        let parent = unsafe { libc::getpid() };
         cmd.process_group(0);
         // SAFETY: only async-signal-safe calls between fork and exec.
         unsafe {
             cmd.pre_exec(move || {
+                die_with_parent(parent);
                 if low_cpu {
                     libc::nice(NICE);
                 }
@@ -202,33 +225,18 @@ mod imp {
                 Ok(())
             });
         }
-        let mut child = cmd.spawn()?;
+        let child = cmd.spawn()?;
         let pid = child.id() as i32;
         CHILD_PGID.store(pid, Ordering::SeqCst);
+        let mut guard = Watchdog::start(parent, pid);
         on_spawn(child.id());
-        let mut stopped_at: Option<Instant> = None;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(st)) => break Ok(st),
-                Ok(None) => {}
-                Err(e) => break Err(e),
-            }
-            match stopped_at {
-                None if watch(child.id()) => {
-                    killpg(pid, libc::SIGTERM);
-                    stopped_at = Some(Instant::now());
-                }
-                Some(t) if t.elapsed() > STOP_GRACE => killpg(pid, libc::SIGKILL),
-                _ => {}
-            }
-            std::thread::sleep(WATCH_EVERY);
-        };
+        let (status, stopped) = wait_child(pid, tty, watch);
         CHILD_PGID.store(0, Ordering::SeqCst);
+        guard.stop();
         if tty {
             // SAFETY: plain syscall.
             give_terminal_to(unsafe { libc::getpgrp() });
         }
-        let stopped = stopped_at.is_some();
         // After Ctrl+C, leftovers of the command's group get SIGTERM so they can clean up;
         // after a stop (already past its grace period) they are killed. After a normal exit
         // they stay: they are daemons the command meant to leave running.
@@ -239,6 +247,117 @@ mod imp {
         }
         let code = if stopped { EXIT_STOPPED } else { code_of(status?) };
         Ok(Ended { code, stopped })
+    }
+
+    /// Wait for the child, asking `watch` meanwhile. Uses `waitpid(WUNTRACED)` so Ctrl+Z works:
+    /// when the command stops, calmrun takes the terminal back and stops itself; when the shell
+    /// continues calmrun, it hands the terminal back and continues the command.
+    fn wait_child(pid: i32, tty: bool, watch: &mut dyn FnMut(u32) -> bool) -> (io::Result<ExitStatus>, bool) {
+        let mut stopped_at: Option<Instant> = None;
+        loop {
+            let mut st: libc::c_int = 0;
+            // SAFETY: waiting for our own child.
+            let r = unsafe { libc::waitpid(pid, &mut st, libc::WNOHANG | libc::WUNTRACED) };
+            if r < 0 {
+                return (Err(io::Error::last_os_error()), stopped_at.is_some());
+            }
+            if r == pid && libc::WIFSTOPPED(st) {
+                if tty {
+                    suspend_with_child(pid);
+                }
+                continue;
+            }
+            if r == pid {
+                return (Ok(ExitStatus::from_raw(st)), stopped_at.is_some());
+            }
+            match stopped_at {
+                None if watch(pid as u32) => {
+                    killpg(pid, libc::SIGTERM);
+                    stopped_at = Some(Instant::now());
+                }
+                Some(t) if t.elapsed() > STOP_GRACE => killpg(pid, libc::SIGKILL),
+                _ => {}
+            }
+            std::thread::sleep(WATCH_EVERY);
+        }
+    }
+
+    /// Ctrl+Z: the command stopped. Stop ourselves the same way, then resume it.
+    fn suspend_with_child(pid: i32) {
+        // SAFETY: plain syscalls on our own process and group.
+        unsafe {
+            give_terminal_to(libc::getpgrp());
+            libc::kill(libc::getpid(), libc::SIGSTOP);
+        }
+        // Continued by the shell (`fg`): give the terminal back and continue the command.
+        give_terminal_to(pid);
+        killpg(pid, libc::SIGCONT);
+    }
+
+    /// In the child, before exec: die when calmrun dies, even by SIGKILL (Linux). The death
+    /// signal is tied to the thread that forked; calmrun forks from the thread that then waits
+    /// for the child, so it lives as long as the child matters.
+    #[cfg(target_os = "linux")]
+    fn die_with_parent(parent: libc::pid_t) {
+        // SAFETY: async-signal-safe calls only.
+        unsafe {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            if libc::getppid() != parent {
+                libc::_exit(1);
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn die_with_parent(_: libc::pid_t) {}
+
+    /// macOS has no parent-death signal: a small `calmrun __watchdog` process ends the
+    /// command's group if calmrun disappears. Elsewhere this does nothing.
+    struct Watchdog(Option<std::process::Child>);
+
+    impl Watchdog {
+        fn start(parent: libc::pid_t, pgid: i32) -> Watchdog {
+            if !cfg!(target_os = "macos") {
+                return Watchdog(None);
+            }
+            let child = std::env::current_exe().ok().and_then(|exe| {
+                let mut c = Command::new(exe);
+                c.args(["__watchdog", &parent.to_string(), &pgid.to_string()])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .process_group(0);
+                c.spawn().ok()
+            });
+            Watchdog(child)
+        }
+
+        fn stop(&mut self) {
+            if let Some(mut c) = self.0.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+
+    /// The watchdog: wait for `parent` to disappear, then end group `pgid`.
+    pub fn watchdog(parent: i32, pgid: i32) -> i32 {
+        const CHECK_EVERY: Duration = Duration::from_millis(500);
+        loop {
+            // SAFETY: signal 0 only checks existence.
+            let parent_alive = unsafe { libc::kill(parent, 0) == 0 };
+            let group_alive = unsafe { libc::killpg(pgid, 0) == 0 };
+            if !group_alive {
+                return 0;
+            }
+            if !parent_alive {
+                killpg(pgid, libc::SIGTERM);
+                std::thread::sleep(STOP_GRACE);
+                killpg(pgid, libc::SIGKILL);
+                return 0;
+            }
+            std::thread::sleep(CHECK_EVERY);
+        }
     }
 }
 
@@ -259,6 +378,11 @@ mod imp {
     pub const SHELL_CHARS: &[char] = &[
         '&', '|', ';', '<', '>', '(', ')', '$', '`', '*', '?', '\n', '%', '^', '!', '~',
     ];
+    /// No watchdog is needed: the Job Object ends the tree when calmrun dies.
+    pub fn watchdog(_: i32, _: i32) -> i32 {
+        2
+    }
+
     /// Exit status of a process ended by Ctrl+C.
     const STATUS_CONTROL_C_EXIT: i32 = 0xC000_013Au32 as i32;
     /// How long the Ctrl+C helper stays attached so the event is delivered.
@@ -372,9 +496,9 @@ mod imp {
         })
     }
 
-    /// PATH + PATHEXT lookup, like cmd.exe does (so `npm` finds `npm.cmd`). Relative names are
-    /// looked up in `cwd` (the directory the command will run in), and the result is an
-    /// absolute path with backslashes, which `cmd /c` accepts.
+    /// PATH + PATHEXT lookup (so `npm` finds `npm.cmd`). A name with a `/` or `\` is a path
+    /// relative to `cwd` (the directory the command will run in); a bare name is looked up on
+    /// PATH only. The result is an absolute path with backslashes, which `cmd /c` accepts.
     pub fn resolve(name: &str, cwd: &Path) -> Option<PathBuf> {
         let exts = pathext();
         let p = Path::new(name);
@@ -384,10 +508,14 @@ mod imp {
         if name.contains(['/', '\\']) {
             return try_file(&cwd.join(name.replace('/', "\\")), &exts);
         }
-        // cmd.exe searches the current directory first; mirror that.
-        if let Some(found) = try_file(&cwd.join(name), &exts) {
-            return Some(found);
-        }
+        // Bare names come only from PATH, never from the working directory: a repository's
+        // own `npm.cmd` must not run in place of the real one.
+        find_on_path(name)
+    }
+
+    /// `name` (with PATHEXT) in a PATH directory.
+    pub fn find_on_path(name: &str) -> Option<PathBuf> {
+        let exts = pathext();
         let path = std::env::var_os("PATH")?;
         std::env::split_paths(&path)
             .filter(|d| !d.as_os_str().is_empty())
