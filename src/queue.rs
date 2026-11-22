@@ -31,6 +31,18 @@ pub struct Ctx {
     pub config_path: PathBuf,
     pub machine: config::Machine,
     pub sys: Sys,
+    /// A separate queue (`--id`); `None` is the default machine-wide queue.
+    pub queue: Option<String>,
+}
+
+/// A queue id may hold letters, digits, `-`, `_` and `.` (not leading).
+pub fn valid_queue_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && !id.starts_with('.')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 impl Ctx {
@@ -50,6 +62,7 @@ impl Ctx {
             config_path,
             machine,
             sys,
+            queue: None,
         }
     }
 
@@ -62,7 +75,10 @@ impl Ctx {
     }
 
     pub fn store(&self) -> io::Result<Store> {
-        Store::open(&self.home)
+        match &self.queue {
+            Some(id) => Store::open_queue(&self.home, id),
+            None => Store::open(&self.home),
+        }
     }
 }
 
@@ -117,6 +133,8 @@ pub struct Request {
     pub rerun_hint: Option<String>,
     /// Extra environment for the command.
     pub env: Vec<(String, String)>,
+    /// Named resources to hold one slot of each (`--needs db`).
+    pub needs: Vec<String>,
 }
 
 /// How long a ticket keeps its place without a re-run.
@@ -354,6 +372,17 @@ pub fn run(ctx: &mut Ctx, mut req: Request, notify: &mut dyn Notify) -> Outcome 
         parked_until: None,
         mem_bytes: None,
         disk_short: false,
+        needs: {
+            let mut n: Vec<String> = req
+                .needs
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            n.sort();
+            n.dedup();
+            n
+        },
     };
     let sys = &mut ctx.sys;
     let ticket = req.ticket;
@@ -447,7 +476,7 @@ pub fn run(ctx: &mut Ctx, mut req: Request, notify: &mut dyn Notify) -> Outcome 
             if let Some(j) = s.jobs.iter_mut().find(|j| j.id == id) {
                 j.disk_short = short;
             }
-            let (admitted, blocked) = scheduler::plan(&s.jobs, now, free, lim);
+            let (admitted, blocked) = scheduler::plan_with(&s.jobs, now, free, lim, &cfg.resources);
             if admitted.contains(&id) {
                 if let Some(j) = s.jobs.iter_mut().find(|j| j.id == id) {
                     j.started_ms = Some(now);
@@ -455,7 +484,17 @@ pub fn run(ctx: &mut Ctx, mut req: Request, notify: &mut dyn Notify) -> Outcome 
                 }
                 return Ok(now);
             }
-            Err(waiting_line(s, id, &entry, &blocked, lim, cost, &disk, now))
+            Err(waiting_line(
+                s,
+                id,
+                &entry,
+                &blocked,
+                lim,
+                cost,
+                &disk,
+                now,
+                &cfg.resources,
+            ))
         });
         match step {
             Ok(Ok(t)) => break t,
@@ -587,6 +626,7 @@ pub fn run(ctx: &mut Ctx, mut req: Request, notify: &mut dyn Notify) -> Outcome 
             wait_ms: out.wait_ms,
             run_ms: out.run_ms,
             status: out.status.clone(),
+            queue: ctx.queue.clone(),
         },
     );
     out
@@ -687,8 +727,9 @@ fn waiting_line(
     cost: u32,
     disk: &DiskCheck,
     now: u64,
+    caps: &std::collections::BTreeMap<String, u32>,
 ) -> String {
-    let line = waiting_reason(s, id, entry, blocked, lim, cost, disk);
+    let line = waiting_reason(s, id, entry, blocked, lim, cost, disk, caps);
     let running = running_summary(s, now);
     if running.is_empty() {
         line
@@ -697,6 +738,7 @@ fn waiting_line(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn waiting_reason(
     s: &State,
     id: u64,
@@ -705,6 +747,7 @@ fn waiting_reason(
     lim: Limits,
     cost: u32,
     disk: &DiskCheck,
+    caps: &std::collections::BTreeMap<String, u32>,
 ) -> String {
     let used = scheduler::used_points(&s.jobs, lim.budget);
     let place = scheduler::waiting_in_order(&s.jobs)
@@ -723,6 +766,21 @@ fn waiting_reason(
             bytes_to_gb(free),
             bytes_to_gb(needs)
         ),
+        Block::Resource(name) => {
+            let holders: Vec<String> = s
+                .jobs
+                .iter()
+                .filter(|j| j.running() && j.needs.contains(&name))
+                .map(|j| j.label.clone())
+                .collect();
+            format!(
+                "calmrun: waiting for resource \"{name}\" ({} of {} slot(s) held by {}), {} in line",
+                holders.len(),
+                scheduler::capacity(caps, &name),
+                holders.join(", "),
+                ordinal(place)
+            )
+        }
         Block::Disk => format!(
             "calmrun: waiting for disk space: {:.1} GB free on {}, needs {:.1} GB",
             bytes_to_gb(disk.free),
@@ -758,6 +816,7 @@ fn job_json(j: &Job, now: u64, place: Option<usize>) -> serde_json::Value {
         "pid": j.pid,
         "child_pid": j.child_pid,
         "mem_bytes": j.mem_bytes,
+        "needs": j.needs,
         "cwd": j.cwd,
         "high": j.high,
         "since_ms": j.started_ms.unwrap_or(j.queued_ms),
@@ -785,6 +844,7 @@ pub fn status_json(ctx: &mut Ctx, state: &State) -> serde_json::Value {
     let running: Vec<&Job> = state.jobs.iter().filter(|j| j.running()).collect();
     let waiting = scheduler::waiting_in_order(&state.jobs);
     json!({
+        "queue": ctx.queue,
         "budget": budget,
         "used": used,
         "free_ram_bytes": free,

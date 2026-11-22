@@ -74,10 +74,11 @@ calmrun: waiting for RAM: 2.1 GB free, needs 3.0 GB; running: npx playwright in 
 ## CLI
 
 ```
-calmrun [--kind K] [--cost N] [--prio high] [--label L] [--wait-timeout SECS] [--ticket ID] -- <command...>
-calmrun status [--json]
+calmrun [--kind K] [--cost N] [--prio high] [--label L] [--needs NAME,…] [--id QUEUE]
+        [--wait-timeout SECS] [--ticket ID] -- <command...>
+calmrun status [--json] [--id QUEUE]
 calmrun stats [--days N] [--json]
-calmrun bump <label-substring>
+calmrun bump <label-substring> [--id QUEUE]
 calmrun doctor
 calmrun hook claude
 calmrun mcp
@@ -152,6 +153,17 @@ is running, so a job never waits forever on an idle machine.
 `calmrun: waiting for disk space: 3.2 GB free on C:\, needs 5.0 GB`. When nothing else is
 running it starts anyway, with a warning, so it never waits for a drive it cannot clean up.
 
+**Named resources.** `--needs db` makes a job also take one slot of the resource `db`.
+Configure slots with `[resources] db = 1` or `CALMRUN_RESOURCES="db=1,gpu=2"`; a resource
+that is not configured has one slot. Use it for things that cannot be shared: one test
+database, one emulator, one GPU. Waiters say who holds it:
+`calmrun: waiting for resource "db" (1 of 1 slot(s) held by npm test), 2nd in line`.
+
+**Separate queues.** `--id QUEUE` uses its own queue with its own budget, like GNU `sem --id`
+(for example one queue per project, or one for long e2e runs). `status --id QUEUE` and
+`bump … --id QUEUE` act on it. The default queue and named queues do not see each other's
+points; history and config are shared.
+
 **Order.** `--prio high` first, then first come. A later job may pass earlier ones only if it
 fits right now and no job ahead of it has waited longer than `pass_limit_min` (default 10;
 0 = strict order). Running jobs are never stopped.
@@ -218,6 +230,10 @@ ceiling_gb = 8          # 0 = off
 min_free_disk_gb = 5    # 0 = off
 critical_free_gb = 0.8  # 0 = off
 
+[resources]                      # named resources for --needs, with their slots
+db = 1
+emulator = 1
+
 [kinds.vitest]
 cost = 3                         # override a built-in cost
 
@@ -235,6 +251,7 @@ patterns = ["make", "bazel build"]
 | `CALMRUN_PASS_MIN` | Pass limit in minutes; `0` = strict order |
 | `CALMRUN_VITEST_WORKERS` | `--maxWorkers` value for vitest |
 | `CALMRUN_LOW_CPU` | `0` keeps normal priority |
+| `CALMRUN_RESOURCES` | Named resource slots, e.g. `db=1,gpu=2` (adds to `[resources]`) |
 | `CALMRUN_MIN_FREE_DISK_GB` | Free space needed on the cwd's drive; `0` = off |
 | `CALMRUN_CEILING_GB` | Memory ceiling for one job's process tree; `0` = off |
 | `CALMRUN_CRITICAL_FREE_GB` | Free-RAM floor that stops the biggest job; `0` = off |
@@ -302,7 +319,7 @@ speak MCP can queue work without a shell wrapper. It offers three tools:
 
 | Tool | What it does |
 | --- | --- |
-| `run_task` | `{command, cwd?, kind?, cost?, label?, timeout_s?, prio?, wait_timeout_s?, ticket?}`. Waits in the same queue as the CLI, runs the command at low priority and returns the exit code, wait and run time, the last 200 lines of output and the path of the full log (kept under `logs/` in the state directory; the newest 200 are kept). While it waits, the server sends progress notifications if the client passed a `progressToken`. `timeout_s` stops the command (exit 124). `wait_timeout_s` gives up waiting (exit 75) and returns a `ticket`; pass it back as `ticket` to resume the same place in line. Cancelling the request leaves the queue or stops the command. |
+| `run_task` | `{command, cwd?, kind?, cost?, label?, timeout_s?, prio?, wait_timeout_s?, ticket?, needs?, queue?}`. Waits in the same queue as the CLI, runs the command at low priority and returns the exit code, wait and run time, the last 200 lines of output and the path of the full log (kept under `logs/` in the state directory; the newest 200 are kept). While it waits, the server sends progress notifications if the client passed a `progressToken`. `timeout_s` stops the command (exit 124). `wait_timeout_s` gives up waiting (exit 75) and returns a `ticket`; pass it back as `ticket` to resume the same place in line. Cancelling the request leaves the queue or stops the command. |
 | `queue_status` | The same data as `calmrun status --json`. |
 | `bump` | `{label}`: move matching waiting jobs to the front. |
 
@@ -398,7 +415,9 @@ Use `calmrun status` to see what is running or waiting. Do not wrap light comman
 - **What CI covers.** The test suite runs on Windows, macOS and Linux (GitHub-hosted x64 and
   arm64 runners): queue rules, exit codes, Ctrl+C while running and while waiting, and daemons
   surviving a normal exit, and the memory ceiling stopping a nested tree. The critical
-  free-RAM floor is covered by unit tests only (it depends on the machine). Killing calmrun ending the tree is tested on Windows only. The
+  free-RAM floor is covered by unit tests only (it depends on the machine).
+  The MCP server, tickets, the disk gate, named resources, separate queues and `setup` run
+  their integration tests on all three systems as well. Killing calmrun ending the tree is tested on Windows only. The
   terminal hand-over is not covered by CI (runners have no terminal).
 - **Battery.** `calmrun doctor` reports whether the machine runs on battery; consider a smaller
   budget then.

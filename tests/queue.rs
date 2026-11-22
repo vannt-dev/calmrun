@@ -39,7 +39,7 @@ impl Env {
         c.args(flags)
             .arg("--")
             .arg(EXE)
-            .args(["__probe", "--id", id, "--sleep-ms", &ms.to_string(), "--log"])
+            .args(["__probe", "--name", id, "--sleep-ms", &ms.to_string(), "--log"])
             .arg(&self.log);
         if let Some(d) = cwd {
             c.current_dir(d);
@@ -253,7 +253,7 @@ fn nested_run_does_not_deadlock() {
     let env = Env::new();
     let mut c = env.cmd(2);
     c.args([
-        "--cost", "2", "--", EXE, "--cost", "2", "--", EXE, "__probe", "--id", "inner", "--log",
+        "--cost", "2", "--", EXE, "--cost", "2", "--", EXE, "__probe", "--name", "inner", "--log",
     ])
     .arg(&env.log);
     let child = c.spawn().unwrap();
@@ -374,7 +374,7 @@ fn wait_timeout_keeps_the_place_with_a_ticket() {
             "--",
             EXE,
             "__probe",
-            "--id",
+            "--name",
             "b",
             "--log",
         ])
@@ -500,4 +500,58 @@ fn cargo_gets_a_job_count() {
         .output()
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "7");
+}
+
+#[test]
+fn named_resource_is_held_by_one_job_at_a_time() {
+    let env = Env::new();
+    let kids = vec![
+        env.probe(4, &["--cost", "1", "--needs", "db"], "db1", 600, None),
+        env.probe(4, &["--cost", "1", "--needs", "db"], "db2", 600, None),
+        env.probe(4, &["--cost", "1"], "free", 600, None),
+    ];
+    assert!(wait_all(kids, Duration::from_secs(60)).iter().all(|&c| c == 0));
+    let iv = env.intervals();
+    let db: Vec<_> = iv.iter().filter(|x| x.0.starts_with("db")).cloned().collect();
+    assert_eq!(max_overlap(&db, |_| 1), 1, "db holders overlapped: {db:?}");
+    assert!(
+        max_overlap(&iv, |_| 1) >= 2,
+        "the job without needs should run alongside: {iv:?}"
+    );
+}
+
+#[test]
+fn separate_queues_do_not_share_points() {
+    let env = Env::new();
+    let a = env.probe(2, &["--cost", "2", "--id", "alpha"], "a", 1500, None);
+    let b = env.probe(2, &["--cost", "2", "--id", "beta"], "b", 1500, None);
+    // Each queue has its own budget, so both run at once.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let out = env
+            .cmd(2)
+            .args(["status", "--json", "--id", "alpha"])
+            .stdout(Stdio::piped())
+            .output()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        if v["running"].as_array().is_some_and(|r| r.len() == 1) {
+            assert_eq!(v["queue"], "alpha");
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(wait_all(vec![a, b], Duration::from_secs(60))
+        .iter()
+        .all(|&c| c == 0));
+    assert_eq!(max_overlap(&env.intervals(), |_| 1), 2);
+    // The default queue never saw them.
+    assert_eq!(env.status()["running"].as_array().unwrap().len(), 0);
+    let bad = env
+        .cmd(2)
+        .args(["--id", "../x", "--", EXE, "__probe"])
+        .status()
+        .unwrap();
+    assert_eq!(bad.code(), Some(2));
 }

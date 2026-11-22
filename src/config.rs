@@ -37,6 +37,9 @@ pub struct FileConfig {
     pub critical_free_gb: Option<f64>,
     #[serde(default)]
     pub kinds: BTreeMap<String, KindConfig>,
+    /// Named resources and their slots (`[resources] db = 1`).
+    #[serde(default)]
+    pub resources: BTreeMap<String, u32>,
 }
 
 /// Effective settings after defaults, file and env are merged.
@@ -54,6 +57,18 @@ pub struct Config {
     /// A job waits while its cwd's drive has less free space than this (0 = off).
     pub min_free_disk_bytes: u64,
     pub kinds: BTreeMap<String, KindConfig>,
+    pub resources: BTreeMap<String, u32>,
+}
+
+/// `db=1,gpu=2` -> map.
+pub fn parse_resources(s: &str) -> BTreeMap<String, u32> {
+    s.split(',')
+        .filter_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            Some((k.trim().to_string(), v.trim().parse().ok()?))
+        })
+        .filter(|(k, _): &(String, u32)| !k.is_empty())
+        .collect()
 }
 
 pub fn default_budget(m: Machine) -> u32 {
@@ -163,6 +178,13 @@ pub fn resolve(m: Machine, file: FileConfig, env: &dyn Fn(&str) -> Option<String
         critical_free_bytes: (critical_gb * GB) as u64,
         min_free_disk_bytes: (disk_gb * GB) as u64,
         kinds: file.kinds,
+        resources: {
+            let mut r = file.resources;
+            if let Some(v) = env("CALMRUN_RESOURCES") {
+                r.extend(parse_resources(&v));
+            }
+            r
+        },
     }
 }
 
@@ -202,6 +224,11 @@ pub fn default_config_text(m: Machine) -> String {
 
 # --maxWorkers value appended to direct vitest calls (env CALMRUN_VITEST_WORKERS).
 # vitest_workers = {workers}
+
+# Named resources and how many jobs may hold each at once (env CALMRUN_RESOURCES="db=1").
+# A job takes a slot with --needs db. A resource that is not listed has 1 slot.
+# [resources]
+# db = 1
 
 # Override the cost of a built-in kind, or add your own kind with command patterns.
 # A pattern is the command's first words, e.g. "make" or "bazel build".
@@ -267,6 +294,17 @@ mod tests {
         assert_eq!(c.pass_limit_ms, 120_000);
         assert!(!c.low_cpu);
         assert_eq!(c.kinds["vitest"].cost, Some(3));
+    }
+
+    #[test]
+    fn resources_from_file_and_env() {
+        let file: FileConfig = toml::from_str("[resources]\ndb = 1\ngpu = 2\n").unwrap();
+        let env = |k: &str| (k == "CALMRUN_RESOURCES").then(|| "gpu=4, cache = 3,bad".to_string());
+        let c = resolve(m(8, 16), file, &env);
+        assert_eq!(c.resources["db"], 1);
+        assert_eq!(c.resources["gpu"], 4);
+        assert_eq!(c.resources["cache"], 3);
+        assert_eq!(c.resources.len(), 3);
     }
 
     #[test]

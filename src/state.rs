@@ -40,6 +40,9 @@ pub struct Job {
     /// Set by a waiting owner while the drive of its cwd has less free space than required.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disk_short: bool,
+    /// Named resources this job takes one slot of (`--needs db`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<String>,
 }
 
 impl Job {
@@ -73,6 +76,7 @@ impl State {
 
 pub struct Store {
     dir: PathBuf,
+    history: PathBuf,
 }
 
 impl Store {
@@ -80,6 +84,17 @@ impl Store {
         std::fs::create_dir_all(dir)?;
         Ok(Store {
             dir: dir.to_path_buf(),
+            history: dir.join("history.jsonl"),
+        })
+    }
+
+    /// A separate queue (`--id`) with its own state, sharing the history file of `home`.
+    pub fn open_queue(home: &Path, id: &str) -> io::Result<Store> {
+        let dir = home.join("queues").join(id);
+        std::fs::create_dir_all(&dir)?;
+        Ok(Store {
+            dir,
+            history: home.join("history.jsonl"),
         })
     }
 
@@ -88,7 +103,7 @@ impl Store {
     }
 
     pub fn history_path(&self) -> PathBuf {
-        self.dir.join("history.jsonl")
+        self.history.clone()
     }
 
     /// Run `f` on the state with the lock held; writes the state back if `f` changed it.
@@ -176,6 +191,7 @@ mod tests {
             parked_until: None,
             mem_bytes: None,
             disk_short: false,
+            needs: Vec::new(),
         }
     }
 

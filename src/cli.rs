@@ -32,6 +32,15 @@ pub struct Cli {
     #[arg(long, value_name = "L")]
     pub label: Option<String>,
 
+    /// Also take a slot of this named resource (repeat or comma-separate: --needs db,gpu).
+    #[arg(long, value_name = "NAME", value_delimiter = ',')]
+    pub needs: Vec<String>,
+
+    /// Use a separate queue with this id instead of the machine-wide one (like GNU sem --id).
+    /// Also selects the queue for status and bump.
+    #[arg(long, value_name = "QUEUE", global = true)]
+    pub id: Option<String>,
+
     /// Give up waiting after this many seconds: exit 75 and keep the place in line for
     /// 10 minutes. calmrun prints the command that resumes it.
     #[arg(long, value_name = "SECS")]
@@ -129,7 +138,7 @@ pub struct ProbeArgs {
     #[arg(long)]
     pub log: Option<std::path::PathBuf>,
     #[arg(long, default_value = "")]
-    pub id: String,
+    pub name: String,
     #[arg(long, default_value_t = 0)]
     pub sleep_ms: u64,
     #[arg(long, default_value_t = 0)]

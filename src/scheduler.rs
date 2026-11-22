@@ -4,7 +4,7 @@
 //! if its own id is in the result, so the queue behaves as if one scheduler decided.
 
 use crate::state::Job;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
@@ -38,10 +38,18 @@ pub fn used_points(jobs: &[Job], budget: u32) -> u32 {
 /// Why the first blocked waiter cannot start (for the waiting message).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
-    Points { used: u32, needs: u32 },
-    Ram { free: u64, needs: u64 },
+    Points {
+        used: u32,
+        needs: u32,
+    },
+    Ram {
+        free: u64,
+        needs: u64,
+    },
     Disk,
     Key,
+    /// All slots of this named resource are taken.
+    Resource(String),
     Order,
 }
 
@@ -52,7 +60,30 @@ pub fn admissible(jobs: &[Job], now_ms: u64, free_ram: u64, lim: Limits) -> Vec<
 }
 
 /// Admitted ids plus, for every waiter that is not admitted, the reason.
+#[cfg(test)]
 pub fn plan(jobs: &[Job], now_ms: u64, free_ram: u64, lim: Limits) -> (Vec<u64>, Vec<(u64, Block)>) {
+    plan_with(jobs, now_ms, free_ram, lim, &BTreeMap::new())
+}
+
+/// Slots of a named resource (a resource that is not configured has 1 slot).
+pub fn capacity(caps: &BTreeMap<String, u32>, name: &str) -> u32 {
+    caps.get(name).copied().unwrap_or(1).max(1)
+}
+
+/// `plan` with named-resource capacities.
+pub fn plan_with(
+    jobs: &[Job],
+    now_ms: u64,
+    free_ram: u64,
+    lim: Limits,
+    caps: &BTreeMap<String, u32>,
+) -> (Vec<u64>, Vec<(u64, Block)>) {
+    let mut held: HashMap<&str, u32> = HashMap::new();
+    for j in jobs.iter().filter(|j| j.running()) {
+        for n in &j.needs {
+            *held.entry(n.as_str()).or_default() += 1;
+        }
+    }
     let mut used = used_points(jobs, lim.budget);
     let mut keys: HashSet<&str> = jobs
         .iter()
@@ -72,6 +103,12 @@ pub fn plan(jobs: &[Job], now_ms: u64, free_ram: u64, lim: Limits) -> (Vec<u64>,
             Some(Block::Points { used, needs: cost })
         } else if w.keys.iter().any(|k| keys.contains(k.as_str())) {
             Some(Block::Key)
+        } else if let Some(n) = w
+            .needs
+            .iter()
+            .find(|n| held.get(n.as_str()).copied().unwrap_or(0) >= capacity(caps, n))
+        {
+            Some(Block::Resource(n.clone()))
         } else if active && w.disk_short {
             Some(Block::Disk)
         } else if active && lim.min_free_bytes > 0 && free_ram < lim.min_free_bytes {
@@ -86,6 +123,9 @@ pub fn plan(jobs: &[Job], now_ms: u64, free_ram: u64, lim: Limits) -> (Vec<u64>,
             None => {
                 used += cost;
                 keys.extend(w.keys.iter().map(String::as_str));
+                for n in &w.needs {
+                    *held.entry(n.as_str()).or_default() += 1;
+                }
                 active = true;
                 admitted.push(w.id);
             }
@@ -130,6 +170,7 @@ mod tests {
             parked_until: None,
             mem_bytes: None,
             disk_short: false,
+            needs: Vec::new(),
         }
     }
     fn keyed(mut j: Job, k: &str) -> Job {
@@ -238,6 +279,36 @@ mod tests {
         b.order = -1;
         let jobs = vec![job(1, 2, true), job(2, 2, false), b];
         assert_eq!(admissible(&jobs, 2_000, 16 * GB, LIM), vec![3]);
+    }
+
+    #[test]
+    fn named_resources_have_slots() {
+        let need = |mut j: Job, n: &str| {
+            j.needs = vec![n.to_string()];
+            j
+        };
+        let mut caps = BTreeMap::new();
+        caps.insert("db".to_string(), 1);
+        caps.insert("gpu".to_string(), 2);
+        // One db slot taken by a running job: the db waiter is blocked, the other passes.
+        let jobs = vec![
+            need(job(1, 1, true), "db"),
+            need(job(2, 1, false), "db"),
+            job(3, 1, false),
+        ];
+        let (adm, blocked) = plan_with(&jobs, 2_000, 16 * GB, LIM, &caps);
+        assert_eq!(adm, vec![3]);
+        assert_eq!(blocked, vec![(2, Block::Resource("db".into()))]);
+        // Two gpu slots: two of three waiters start.
+        let jobs = vec![
+            need(job(1, 1, false), "gpu"),
+            need(job(2, 1, false), "gpu"),
+            need(job(3, 1, false), "gpu"),
+        ];
+        assert_eq!(plan_with(&jobs, 2_000, 16 * GB, LIM, &caps).0, vec![1, 2]);
+        // Unconfigured resources have one slot.
+        let jobs = vec![need(job(1, 1, false), "x"), need(job(2, 1, false), "x")];
+        assert_eq!(plan_with(&jobs, 2_000, 16 * GB, LIM, &caps).0, vec![1]);
     }
 
     #[test]

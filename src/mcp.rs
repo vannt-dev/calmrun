@@ -69,7 +69,9 @@ fn tools() -> Value {
                     "timeout_s": {"type": "number", "exclusiveMinimum": 0, "description": "Stop the command after this many seconds (exit 124)"},
                     "prio": {"type": "string", "enum": ["normal", "high"]},
                     "wait_timeout_s": {"type": "number", "exclusiveMinimum": 0, "description": "Give up waiting after this many seconds; the result carries a ticket that keeps the place in line for 10 minutes"},
-                    "ticket": {"type": "integer", "description": "Ticket from an earlier wait timeout: resume that place in line"}
+                    "ticket": {"type": "integer", "description": "Ticket from an earlier wait timeout: resume that place in line"},
+                    "needs": {"type": "array", "items": {"type": "string"}, "description": "Named resources to hold a slot of, e.g. [\"db\"]"},
+                    "queue": {"type": "string", "description": "A separate queue id instead of the machine-wide one"}
                 },
                 "required": ["command"]
             }
@@ -79,7 +81,7 @@ fn tools() -> Value {
             "title": "Show the calmrun queue",
             "description": "Running and waiting jobs (label, kind, cost, pid, cwd, time), the point budget, \
     free RAM and warnings about jobs that have waited a long time.",
-            "inputSchema": {"type": "object", "properties": {}}
+            "inputSchema": {"type": "object", "properties": {"queue": {"type": "string", "description": "A separate queue id"}}}
         },
         {
             "name": "bump",
@@ -87,7 +89,10 @@ fn tools() -> Value {
             "description": "Move waiting jobs whose label contains the given text to the front of the queue.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"label": {"type": "string", "description": "Part of the label (case-insensitive)"}},
+                "properties": {
+                    "label": {"type": "string", "description": "Part of the label (case-insensitive)"},
+                    "queue": {"type": "string", "description": "A separate queue id"}
+                },
                 "required": ["label"]
             }
         }
@@ -183,6 +188,10 @@ fn run_task(out: &Out, args: &Value, token: Option<Value>, cancel: Arc<AtomicBoo
         }
     }
     let mut ctx = Ctx::load();
+    match queue_arg(args) {
+        Ok(q) => ctx.queue = q,
+        Err(e) => return e,
+    }
     let log = queue::log_dir(&ctx.home).join(format!(
         "{}-{}-{}.log",
         queue::now_ms(),
@@ -213,6 +222,11 @@ fn run_task(out: &Out, args: &Value, token: Option<Value>, cancel: Arc<AtomicBoo
             .map(Duration::from_secs_f64),
         ticket: args.get("ticket").and_then(Value::as_u64),
         env: Vec::new(),
+        needs: args
+            .get("needs")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+            .unwrap_or_default(),
         rerun_hint: Some("call run_task again with the same arguments plus \"ticket\": {ticket}".into()),
     };
     let mut notify = McpNotify {
@@ -262,8 +276,29 @@ fn run_task(out: &Out, args: &Value, token: Option<Value>, cancel: Arc<AtomicBoo
     text_result(text, o.code != 0, Some(structured))
 }
 
-fn queue_status() -> Value {
+/// The optional `queue` argument (a separate queue, like `--id`).
+fn queue_arg(args: &Value) -> Result<Option<String>, Value> {
+    match args
+        .get("queue")
+        .and_then(Value::as_str)
+        .filter(|q| !q.is_empty())
+    {
+        None => Ok(None),
+        Some(q) if queue::valid_queue_id(q) => Ok(Some(q.to_string())),
+        Some(q) => Err(text_result(
+            format!("invalid queue id \"{q}\": use letters, digits, '-', '_' or '.'"),
+            true,
+            None,
+        )),
+    }
+}
+
+fn queue_status(args: &Value) -> Value {
     let mut ctx = Ctx::load();
+    match queue_arg(args) {
+        Ok(q) => ctx.queue = q,
+        Err(e) => return e,
+    }
     match queue::snapshot(&mut ctx) {
         Ok(state) => {
             let v = queue::status_json(&mut ctx, &state);
@@ -286,6 +321,10 @@ fn bump(args: &Value) -> Value {
         return text_result("bump needs a \"label\" string".into(), true, None);
     };
     let mut ctx = Ctx::load();
+    match queue_arg(args) {
+        Ok(q) => ctx.queue = q,
+        Err(e) => return e,
+    }
     match queue::bump(&mut ctx, label) {
         Ok(n) => text_result(
             format!("moved {n} waiting job(s) matching \"{label}\" to the front"),
@@ -379,7 +418,7 @@ pub fn serve() -> i32 {
                             reply(&out, &id, result);
                         }));
                     }
-                    "queue_status" => reply(&out, &id, queue_status()),
+                    "queue_status" => reply(&out, &id, queue_status(&args)),
                     "bump" => reply(&out, &id, bump(&args)),
                     _ => reply_error(&out, &id, -32602, &format!("unknown tool: {name}")),
                 }

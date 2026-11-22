@@ -23,10 +23,22 @@ use std::time::Duration;
 
 fn main() {
     let cli = Cli::parse();
+    if let Some(q) = &cli.id {
+        if !queue::valid_queue_id(q) {
+            eprintln!("calmrun: invalid --id \"{q}\": use letters, digits, '-', '_' or '.'");
+            std::process::exit(2);
+        }
+    }
+    let queue_id = cli.id.clone();
+    let load = move || {
+        let mut c = Ctx::load();
+        c.queue = queue_id.clone();
+        c
+    };
     let code = match cli.sub {
-        Some(Sub::Status { json }) => cmd_status(json),
+        Some(Sub::Status { json }) => cmd_status(load(), json),
         Some(Sub::Stats { days, json }) => cmd_stats(days, json),
-        Some(Sub::Bump { ref label }) => cmd_bump(label),
+        Some(Sub::Bump { ref label }) => cmd_bump(load(), label),
         Some(Sub::Doctor) => cmd_doctor(),
         Some(Sub::Hook {
             target: HookTarget::Claude,
@@ -66,15 +78,14 @@ fn main() {
             let _ = Cli::command().print_help();
             2
         }
-        None => run_queued(cli),
+        None => run_queued(load(), cli),
     };
     std::process::exit(code);
 }
 
-fn run_queued(cli: Cli) -> i32 {
+fn run_queued(mut ctx: Ctx, cli: Cli) -> i32 {
     // Installed before anything runs so an inner (nested) calmrun also forwards signals.
     runner::install_signal_handler();
-    let mut ctx = Ctx::load();
     if let Some(kind) = &cli.kind {
         if !detect::BUILTIN_KINDS.contains(&kind.as_str())
             && kind != "other"
@@ -87,6 +98,7 @@ fn run_queued(cli: Cli) -> i32 {
         rerun_hint: Some(rerun_hint(std::env::args().skip(1).collect())),
         wait_timeout: cli.wait_timeout.filter(|t| *t > 0.0).map(Duration::from_secs_f64),
         ticket: cli.ticket,
+        needs: cli.needs,
         argv: cli.command,
         kind: cli.kind,
         cost: cli.cost,
@@ -169,8 +181,7 @@ fn rerun_hint(args: Vec<String>) -> String {
     out.join(" ")
 }
 
-fn cmd_status(as_json: bool) -> i32 {
-    let mut ctx = Ctx::load();
+fn cmd_status(mut ctx: Ctx, as_json: bool) -> i32 {
     let state = match queue::snapshot(&mut ctx) {
         Ok(s) => s,
         Err(e) => {
@@ -185,6 +196,9 @@ fn cmd_status(as_json: bool) -> i32 {
     }
     let now = now_ms();
     let used = v["used"].as_u64().unwrap_or(0);
+    if let Some(q) = &ctx.queue {
+        println!("queue: {q}");
+    }
     println!(
         "budget: {used} of {} points in use · free RAM {:.1} GB (starts need {:.1} GB)",
         ctx.cfg.budget,
@@ -231,8 +245,7 @@ fn cmd_status(as_json: bool) -> i32 {
     0
 }
 
-fn cmd_bump(needle: &str) -> i32 {
-    let mut ctx = Ctx::load();
+fn cmd_bump(mut ctx: Ctx, needle: &str) -> i32 {
     match queue::bump(&mut ctx, needle) {
         Ok(0) => {
             eprintln!("calmrun: no waiting job matches \"{needle}\"; see `calmrun status`");
@@ -366,7 +379,7 @@ fn cmd_probe(a: &cli::ProbeArgs) -> i32 {
         if let Some(p) = &a.log {
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
                 // One write per line: concurrent appends must not interleave.
-                let _ = f.write_all(format!("{what} {} {}\n", a.id, now_ms()).as_bytes());
+                let _ = f.write_all(format!("{what} {} {}\n", a.name, now_ms()).as_bytes());
             }
         }
     };

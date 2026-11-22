@@ -32,6 +32,8 @@ All notable changes to this project are documented here. The format follows
 - `calmrun setup`: a dry-run-by-default writer for the calmrun block in the global instruction
   files of Claude Code, Codex, Gemini CLI and OpenCode (marker comments, re-runnable,
   `--remove`), plus `--hook` to merge the Claude Code hook into `settings.json` with a backup.
+- Named resources: `--needs db` takes a slot of `db` (`[resources] db = 1`, `CALMRUN_RESOURCES`).
+- Separate queues: `--id QUEUE` for running, `status` and `bump` (GNU sem style).
 - `calmrun mcp`: an MCP server over stdio with `run_task` (same queue as the CLI, captured
   log, last 200 lines, progress notifications, timeout, cancellation), `queue_status` and
   `bump`.

@@ -16,6 +16,9 @@ pub struct Record {
     pub run_ms: u64,
     /// Exit code, or a word such as "interrupted" / "spawn-failed".
     pub status: String,
+    /// The separate queue (`--id`) it ran in, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<String>,
 }
 
 pub fn append(path: &Path, r: &Record) -> std::io::Result<()> {
@@ -158,6 +161,7 @@ mod tests {
                 wait_ms: wait,
                 run_ms: run,
                 status: st.into(),
+                queue: None,
             })
             .unwrap()
         };
