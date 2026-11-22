@@ -28,6 +28,8 @@ impl Env {
         c.env("CALMRUN_HOME", self.home.path())
             .env("CALMRUN_BUDGET", budget.to_string())
             .env("CALMRUN_MIN_FREE_GB", "0")
+            .env("CALMRUN_MIN_FREE_DISK_GB", "0")
+            .env("CALMRUN_CRITICAL_FREE_GB", "0")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         c
@@ -554,4 +556,29 @@ fn separate_queues_do_not_share_points() {
         .status()
         .unwrap();
     assert_eq!(bad.code(), Some(2));
+}
+
+#[cfg(windows)]
+#[test]
+fn relative_cmd_path_runs_from_its_folder() {
+    let env = Env::new();
+    let dir = env.home.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("gradlew.bat"),
+        format!("@\"{EXE}\" __probe --print-args -- %*\r\n"),
+    )
+    .unwrap();
+    let out = env
+        .cmd(2)
+        .current_dir(&dir)
+        .args(["--", "./gradlew", "build"])
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    // The gradle rule adds --max-workers to a direct gradlew call.
+    let got: Vec<String> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(got[0], "build");
+    assert!(got[1].starts_with("--max-workers="), "{got:?}");
 }

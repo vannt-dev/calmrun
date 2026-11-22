@@ -16,6 +16,8 @@ fn calmrun(home: &Path, budget: u32) -> Command {
     c.env("CALMRUN_HOME", home)
         .env("CALMRUN_BUDGET", budget.to_string())
         .env("CALMRUN_MIN_FREE_GB", "0")
+        .env("CALMRUN_MIN_FREE_DISK_GB", "0")
+        .env("CALMRUN_CRITICAL_FREE_GB", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

@@ -366,11 +366,8 @@ fn cmd_probe(a: &cli::ProbeArgs) -> i32 {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            c.process_group(0);
-        }
+        // Same process group as this probe on Unix, like a real build daemon before it
+        // detaches, so the test shows a normal exit leaves the group alone.
         if let Ok(child) = c.spawn() {
             let _ = std::fs::write(pidfile, child.id().to_string());
         }

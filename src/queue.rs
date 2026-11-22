@@ -219,7 +219,14 @@ fn spawn_error(argv: &[String], e: &io::Error) -> (i32, String) {
 fn prepare(req: &Request, cfg: &Config) -> io::Result<std::process::Command> {
     let mut cmd = match (req.shell, req.argv.first()) {
         (true, Some(line)) => runner::shell_command(line),
-        _ => runner::build(&req.argv)?,
+        _ => {
+            let cwd = req
+                .cwd
+                .clone()
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_default();
+            runner::build(&req.argv, &cwd)?
+        }
     };
     if let Some(d) = &req.cwd {
         cmd.current_dir(d);

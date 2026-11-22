@@ -1,6 +1,7 @@
 //! Spawning the command: name resolution, low priority, process tree cleanup, signals.
 
 use std::io;
+use std::path::Path;
 use std::process::{Command, ExitStatus};
 #[cfg(unix)]
 use std::sync::atomic::AtomicI32;
@@ -34,15 +35,16 @@ pub fn install_signal_handler() {
     });
 }
 
-/// Build the command for `argv`. A single string containing whitespace runs through the shell.
-pub fn build(argv: &[String]) -> io::Result<Command> {
+/// Build the command for `argv`, to run in `cwd`. A single string containing whitespace runs
+/// through the shell. A relative program path (`./gradlew`) is resolved against `cwd`.
+pub fn build(argv: &[String], cwd: &Path) -> io::Result<Command> {
     if argv.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "no command given"));
     }
     if crate::detect::is_shell_string(argv) {
         return Ok(shell_command(&argv[0]));
     }
-    platform_build(argv)
+    platform_build(argv, cwd)
 }
 
 #[cfg(unix)]
@@ -53,8 +55,14 @@ pub fn shell_command(line: &str) -> Command {
 }
 
 #[cfg(unix)]
-fn platform_build(argv: &[String]) -> io::Result<Command> {
-    let mut c = Command::new(&argv[0]);
+fn platform_build(argv: &[String], cwd: &Path) -> io::Result<Command> {
+    let p = Path::new(&argv[0]);
+    let program = if p.is_relative() && argv[0].contains('/') {
+        cwd.join(p)
+    } else {
+        p.to_path_buf()
+    };
+    let mut c = Command::new(program);
     c.args(&argv[1..]);
     Ok(c)
 }
@@ -73,9 +81,9 @@ pub fn shell_command(line: &str) -> Command {
 }
 
 #[cfg(windows)]
-fn platform_build(argv: &[String]) -> io::Result<Command> {
+fn platform_build(argv: &[String], cwd: &Path) -> io::Result<Command> {
     use std::os::windows::process::CommandExt;
-    let path = win::resolve(&argv[0])
+    let path = win::resolve(&argv[0], cwd)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("command not found: {}", argv[0])))?;
     let ext = path
         .extension()
@@ -141,14 +149,20 @@ pub mod win {
         None
     }
 
-    /// PATH + PATHEXT lookup, like cmd.exe does (so `npm` finds `npm.cmd`).
-    pub fn resolve(name: &str) -> Option<PathBuf> {
+    /// PATH + PATHEXT lookup, like cmd.exe does (so `npm` finds `npm.cmd`). Relative names are
+    /// looked up in `cwd` (the directory the command will run in), and the result is an
+    /// absolute path with backslashes, which `cmd /c` accepts.
+    pub fn resolve(name: &str, cwd: &Path) -> Option<PathBuf> {
         let exts = pathext();
         let p = Path::new(name);
-        if p.is_absolute() || name.contains('/') || name.contains('\\') {
+        if p.is_absolute() {
             return try_file(p, &exts);
         }
-        if let Some(found) = try_file(&std::env::current_dir().ok()?.join(name), &exts) {
+        if name.contains('/') || name.contains('\\') {
+            let joined = cwd.join(name.replace('/', "\\"));
+            return try_file(&joined, &exts);
+        }
+        if let Some(found) = try_file(&cwd.join(name), &exts) {
             // cmd.exe searches the current directory first; mirror that.
             return Some(found);
         }
@@ -447,10 +461,13 @@ pub fn run(
                 libc::tcsetpgrp(0, libc::getpgrp());
                 libc::signal(libc::SIGTTOU, libc::SIG_DFL);
             }
-            // After Ctrl+C or a stop, leftovers of the command's group go too. After a normal
-            // exit they stay: they are daemons the command meant to leave running.
-            if stopped || INTERRUPTED.load(Ordering::SeqCst) {
+            // After Ctrl+C, leftovers of the command's group get SIGTERM so they can clean up;
+            // after a stop (already past its grace period) they are killed. After a normal exit
+            // they stay: they are daemons the command meant to leave running.
+            if stopped {
                 libc::killpg(pid, libc::SIGKILL);
+            } else if INTERRUPTED.load(Ordering::SeqCst) {
+                libc::killpg(pid, libc::SIGTERM);
             }
         }
         let code = if stopped { 137 } else { code_of(status?) };
@@ -472,6 +489,7 @@ pub fn code_of(status: ExitStatus) -> i32 {
 #[cfg(all(test, windows))]
 mod tests {
     use super::win::*;
+    use std::path::Path;
 
     #[test]
     fn escapes_metacharacters() {
@@ -483,7 +501,7 @@ mod tests {
 
     #[test]
     fn resolves_cmd_from_path() {
-        let found = resolve("cmd").expect("cmd.exe on PATH");
+        let found = resolve("cmd", Path::new(".")).expect("cmd.exe on PATH");
         assert!(found.to_string_lossy().to_ascii_lowercase().ends_with("cmd.exe"));
     }
 }

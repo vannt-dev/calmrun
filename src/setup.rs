@@ -237,6 +237,14 @@ pub fn run(opts: &Options, env: &dyn Fn(&str) -> Option<String>) -> (String, i32
             format!("{verb}create the file with the calmrun block")
         };
         out += &format!("{:<9} {}: {action}\n", a.name, a.file.display());
+        // Codex reads AGENTS.override.md instead of AGENTS.md when it exists.
+        let override_md = a.dir.join("AGENTS.override.md");
+        if a.name == "codex" && override_md.is_file() && !opts.remove {
+            out += &format!(
+                "          note: {} exists and Codex reads it instead; copy the block there too\n",
+                override_md.display()
+            );
+        }
         if opts.write && new != old {
             let res = a
                 .file

@@ -359,7 +359,9 @@ pub fn serve() -> i32 {
             // A notification (or a response to us). Only cancellation matters.
             if method == "notifications/cancelled" {
                 if let Some(rid) = params.get("requestId") {
-                    if let Some(flag) = running.lock().ok().and_then(|m| m.get(&rid.to_string()).cloned()) {
+                    // Taking the entry out also tells the task thread not to reply: per the MCP
+                    // spec a cancelled request gets no response.
+                    if let Some(flag) = running.lock().ok().and_then(|mut m| m.remove(&rid.to_string())) {
                         flag.store(true, Ordering::SeqCst);
                     }
                 }
@@ -412,10 +414,13 @@ pub fn serve() -> i32 {
                         let running = running.clone();
                         threads.push(std::thread::spawn(move || {
                             let result = run_task(&out, &args, token, cancel);
-                            if let Ok(mut m) = running.lock() {
-                                m.remove(&key);
+                            let still_wanted = running
+                                .lock()
+                                .map(|mut m| m.remove(&key).is_some())
+                                .unwrap_or(true);
+                            if still_wanted {
+                                reply(&out, &id, result);
                             }
-                            reply(&out, &id, result);
                         }));
                     }
                     "queue_status" => reply(&out, &id, queue_status(&args)),

@@ -16,6 +16,7 @@ fn calmrun(home: &Path) -> Command {
     c.env("CALMRUN_HOME", home)
         .env("CALMRUN_BUDGET", "2")
         .env("CALMRUN_MIN_FREE_GB", "0")
+        .env("CALMRUN_MIN_FREE_DISK_GB", "0")
         // The critical-free-RAM guard depends on the machine; keep it out of these tests.
         .env("CALMRUN_CRITICAL_FREE_GB", "0")
         .stdin(Stdio::null());

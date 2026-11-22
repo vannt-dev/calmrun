@@ -343,16 +343,26 @@ tool_timeout_sec = 3600   # tasks may wait in the queue and run for a while
 ```
 
 ```json
-// Cursor: ~/.cursor/mcp.json   ·   Gemini CLI: ~/.gemini/settings.json
+// Cursor: ~/.cursor/mcp.json
 {
   "mcpServers": {
-    "calmrun": { "command": "calmrun", "args": ["mcp"] }
+    "calmrun": { "type": "stdio", "command": "calmrun", "args": ["mcp"] }
   }
 }
 ```
 
-Long test runs can outlast a client's default tool timeout; raise it where the client allows
-(Gemini CLI: a `timeout` in milliseconds on the server entry).
+```json
+// Gemini CLI: ~/.gemini/settings.json (timeout in ms; the default is 10 minutes)
+{
+  "mcpServers": {
+    "calmrun": { "command": "calmrun", "args": ["mcp"], "timeout": 3600000 }
+  }
+}
+```
+
+Long test runs can outlast a client's default tool timeout; raise it where the client allows.
+Cancelling a `run_task` request (`notifications/cancelled`) stops the command or leaves the
+queue, and, as the MCP spec asks, the cancelled request gets no response.
 
 ### `calmrun setup`
 
@@ -409,6 +419,12 @@ Use `calmrun status` to see what is running or waiting. Do not wrap light comman
   foreground of a terminal, that group becomes the terminal's foreground group (so the command
   can read input and gets Ctrl+C directly) and the terminal is handed back afterwards; SIGINT,
   SIGTERM and SIGHUP that calmrun receives are forwarded to the group as SIGINT.
+- **When calmrun itself is killed hard.** On Windows the Job Object ends the command's tree
+  even after `taskkill /F`. On macOS and Linux a `kill -9` of calmrun (or of `calmrun mcp`)
+  cannot be caught: the command keeps running, and its queue points are freed as soon as
+  another calmrun notices the dead pid. The same holds for any signal to `calmrun mcp`. Stop
+  calmrun with Ctrl+C or SIGTERM instead; an MCP server stops its tasks when its client
+  closes stdin.
 - **Memory figures.** calmrun counts resident memory: the working set on Windows and the
   resident set size (RSS) on macOS and Linux. Shared pages count once per process, so the
   tree total can be higher than what the OS reports as used; the default ceiling leaves room.

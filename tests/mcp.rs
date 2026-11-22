@@ -18,7 +18,9 @@ fn calmrun(home: &Path) -> Command {
     }
     c.env("CALMRUN_HOME", home)
         .env("CALMRUN_BUDGET", "2")
-        .env("CALMRUN_MIN_FREE_GB", "0");
+        .env("CALMRUN_MIN_FREE_GB", "0")
+        .env("CALMRUN_MIN_FREE_DISK_GB", "0")
+        .env("CALMRUN_CRITICAL_FREE_GB", "0");
     c
 }
 
@@ -212,4 +214,78 @@ fn timeout_stops_the_task() {
     assert_eq!(s["exit_code"], 124, "{s}");
     assert_eq!(s["status"], "timeout");
     assert!(s["run_ms"].as_u64().unwrap() < 15_000);
+}
+
+#[test]
+fn cancellation_stops_the_task_without_a_reply() {
+    let home = tempfile::tempdir().unwrap();
+    let mut c = Client::start(home.path());
+    init(&mut c);
+    c.send(json!({
+        "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+        "params": {"name": "run_task", "arguments": {"command": probe_cmd("--sleep-ms 30000"), "label": "long"}}
+    }));
+    // Wait until it runs, then cancel it.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let out = calmrun(home.path()).args(["status", "--json"]).output().unwrap();
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        if v["running"].as_array().is_some_and(|r| r.len() == 1) {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    c.send(json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 7}}));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let out = calmrun(home.path()).args(["status", "--json"]).output().unwrap();
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        if v["running"].as_array().is_some_and(|r| r.is_empty()) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "task kept running after cancel");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The server still answers, and never answered the cancelled request.
+    c.send(json!({"jsonrpc": "2.0", "id": 8, "method": "ping"}));
+    c.response(8, Duration::from_secs(10));
+    std::thread::sleep(Duration::from_millis(300));
+    while let Ok(v) = c.rx.try_recv() {
+        c.seen.push(v);
+    }
+    assert!(
+        c.seen.iter().all(|m| m.get("id") != Some(&json!(7))),
+        "{:?}",
+        c.seen
+    );
+    let hist = std::fs::read_to_string(home.path().join("history.jsonl")).unwrap();
+    assert!(hist.contains("\"status\":\"cancelled\""), "{hist}");
+}
+
+#[cfg(windows)]
+#[test]
+fn relative_program_resolves_in_the_task_cwd() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("tool.cmd"),
+        format!("@\"{EXE}\" __probe --print-args -- %*\r\n"),
+    )
+    .unwrap();
+    let mut c = Client::start(home.path());
+    init(&mut c);
+    for (i, cmd) in ["./tool x", "tool x", ".\\tool x"].iter().enumerate() {
+        let r = c.call(
+            10 + i as i64,
+            "run_task",
+            json!({"command": cmd, "cwd": dir.to_string_lossy()}),
+            None,
+        );
+        let s = &r["result"]["structuredContent"];
+        assert_eq!(s["exit_code"], 0, "{cmd}: {r}");
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("[\"x\"]"), "{cmd}: {text}");
+    }
 }
