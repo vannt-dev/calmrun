@@ -110,7 +110,13 @@ pub fn handle(
     }
     let tool_input = v.get("tool_input")?.as_object()?;
     let cmd = tool_input.get("command")?.as_str()?;
-    let (wrapped, found) = wrap_with(cmd, kinds, program)?;
+    // Bash (Git Bash on Windows) eats backslashes in an unquoted path; C:/x/calmrun.exe works.
+    let program = if tool == "Bash" {
+        program.replace('\\', "/")
+    } else {
+        program.to_string()
+    };
+    let (wrapped, found) = wrap_with(cmd, kinds, &program)?;
     let out = match mode {
         Mode::Deny => json!({
             "hookSpecificOutput": {
@@ -255,5 +261,19 @@ mod tests {
         assert_eq!(out["updatedInput"]["command"], "calmrun -- cargo test");
         assert_eq!(out["updatedInput"]["description"], "d");
         assert_eq!(out["updatedInput"]["timeout"], 120000);
+    }
+
+    #[test]
+    fn bash_gets_forward_slashes_in_an_absolute_path() {
+        let kinds = BTreeMap::new();
+        let exe = r"C:\tools\calmrun.exe";
+        let bash = handle(&input("Bash", "npx vitest run"), Mode::Rewrite, &kinds, exe).unwrap();
+        assert!(bash.contains("C:/tools/calmrun.exe -- npx vitest run"), "{bash}");
+        let ps = handle(&input("PowerShell", "npx vitest run"), Mode::Rewrite, &kinds, exe).unwrap();
+        let v: Value = serde_json::from_str(&ps).unwrap();
+        let cmd = v["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap();
+        assert!(cmd.starts_with(r"C:\tools\calmrun.exe"), "{cmd}");
     }
 }
