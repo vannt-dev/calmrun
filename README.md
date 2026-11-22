@@ -82,6 +82,7 @@ calmrun doctor
 calmrun hook claude
 calmrun mcp
 calmrun guide
+calmrun setup [--write] [--remove] [--hook] [--agents claude,codex,gemini,opencode]
 calmrun init [--force]
 ```
 
@@ -336,9 +337,37 @@ tool_timeout_sec = 3600   # tasks may wait in the queue and run for a while
 Long test runs can outlast a client's default tool timeout; raise it where the client allows
 (Gemini CLI: a `timeout` in milliseconds on the server entry).
 
+### `calmrun setup`
+
+`calmrun setup` adds a short calmrun section to each coding agent's **global** instruction
+file. It is a dry run by default: it prints what it would change and the exact block. Add
+`--write` to apply.
+
+| Agent | File |
+| --- | --- |
+| `claude` | `~/.claude/CLAUDE.md` (or `$CLAUDE_CONFIG_DIR/CLAUDE.md`) |
+| `codex` | `~/.codex/AGENTS.md` (or `$CODEX_HOME/AGENTS.md`) |
+| `gemini` | `~/.gemini/GEMINI.md` |
+| `opencode` | `~/.config/opencode/AGENTS.md` |
+
+```sh
+calmrun setup                         # show what would change (agents whose folder exists)
+calmrun setup --write                 # apply
+calmrun setup --write --agents codex  # only some agents
+calmrun setup --write --hook          # also add the Claude Code hook to ~/.claude/settings.json
+calmrun setup --write --remove --hook # take both out again
+```
+
+The block sits between `<!-- calmrun:start … -->` and `<!-- calmrun:end -->`. Running setup
+again replaces the block in place instead of adding a second one, and `--remove` deletes it
+and leaves the rest of the file as it was. `--hook` merges the PreToolUse entry into
+`settings.json`, keeps every other setting, writes a backup to `settings.json.calmrun.bak`
+first, and leaves a file it cannot parse untouched.
+
 ### Instructions for agents
 
-Add this to `CLAUDE.md`, `AGENTS.md` or your agent's instruction file:
+To write the instructions by hand instead, add this to `CLAUDE.md`, `AGENTS.md` or your
+agent's instruction file:
 
 ```markdown
 ## Heavy commands

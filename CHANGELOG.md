@@ -29,6 +29,9 @@ All notable changes to this project are documented here. The format follows
 - `CARGO_BUILD_JOBS` for cargo and `--max-workers` for gradle invoked directly, sized to the
   job's share of the cores.
 - The waiting line names what is running: `running: npx vitest in web (3m10s), …`.
+- `calmrun setup`: a dry-run-by-default writer for the calmrun block in the global instruction
+  files of Claude Code, Codex, Gemini CLI and OpenCode (marker comments, re-runnable,
+  `--remove`), plus `--hook` to merge the Claude Code hook into `settings.json` with a backup.
 - `calmrun mcp`: an MCP server over stdio with `run_task` (same queue as the CLI, captured
   log, last 200 lines, progress notifications, timeout, cancellation), `queue_status` and
   `bump`.

@@ -9,6 +9,7 @@ mod memwatch;
 mod queue;
 mod runner;
 mod scheduler;
+mod setup;
 mod state;
 mod sys;
 
@@ -32,6 +33,28 @@ fn main() {
         }) => cmd_hook(),
         Some(Sub::Init { force }) => cmd_init(force),
         Some(Sub::Mcp) => mcp::serve(),
+        Some(Sub::Setup {
+            write,
+            remove,
+            hook,
+            ref agents,
+            ref home,
+        }) => {
+            let Some(home) = home.clone().or_else(dirs::home_dir) else {
+                eprintln!("calmrun: cannot find your home directory; pass --home");
+                std::process::exit(1);
+            };
+            let opts = setup::Options {
+                write,
+                remove,
+                hook,
+                agents: agents.clone(),
+                home,
+            };
+            let (text, code) = setup::run(&opts, &|k| std::env::var(k).ok());
+            print!("{text}");
+            code
+        }
         Some(Sub::Guide) => {
             print!("{}", GUIDE);
             0

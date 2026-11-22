@@ -81,6 +81,25 @@ pub enum Sub {
         #[command(subcommand)]
         target: HookTarget,
     },
+    /// Add calmrun instructions to coding agents' global instruction files (dry run unless
+    /// --write).
+    Setup {
+        /// Apply the changes (default: only show them).
+        #[arg(long)]
+        write: bool,
+        /// Take the calmrun block (and with --hook, the hook) out again.
+        #[arg(long)]
+        remove: bool,
+        /// Also add the Claude Code PreToolUse hook to its settings.json (a backup is kept).
+        #[arg(long)]
+        hook: bool,
+        /// Which agents (claude, codex, gemini, opencode). Default: those whose folder exists.
+        #[arg(long, value_delimiter = ',')]
+        agents: Option<Vec<String>>,
+        /// Home directory to use instead of yours (for tests and other users' profiles).
+        #[arg(long, value_name = "DIR")]
+        home: Option<std::path::PathBuf>,
+    },
     /// Print short instructions for coding agents.
     Guide,
     /// Serve the queue to coding agents over MCP (JSON-RPC on stdin/stdout).
