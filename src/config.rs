@@ -33,6 +33,7 @@ pub struct FileConfig {
     pub pass_limit_min: Option<f64>,
     pub vitest_workers: Option<u32>,
     pub ceiling_gb: Option<f64>,
+    pub min_free_disk_gb: Option<f64>,
     pub critical_free_gb: Option<f64>,
     #[serde(default)]
     pub kinds: BTreeMap<String, KindConfig>,
@@ -50,6 +51,8 @@ pub struct Config {
     pub ceiling_bytes: u64,
     /// Stop the biggest job when free RAM stays below this for a few seconds (0 = off).
     pub critical_free_bytes: u64,
+    /// A job waits while its cwd's drive has less free space than this (0 = off).
+    pub min_free_disk_bytes: u64,
     pub kinds: BTreeMap<String, KindConfig>,
 }
 
@@ -142,6 +145,10 @@ pub fn resolve(m: Machine, file: FileConfig, env: &dyn Fn(&str) -> Option<String
         .or(file.critical_free_gb)
         .unwrap_or_else(|| default_critical_free_gb(m))
         .max(0.0);
+    let disk_gb = num("CALMRUN_MIN_FREE_DISK_GB")
+        .or(file.min_free_disk_gb)
+        .unwrap_or(5.0)
+        .max(0.0);
     let low_cpu = !matches!(
         env("CALMRUN_LOW_CPU").as_deref().map(str::trim),
         Some("0" | "false" | "no" | "off")
@@ -154,6 +161,7 @@ pub fn resolve(m: Machine, file: FileConfig, env: &dyn Fn(&str) -> Option<String
         low_cpu,
         ceiling_bytes: (ceiling_gb * GB) as u64,
         critical_free_bytes: (critical_gb * GB) as u64,
+        min_free_disk_bytes: (disk_gb * GB) as u64,
         kinds: file.kinds,
     }
 }
@@ -187,6 +195,10 @@ pub fn default_config_text(m: Machine) -> String {
 # When free RAM stays below this for a few seconds, stop the running job that uses the most
 # memory (env CALMRUN_CRITICAL_FREE_GB). 0 turns it off. Default: 5% of RAM, at most 1 GB.
 # critical_free_gb = {critical:.2}
+
+# A job waits while the drive of its working directory has less free space than this
+# (env CALMRUN_MIN_FREE_DISK_GB). 0 turns it off. If nothing else runs it starts anyway.
+# min_free_disk_gb = 5
 
 # --maxWorkers value appended to direct vitest calls (env CALMRUN_VITEST_WORKERS).
 # vitest_workers = {workers}

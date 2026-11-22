@@ -724,6 +724,26 @@ pub fn refuse_reason(argv: &[String]) -> Option<String> {
     })
 }
 
+/// `--max-workers=N` for gradle invoked directly as words, unless it already sets workers.
+pub fn gradle_args(argv: &[String], workers: u32) -> Option<Vec<String>> {
+    if is_shell_string(argv) || argv.is_empty() {
+        return None;
+    }
+    if !matches!(tool_name(&argv[0]).as_str(), "gradle" | "gradlew") {
+        return None;
+    }
+    let rest = &argv[1..];
+    let set = rest
+        .iter()
+        .any(|w| w.starts_with("--max-workers") || w.starts_with("-Dorg.gradle.workers.max"));
+    if set || rest.is_empty() || only_info_flags(rest) {
+        return None;
+    }
+    let mut out = argv.to_vec();
+    out.push(format!("--max-workers={workers}"));
+    Some(out)
+}
+
 /// The same compose command with `-d` added after `up` (argv words only).
 pub fn detached_compose(argv: &[String]) -> Option<Vec<String>> {
     if is_shell_string(argv) || !compose_up_attached(argv) {
@@ -1001,6 +1021,22 @@ mod tests {
             Some(argv("docker compose -f a.yml up -d --build"))
         );
         assert_eq!(detached_compose(&argv("docker compose up -d")), None);
+    }
+
+    #[test]
+    fn gradle_workers_rule() {
+        assert_eq!(
+            gradle_args(&argv("./gradlew build"), 4),
+            Some(argv("./gradlew build --max-workers=4"))
+        );
+        assert_eq!(gradle_args(&argv("gradle test --max-workers=2"), 4), None);
+        assert_eq!(
+            gradle_args(&argv("gradlew build -Dorg.gradle.workers.max=2"), 4),
+            None
+        );
+        assert_eq!(gradle_args(&argv("gradlew --version"), 4), None);
+        assert_eq!(gradle_args(&["./gradlew build".to_string()], 4), None);
+        assert_eq!(gradle_args(&argv("mvn package"), 4), None);
     }
 
     #[test]

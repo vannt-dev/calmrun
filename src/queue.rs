@@ -115,6 +115,8 @@ pub struct Request {
     pub ticket: Option<u64>,
     /// How to show the re-run command; `{ticket}` is replaced by the ticket id.
     pub rerun_hint: Option<String>,
+    /// Extra environment for the command.
+    pub env: Vec<(String, String)>,
 }
 
 /// How long a ticket keeps its place without a re-run.
@@ -203,6 +205,9 @@ fn prepare(req: &Request, cfg: &Config) -> io::Result<std::process::Command> {
     };
     if let Some(d) = &req.cwd {
         cmd.current_dir(d);
+    }
+    for (k, v) in &req.env {
+        cmd.env(k, v);
     }
     if let Some(log) = &req.log {
         if let Some(parent) = log.parent() {
@@ -296,6 +301,14 @@ pub fn run(ctx: &mut Ctx, mut req: Request, notify: &mut dyn Notify) -> Outcome 
     out.label = label.clone();
     out.kind = kind.clone();
     out.cost = cost;
+    // Share of the machine's cores this job's points stand for.
+    let workers = tool_workers(ctx.machine.logical_cores, cost, cfg.budget);
+    if let Some(a) = detect::gradle_args(&req.argv, workers) {
+        req.argv = a;
+    }
+    if det.tool == "cargo" && std::env::var_os("CARGO_BUILD_JOBS").is_none() {
+        req.env.push(("CARGO_BUILD_JOBS".into(), workers.to_string()));
+    }
     let cwd = req
         .cwd
         .clone()
@@ -340,6 +353,7 @@ pub fn run(ctx: &mut Ctx, mut req: Request, notify: &mut dyn Notify) -> Outcome 
         child_pid: None,
         parked_until: None,
         mem_bytes: None,
+        disk_short: false,
     };
     let sys = &mut ctx.sys;
     let ticket = req.ticket;
@@ -385,6 +399,7 @@ pub fn run(ctx: &mut Ctx, mut req: Request, notify: &mut dyn Notify) -> Outcome 
 
     // Wait for our turn.
     let mut last_line = String::from("waiting");
+    let mut disk = DiskCheck::new(&cwd, cfg.min_free_disk_bytes);
     let started_ms = loop {
         if cancelled(&req) {
             let _ = store.with_lock(|s| s.jobs.retain(|j| j.id != id));
@@ -421,6 +436,7 @@ pub fn run(ctx: &mut Ctx, mut req: Request, notify: &mut dyn Notify) -> Outcome 
         }
         let free = ctx.sys.free_ram();
         let now = now_ms();
+        let short = disk.short();
         let sys = &mut ctx.sys;
         let step = store.with_lock(|s| {
             prune_dead(s, sys);
@@ -428,14 +444,18 @@ pub fn run(ctx: &mut Ctx, mut req: Request, notify: &mut dyn Notify) -> Outcome 
                 // Our entry vanished (state file removed by hand); put it back.
                 s.jobs.push(entry.clone());
             }
+            if let Some(j) = s.jobs.iter_mut().find(|j| j.id == id) {
+                j.disk_short = short;
+            }
             let (admitted, blocked) = scheduler::plan(&s.jobs, now, free, lim);
             if admitted.contains(&id) {
                 if let Some(j) = s.jobs.iter_mut().find(|j| j.id == id) {
                     j.started_ms = Some(now);
+                    j.disk_short = false;
                 }
                 return Ok(now);
             }
-            Err(waiting_line(s, id, &entry, &blocked, lim, cost))
+            Err(waiting_line(s, id, &entry, &blocked, lim, cost, &disk, now))
         });
         match step {
             Ok(Ok(t)) => break t,
@@ -454,6 +474,15 @@ pub fn run(ctx: &mut Ctx, mut req: Request, notify: &mut dyn Notify) -> Outcome 
     };
 
     out.wait_ms = started_ms.saturating_sub(queued_ms);
+    if disk.short() {
+        notify.note(&format!(
+            "calmrun: warning: only {:.1} GB free on {} (wanted {:.1} GB); starting anyway \
+             because nothing else is running",
+            bytes_to_gb(disk.free),
+            disk.mount,
+            bytes_to_gb(cfg.min_free_disk_bytes)
+        ));
+    }
     notify.started(out.wait_ms);
     started_at.set(Some(Instant::now()));
     let mut mem = memwatch::MemWatch::new(cfg.ceiling_bytes, cfg.critical_free_bytes);
@@ -563,7 +592,120 @@ pub fn run(ctx: &mut Ctx, mut req: Request, notify: &mut dyn Notify) -> Outcome 
     out
 }
 
-fn waiting_line(s: &State, id: u64, entry: &Job, blocked: &[(u64, Block)], lim: Limits, cost: u32) -> String {
+/// Free space on the drive of a directory, refreshed every few seconds.
+pub struct DiskCheck {
+    disks: Option<sysinfo::Disks>,
+    target: String,
+    need: u64,
+    pub free: u64,
+    pub mount: String,
+    last: Option<Instant>,
+}
+
+impl DiskCheck {
+    pub fn new(dir: &Path, need: u64) -> DiskCheck {
+        let real = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let mut target = real.to_string_lossy().replace("\\\\?\\", "");
+        if cfg!(windows) {
+            target = target.to_lowercase();
+        }
+        DiskCheck {
+            disks: None,
+            target,
+            need,
+            free: u64::MAX,
+            mount: String::new(),
+            last: None,
+        }
+    }
+
+    /// True while the drive has less than the required free space.
+    pub fn short(&mut self) -> bool {
+        if self.need == 0 {
+            return false;
+        }
+        if self.last.is_none_or(|t| t.elapsed() >= Duration::from_secs(3)) {
+            self.last = Some(Instant::now());
+            let disks = self.disks.get_or_insert_with(|| {
+                sysinfo::Disks::new_with_refreshed_list()
+                    .unwrap_or_else(|_| sysinfo::Disks::new().expect("disk info unavailable"))
+            });
+            disks.refresh(true);
+            let best = disks
+                .iter()
+                .filter(|d| {
+                    let mut m = d.mount_point().to_string_lossy().to_string();
+                    if cfg!(windows) {
+                        m = m.to_lowercase();
+                    }
+                    self.target.starts_with(&m)
+                })
+                .max_by_key(|d| d.mount_point().as_os_str().len());
+            if let Some(d) = best {
+                self.free = d.available_space();
+                self.mount = d.mount_point().to_string_lossy().to_string();
+            }
+        }
+        self.free < self.need
+    }
+}
+
+fn running_summary(s: &State, now: u64) -> String {
+    let mut running: Vec<&Job> = s.jobs.iter().filter(|j| j.running()).collect();
+    running.sort_by_key(|j| j.started_ms);
+    let parts: Vec<String> = running
+        .iter()
+        .take(3)
+        .map(|j| {
+            let dir = Path::new(&j.cwd)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| j.cwd.clone());
+            let since = now.saturating_sub(j.started_ms.unwrap_or(now));
+            format!("{} in {dir} ({})", j.label, history::human_ms(since))
+        })
+        .collect();
+    let mut out = parts.join(", ");
+    if running.len() > 3 {
+        out.push_str(&format!(", +{} more", running.len() - 3));
+    }
+    out
+}
+
+/// Worker count for a tool: the job's share of the logical cores.
+pub fn tool_workers(cores: usize, cost: u32, budget: u32) -> u32 {
+    ((cores as u64 * cost as u64) / budget.max(1) as u64).max(1) as u32
+}
+
+#[allow(clippy::too_many_arguments)]
+fn waiting_line(
+    s: &State,
+    id: u64,
+    entry: &Job,
+    blocked: &[(u64, Block)],
+    lim: Limits,
+    cost: u32,
+    disk: &DiskCheck,
+    now: u64,
+) -> String {
+    let line = waiting_reason(s, id, entry, blocked, lim, cost, disk);
+    let running = running_summary(s, now);
+    if running.is_empty() {
+        line
+    } else {
+        format!("{line}; running: {running}")
+    }
+}
+
+fn waiting_reason(
+    s: &State,
+    id: u64,
+    entry: &Job,
+    blocked: &[(u64, Block)],
+    lim: Limits,
+    cost: u32,
+    disk: &DiskCheck,
+) -> String {
     let used = scheduler::used_points(&s.jobs, lim.budget);
     let place = scheduler::waiting_in_order(&s.jobs)
         .iter()
@@ -580,6 +722,12 @@ fn waiting_line(s: &State, id: u64, entry: &Job, blocked: &[(u64, Block)], lim: 
             "calmrun: waiting for RAM: {:.1} GB free, needs {:.1} GB",
             bytes_to_gb(free),
             bytes_to_gb(needs)
+        ),
+        Block::Disk => format!(
+            "calmrun: waiting for disk space: {:.1} GB free on {}, needs {:.1} GB",
+            bytes_to_gb(disk.free),
+            disk.mount,
+            bytes_to_gb(disk.need)
         ),
         Block::Key => {
             let holder = s
@@ -724,4 +872,46 @@ pub fn tail_lines(path: &Path, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(n);
     lines[start..].join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_workers_share_cores() {
+        assert_eq!(tool_workers(20, 2, 3), 13);
+        assert_eq!(tool_workers(8, 1, 6), 1);
+        assert_eq!(tool_workers(2, 1, 4), 1);
+    }
+
+    fn job(id: u64, label: &str, cwd: &str, started: u64) -> Job {
+        Job {
+            id,
+            label: label.into(),
+            cwd: cwd.into(),
+            started_ms: Some(started),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn running_summary_names_jobs_and_folders() {
+        let s = State {
+            next_id: 9,
+            jobs: vec![
+                job(1, "npx vitest", "/src/web", 10_000),
+                job(2, "cargo build", "/src/api", 60_000),
+                Job {
+                    id: 3,
+                    label: "waiting".into(),
+                    ..Default::default()
+                },
+            ],
+        };
+        assert_eq!(
+            running_summary(&s, 200_000),
+            "npx vitest in web (3m10s), cargo build in api (2m20s)"
+        );
+    }
 }

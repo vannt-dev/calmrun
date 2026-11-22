@@ -40,6 +40,7 @@ pub fn used_points(jobs: &[Job], budget: u32) -> u32 {
 pub enum Block {
     Points { used: u32, needs: u32 },
     Ram { free: u64, needs: u64 },
+    Disk,
     Key,
     Order,
 }
@@ -71,6 +72,8 @@ pub fn plan(jobs: &[Job], now_ms: u64, free_ram: u64, lim: Limits) -> (Vec<u64>,
             Some(Block::Points { used, needs: cost })
         } else if w.keys.iter().any(|k| keys.contains(k.as_str())) {
             Some(Block::Key)
+        } else if active && w.disk_short {
+            Some(Block::Disk)
         } else if active && lim.min_free_bytes > 0 && free_ram < lim.min_free_bytes {
             Some(Block::Ram {
                 free: free_ram,
@@ -126,6 +129,7 @@ mod tests {
             child_pid: None,
             parked_until: None,
             mem_bytes: None,
+            disk_short: false,
         }
     }
     fn keyed(mut j: Job, k: &str) -> Job {
@@ -234,6 +238,18 @@ mod tests {
         b.order = -1;
         let jobs = vec![job(1, 2, true), job(2, 2, false), b];
         assert_eq!(admissible(&jobs, 2_000, 16 * GB, LIM), vec![3]);
+    }
+
+    #[test]
+    fn short_disk_waits_only_while_busy() {
+        let mut short = job(2, 1, false);
+        short.disk_short = true;
+        let jobs = vec![job(1, 1, true), short.clone(), job(3, 1, false)];
+        assert_eq!(admissible(&jobs, 2_000, 16 * GB, LIM), vec![3]);
+        let (_, blocked) = plan(&jobs, 2_000, 16 * GB, LIM);
+        assert_eq!(blocked, vec![(2, Block::Disk)]);
+        // Nothing running: it starts (the owner warns).
+        assert_eq!(admissible(&[short], 2_000, 16 * GB, LIM), vec![2]);
     }
 
     #[test]

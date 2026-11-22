@@ -118,6 +118,9 @@ pub struct ProbeArgs {
     /// Print the received arguments as JSON.
     #[arg(long)]
     pub print_args: bool,
+    /// Print the value of this environment variable (empty if unset).
+    #[arg(long)]
+    pub print_env: Option<String>,
     /// Allocate and touch this many MB before sleeping.
     #[arg(long, default_value_t = 0)]
     pub alloc_mb: usize,

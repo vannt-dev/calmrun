@@ -431,3 +431,73 @@ fn guide_prints_instructions() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("calmrun -- npx vitest run") && text.contains("--wait-timeout"));
 }
+
+#[test]
+fn short_disk_waits_and_says_why() {
+    let env = Env::new();
+    // Ask for far more free disk than any machine has.
+    let mut holder_cmd = env.cmd(2);
+    holder_cmd
+        .env("CALMRUN_MIN_FREE_DISK_GB", "999999")
+        .args([
+            "--cost",
+            "1",
+            "--label",
+            "holder",
+            "--",
+            EXE,
+            "__probe",
+            "--sleep-ms",
+            "5000",
+        ])
+        .stderr(Stdio::piped());
+    let holder = holder_cmd.spawn().unwrap();
+    env.wait_queue(1, 0);
+    let out = env
+        .cmd(2)
+        .env("CALMRUN_MIN_FREE_DISK_GB", "999999")
+        .args(["--cost", "1", "--wait-timeout", "2", "--", EXE, "__probe"])
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(75));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("waiting for disk space"), "{err}");
+    assert!(err.contains("; running: holder in "), "{err}");
+    let h = holder.wait_with_output().unwrap();
+    assert!(h.status.success());
+    let herr = String::from_utf8_lossy(&h.stderr);
+    assert!(herr.contains("starting anyway"), "{herr}");
+}
+
+#[test]
+fn cargo_gets_a_job_count() {
+    let env = Env::new();
+    let dir = env.home.path().join("bin");
+    std::fs::create_dir_all(&dir).unwrap();
+    let fake = dir.join(if cfg!(windows) { "cargo.exe" } else { "cargo" });
+    std::fs::copy(EXE, &fake).unwrap();
+    let out = env
+        .cmd(4)
+        .env_remove("CARGO_BUILD_JOBS")
+        .arg("--")
+        .arg(&fake)
+        .args(["__probe", "--print-env", "CARGO_BUILD_JOBS"])
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let n: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+    assert!(n >= 1);
+    // An explicit setting wins.
+    let out = env
+        .cmd(4)
+        .env("CARGO_BUILD_JOBS", "7")
+        .arg("--")
+        .arg(&fake)
+        .args(["__probe", "--print-env", "CARGO_BUILD_JOBS"])
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "7");
+}

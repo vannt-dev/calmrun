@@ -37,6 +37,9 @@ pub struct Job {
     /// Memory of the running command's whole process tree, sampled every few seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mem_bytes: Option<u64>,
+    /// Set by a waiting owner while the drive of its cwd has less free space than required.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disk_short: bool,
 }
 
 impl Job {
@@ -172,6 +175,7 @@ mod tests {
             child_pid: None,
             parked_until: None,
             mem_bytes: None,
+            disk_short: false,
         }
     }
 

@@ -318,6 +318,9 @@ fn cmd_init(force: bool) -> i32 {
 
 fn cmd_probe(a: &cli::ProbeArgs) -> i32 {
     use std::io::Write;
+    if let Some(var) = &a.print_env {
+        println!("{}", std::env::var(var).unwrap_or_default());
+    }
     if a.print_args {
         println!("{}", serde_json::to_string(&a.rest).unwrap_or_default());
     }

@@ -67,8 +67,8 @@ calmrun init                     # write a commented config file
 While waiting, calmrun prints one line to stderr, then one every 30 seconds:
 
 ```
-calmrun: waiting — 4 of 6 points in use, 2nd in line (needs 2)
-calmrun: waiting for RAM: 2.1 GB free, needs 3.0 GB
+calmrun: waiting — 4 of 6 points in use, 2nd in line (needs 2); running: npx vitest in web (3m10s), cargo build in api (1m02s)
+calmrun: waiting for RAM: 2.1 GB free, needs 3.0 GB; running: npx playwright in e2e (4m55s)
 ```
 
 ## CLI
@@ -146,6 +146,11 @@ Detection looks at the command position only: the program name (basename, withou
 `min_free_gb` (default max(3, RAM / 8) GB; 0 disables). The RAM check is skipped when nothing
 is running, so a job never waits forever on an idle machine.
 
+**Disk.** A job also waits while the drive of its working directory has less than
+`min_free_disk_gb` free (default 5; `0` turns it off), and says so:
+`calmrun: waiting for disk space: 3.2 GB free on C:\, needs 5.0 GB`. When nothing else is
+running it starts anyway, with a warning, so it never waits for a drive it cannot clean up.
+
 **Order.** `--prio high` first, then first come. A later job may pass earlier ones only if it
 fits right now and no job ahead of it has waited longer than `pass_limit_min` (default 10;
 0 = strict order). Running jobs are never stopped.
@@ -163,6 +168,10 @@ all-or-nothing.
   `pnpm|yarn exec vitest …`) gets `--maxWorkers=N` appended unless it already passes
   `--maxWorkers`, `--pool` or `--no-file-parallelism`. N is `vitest_workers` (default 1 for
   up to 4 cores, 2 below 12, else 3). `npm run …` scripts and shell strings are never changed.
+- gradle / gradlew started directly as words gets `--max-workers=N` unless it already sets
+  `--max-workers` or `-Dorg.gradle.workers.max`.
+- Cargo commands get `CARGO_BUILD_JOBS=N` unless it is already set.
+- For both, N is the job's share of the machine: logical cores × cost ÷ budget (at least 1).
 
 **Nesting.** calmrun sets `CALMRUN_HELD=<pid>` for the command. A calmrun started inside it
 (for example a script that calls calmrun again) runs at once instead of queuing behind its own
@@ -205,6 +214,7 @@ min_free_gb = 4
 pass_limit_min = 10
 vitest_workers = 2
 ceiling_gb = 8          # 0 = off
+min_free_disk_gb = 5    # 0 = off
 critical_free_gb = 0.8  # 0 = off
 
 [kinds.vitest]
@@ -224,6 +234,7 @@ patterns = ["make", "bazel build"]
 | `CALMRUN_PASS_MIN` | Pass limit in minutes; `0` = strict order |
 | `CALMRUN_VITEST_WORKERS` | `--maxWorkers` value for vitest |
 | `CALMRUN_LOW_CPU` | `0` keeps normal priority |
+| `CALMRUN_MIN_FREE_DISK_GB` | Free space needed on the cwd's drive; `0` = off |
 | `CALMRUN_CEILING_GB` | Memory ceiling for one job's process tree; `0` = off |
 | `CALMRUN_CRITICAL_FREE_GB` | Free-RAM floor that stops the biggest job; `0` = off |
 | `CALMRUN_HOME` | State directory |

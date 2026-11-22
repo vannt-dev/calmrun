@@ -212,6 +212,7 @@ fn run_task(out: &Out, args: &Value, token: Option<Value>, cancel: Arc<AtomicBoo
             .filter(|t| *t > 0.0)
             .map(Duration::from_secs_f64),
         ticket: args.get("ticket").and_then(Value::as_u64),
+        env: Vec::new(),
         rerun_hint: Some("call run_task again with the same arguments plus \"ticket\": {ticket}".into()),
     };
     let mut notify = McpNotify {
