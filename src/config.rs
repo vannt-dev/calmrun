@@ -32,6 +32,8 @@ pub struct FileConfig {
     pub min_free_gb: Option<f64>,
     pub pass_limit_min: Option<f64>,
     pub vitest_workers: Option<u32>,
+    pub ceiling_gb: Option<f64>,
+    pub critical_free_gb: Option<f64>,
     #[serde(default)]
     pub kinds: BTreeMap<String, KindConfig>,
 }
@@ -44,6 +46,10 @@ pub struct Config {
     pub pass_limit_ms: u64,
     pub vitest_workers: u32,
     pub low_cpu: bool,
+    /// Stop a job whose process tree uses more than this (0 = off).
+    pub ceiling_bytes: u64,
+    /// Stop the biggest job when free RAM stays below this for a few seconds (0 = off).
+    pub critical_free_bytes: u64,
     pub kinds: BTreeMap<String, KindConfig>,
 }
 
@@ -55,6 +61,16 @@ pub fn default_budget(m: Machine) -> u32 {
 
 pub fn default_min_free_gb(m: Machine) -> f64 {
     (m.total_ram as f64 / GB / 8.0).max(3.0)
+}
+
+/// Half of the RAM.
+pub fn default_ceiling_gb(m: Machine) -> f64 {
+    m.total_ram as f64 / GB / 2.0
+}
+
+/// 5% of the RAM, at most 1 GB.
+pub fn default_critical_free_gb(m: Machine) -> f64 {
+    (m.total_ram as f64 / GB * 0.05).min(1.0)
 }
 
 pub fn default_vitest_workers(m: Machine) -> u32 {
@@ -118,6 +134,14 @@ pub fn resolve(m: Machine, file: FileConfig, env: &dyn Fn(&str) -> Option<String
         .or(file.vitest_workers)
         .unwrap_or_else(|| default_vitest_workers(m))
         .max(1);
+    let ceiling_gb = num("CALMRUN_CEILING_GB")
+        .or(file.ceiling_gb)
+        .unwrap_or_else(|| default_ceiling_gb(m))
+        .max(0.0);
+    let critical_gb = num("CALMRUN_CRITICAL_FREE_GB")
+        .or(file.critical_free_gb)
+        .unwrap_or_else(|| default_critical_free_gb(m))
+        .max(0.0);
     let low_cpu = !matches!(
         env("CALMRUN_LOW_CPU").as_deref().map(str::trim),
         Some("0" | "false" | "no" | "off")
@@ -128,6 +152,8 @@ pub fn resolve(m: Machine, file: FileConfig, env: &dyn Fn(&str) -> Option<String
         pass_limit_ms: (pass_min * 60_000.0) as u64,
         vitest_workers,
         low_cpu,
+        ceiling_bytes: (ceiling_gb * GB) as u64,
+        critical_free_bytes: (critical_gb * GB) as u64,
         kinds: file.kinds,
     }
 }
@@ -154,6 +180,14 @@ pub fn default_config_text(m: Machine) -> String {
 # (env CALMRUN_PASS_MIN). 0 = always strict first-come order.
 # pass_limit_min = 10
 
+# Stop a job whose whole process tree uses more memory than this (env CALMRUN_CEILING_GB).
+# 0 turns it off. Default: half the RAM.
+# ceiling_gb = {ceiling:.1}
+
+# When free RAM stays below this for a few seconds, stop the running job that uses the most
+# memory (env CALMRUN_CRITICAL_FREE_GB). 0 turns it off. Default: 5% of RAM, at most 1 GB.
+# critical_free_gb = {critical:.2}
+
 # --maxWorkers value appended to direct vitest calls (env CALMRUN_VITEST_WORKERS).
 # vitest_workers = {workers}
 
@@ -169,6 +203,8 @@ pub fn default_config_text(m: Machine) -> String {
         budget = default_budget(m),
         min_free = default_min_free_gb(m),
         workers = default_vitest_workers(m),
+        ceiling = default_ceiling_gb(m),
+        critical = default_critical_free_gb(m),
     )
 }
 
@@ -198,6 +234,9 @@ mod tests {
         assert_eq!(default_vitest_workers(m(4, 8)), 1);
         assert_eq!(default_vitest_workers(m(8, 8)), 2);
         assert_eq!(default_vitest_workers(m(12, 8)), 3);
+        assert_eq!(default_ceiling_gb(m(8, 16)), 8.0);
+        assert_eq!(default_critical_free_gb(m(8, 16)), 0.8);
+        assert_eq!(default_critical_free_gb(m(8, 64)), 1.0);
     }
 
     #[test]

@@ -5,6 +5,7 @@ mod doctor;
 mod history;
 mod hook;
 mod mcp;
+mod memwatch;
 mod queue;
 mod runner;
 mod scheduler;
@@ -344,7 +345,10 @@ fn cmd_probe(a: &cli::ProbeArgs) -> i32 {
         }
     };
     mark("start");
+    // Touch every page so the memory is really resident.
+    let hog: Vec<u8> = vec![1u8; a.alloc_mb * 1024 * 1024];
     std::thread::sleep(Duration::from_millis(a.sleep_ms));
+    std::hint::black_box(&hog);
     mark("end");
     a.exit
 }

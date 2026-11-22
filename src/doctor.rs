@@ -120,6 +120,11 @@ pub fn report(
     s += &format!("  min_free_gb     = {:.1}\n", bytes_to_gb(cfg.min_free_bytes));
     s += &format!("  pass_limit_min  = {}\n", cfg.pass_limit_ms / 60_000);
     s += &format!("  vitest_workers  = {}\n", cfg.vitest_workers);
+    s += &format!("  ceiling_gb      = {:.1}\n", bytes_to_gb(cfg.ceiling_bytes));
+    s += &format!(
+        "  critical_free_gb = {:.2}\n",
+        bytes_to_gb(cfg.critical_free_bytes)
+    );
     s += &format!("  low cpu         = {}\n", if cfg.low_cpu { "on" } else { "off" });
     s += "\nSuggested for this machine:\n";
     s += &format!("  budget = {}\n", config::default_budget(m));

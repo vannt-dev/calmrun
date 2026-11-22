@@ -4,7 +4,7 @@ use crate::config::{self, bytes_to_gb, Config};
 use crate::scheduler::{self, Block, Limits};
 use crate::state::{self, Job, State, Store};
 use crate::sys::Sys;
-use crate::{detect, history, runner};
+use crate::{detect, history, memwatch, runner};
 use serde_json::json;
 use std::collections::HashSet;
 use std::io;
@@ -339,6 +339,7 @@ pub fn run(ctx: &mut Ctx, mut req: Request, notify: &mut dyn Notify) -> Outcome 
         started_ms: None,
         child_pid: None,
         parked_until: None,
+        mem_bytes: None,
     };
     let sys = &mut ctx.sys;
     let ticket = req.ticket;
@@ -455,6 +456,45 @@ pub fn run(ctx: &mut Ctx, mut req: Request, notify: &mut dyn Notify) -> Outcome 
     out.wait_ms = started_ms.saturating_sub(queued_ms);
     notify.started(out.wait_ms);
     started_at.set(Some(Instant::now()));
+    let mut mem = memwatch::MemWatch::new(cfg.ceiling_bytes, cfg.critical_free_bytes);
+    let stop_reason: std::cell::RefCell<Option<memwatch::Stop>> = std::cell::RefCell::new(None);
+    let mut samples = 0u64;
+    let mut full_watch = |pid: u32| -> bool {
+        if watch(pid) {
+            return true;
+        }
+        let Some(m) = mem.as_mut() else { return false };
+        // Only the biggest running job is stopped when free RAM is critical.
+        let mut biggest = |mine: u64| {
+            store
+                .with_lock(|s| {
+                    s.jobs
+                        .iter()
+                        .filter(|j| j.running() && j.id != id)
+                        .all(|j| j.mem_bytes.unwrap_or(0) <= mine)
+                })
+                .unwrap_or(true)
+        };
+        let (fresh, stop) = m.check(pid, &mut biggest);
+        if fresh {
+            samples += 1;
+            if samples % 2 == 1 {
+                let used = m.used;
+                let _ = store.with_lock(|s| {
+                    if let Some(j) = s.jobs.iter_mut().find(|j| j.id == id) {
+                        j.mem_bytes = Some(used);
+                    }
+                });
+            }
+        }
+        match stop {
+            Some(r) => {
+                *stop_reason.borrow_mut() = Some(r);
+                true
+            }
+            None => false,
+        }
+    };
     let result = prepare(&req, &cfg).and_then(|mut cmd| {
         cmd.env("CALMRUN_HELD", me.to_string());
         runner::run(
@@ -467,12 +507,19 @@ pub fn run(ctx: &mut Ctx, mut req: Request, notify: &mut dyn Notify) -> Outcome 
                     }
                 });
             },
-            &mut watch,
+            &mut full_watch,
         )
     });
+    let stop_reason = stop_reason.into_inner();
     out.run_ms = now_ms().saturating_sub(started_ms);
     let _ = store.with_lock(|s| s.jobs.retain(|j| j.id != id));
     match result {
+        Ok(e) if e.stopped && stop_reason.is_some() => {
+            let r = stop_reason.as_ref().expect("checked");
+            out.code = e.code;
+            out.status = r.status().into();
+            out.message = Some(r.message(&label));
+        }
         Ok(e) if e.stopped && req.cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) => {
             out.code = 130;
             out.status = "cancelled".into();
@@ -562,6 +609,7 @@ fn job_json(j: &Job, now: u64, place: Option<usize>) -> serde_json::Value {
         "cost": j.cost,
         "pid": j.pid,
         "child_pid": j.child_pid,
+        "mem_bytes": j.mem_bytes,
         "cwd": j.cwd,
         "high": j.high,
         "since_ms": j.started_ms.unwrap_or(j.queued_ms),

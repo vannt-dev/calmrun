@@ -118,6 +118,9 @@ pub struct ProbeArgs {
     /// Print the received arguments as JSON.
     #[arg(long)]
     pub print_args: bool,
+    /// Allocate and touch this many MB before sleeping.
+    #[arg(long, default_value_t = 0)]
+    pub alloc_mb: usize,
     /// Start a detached helper that outlives this process and write its pid here.
     #[arg(long)]
     pub spawn_daemon: Option<std::path::PathBuf>,

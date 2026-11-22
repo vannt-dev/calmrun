@@ -125,6 +125,7 @@ mod tests {
             started_ms: running.then_some(1_000),
             child_pid: None,
             parked_until: None,
+            mem_bytes: None,
         }
     }
     fn keyed(mut j: Job, k: &str) -> Job {

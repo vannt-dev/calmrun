@@ -116,6 +116,7 @@ calmrun init [--force]
 | 124 | stopped by the MCP `timeout_s` |
 | 127 | command not found |
 | 130 | Ctrl+C |
+| 137 | stopped by the memory ceiling or the critical free-RAM floor |
 
 ## Rules
 
@@ -170,6 +171,20 @@ parent.
 **Low priority.** The command runs below normal priority on Windows and with `nice +10` in its
 own process group on Unix. `CALMRUN_LOW_CPU=0` turns the priority change off.
 
+**Memory ceiling.** While a job runs, calmrun adds up the memory of its whole process tree
+(the command and every process below it, including nested calmrun runs) about once a second.
+If the tree goes above `ceiling_gb` (default half the RAM; `0` turns it off), or free RAM
+stays below `critical_free_gb` (default 5% of RAM, at most 1 GB) for 3 seconds and this job's
+tree is the largest of the running jobs, calmrun stops the tree (gracefully, then forced) and
+exits **137** with a message like:
+
+```
+calmrun: stopped npx vitest run: its processes used 9.1 GB, above the 8.0 GB ceiling
+```
+
+The stop is recorded in `history.jsonl` (`"status": "ceiling"` or `"low-memory"`), and
+`status --json` shows each running job's `mem_bytes`.
+
 **Process tree.** When the command exits normally, processes it deliberately left running
 (a Gradle or Kotlin daemon, a dev server started in the background) are left alone. When the
 run ends abnormally — Ctrl+C, or calmrun itself being killed — the whole tree is ended: on
@@ -189,6 +204,8 @@ budget = 6
 min_free_gb = 4
 pass_limit_min = 10
 vitest_workers = 2
+ceiling_gb = 8          # 0 = off
+critical_free_gb = 0.8  # 0 = off
 
 [kinds.vitest]
 cost = 3                         # override a built-in cost
@@ -207,6 +224,8 @@ patterns = ["make", "bazel build"]
 | `CALMRUN_PASS_MIN` | Pass limit in minutes; `0` = strict order |
 | `CALMRUN_VITEST_WORKERS` | `--maxWorkers` value for vitest |
 | `CALMRUN_LOW_CPU` | `0` keeps normal priority |
+| `CALMRUN_CEILING_GB` | Memory ceiling for one job's process tree; `0` = off |
+| `CALMRUN_CRITICAL_FREE_GB` | Free-RAM floor that stops the biggest job; `0` = off |
 | `CALMRUN_HOME` | State directory |
 | `CALMRUN_CONFIG` | Config file path |
 | `CALMRUN_HOOK_MODE` | `rewrite` makes the Claude Code hook wrap commands itself |
@@ -333,9 +352,13 @@ Use `calmrun status` to see what is running or waiting. Do not wrap light comman
   foreground of a terminal, that group becomes the terminal's foreground group (so the command
   can read input and gets Ctrl+C directly) and the terminal is handed back afterwards; SIGINT,
   SIGTERM and SIGHUP that calmrun receives are forwarded to the group as SIGINT.
+- **Memory figures.** calmrun counts resident memory: the working set on Windows and the
+  resident set size (RSS) on macOS and Linux. Shared pages count once per process, so the
+  tree total can be higher than what the OS reports as used; the default ceiling leaves room.
 - **What CI covers.** The test suite runs on Windows, macOS and Linux (GitHub-hosted x64 and
   arm64 runners): queue rules, exit codes, Ctrl+C while running and while waiting, and daemons
-  surviving a normal exit. Killing calmrun ending the tree is tested on Windows only. The
+  surviving a normal exit, and the memory ceiling stopping a nested tree. The critical
+  free-RAM floor is covered by unit tests only (it depends on the machine). Killing calmrun ending the tree is tested on Windows only. The
   terminal hand-over is not covered by CI (runners have no terminal).
 - **Battery.** `calmrun doctor` reports whether the machine runs on battery; consider a smaller
   budget then.

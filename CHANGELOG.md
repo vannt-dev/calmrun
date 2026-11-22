@@ -22,6 +22,8 @@ All notable changes to this project are documented here. The format follows
 - `--wait-timeout SECS`: exit 75 when not started in time and keep the place in line for 10
   minutes; `--ticket <id>` resumes it. The `next:` line gives the exact command.
 - `calmrun guide`, and `next:` hints on refusals and missing commands.
+- Memory ceiling: a job whose process tree passes `ceiling_gb` (default half the RAM), or the
+  biggest job when free RAM stays below `critical_free_gb`, is stopped with exit 137.
 - `calmrun mcp`: an MCP server over stdio with `run_task` (same queue as the CLI, captured
   log, last 200 lines, progress notifications, timeout, cancellation), `queue_status` and
   `bump`.

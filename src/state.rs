@@ -34,6 +34,9 @@ pub struct Job {
     /// re-run with `--ticket <id>` until this time, and is skipped by the scheduler meanwhile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parked_until: Option<u64>,
+    /// Memory of the running command's whole process tree, sampled every few seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_bytes: Option<u64>,
 }
 
 impl Job {
@@ -168,6 +171,7 @@ mod tests {
             started_ms: None,
             child_pid: None,
             parked_until: None,
+            mem_bytes: None,
         }
     }
 
