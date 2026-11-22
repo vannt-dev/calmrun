@@ -1,0 +1,338 @@
+//! End-to-end tests: several real calmrun processes against one temporary state dir.
+
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+const EXE: &str = env!("CARGO_BIN_EXE_calmrun");
+
+struct Env {
+    home: tempfile::TempDir,
+    log: PathBuf,
+}
+
+impl Env {
+    fn new() -> Env {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("probe.log");
+        Env { home, log }
+    }
+
+    fn cmd(&self, budget: u32) -> Command {
+        let mut c = Command::new(EXE);
+        for (k, _) in std::env::vars() {
+            if k.starts_with("CALMRUN_") {
+                c.env_remove(k);
+            }
+        }
+        c.env("CALMRUN_HOME", self.home.path())
+            .env("CALMRUN_BUDGET", budget.to_string())
+            .env("CALMRUN_MIN_FREE_GB", "0")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        c
+    }
+
+    /// `calmrun <flags> -- calmrun __probe --log L --id ID --sleep-ms MS`
+    fn probe(&self, budget: u32, flags: &[&str], id: &str, ms: u64, cwd: Option<&Path>) -> Child {
+        let mut c = self.cmd(budget);
+        c.args(flags)
+            .arg("--")
+            .arg(EXE)
+            .args(["__probe", "--id", id, "--sleep-ms", &ms.to_string(), "--log"])
+            .arg(&self.log);
+        if let Some(d) = cwd {
+            c.current_dir(d);
+        }
+        c.spawn().unwrap()
+    }
+
+    /// (id, start_ms, end_ms) per probe.
+    fn intervals(&self) -> Vec<(String, u64, u64)> {
+        let text = std::fs::read_to_string(&self.log).unwrap_or_default();
+        let mut starts = std::collections::HashMap::new();
+        let mut out = Vec::new();
+        for line in text.lines() {
+            let p: Vec<&str> = line.split_whitespace().collect();
+            let t: u64 = p[2].parse().unwrap();
+            match p[0] {
+                "start" => {
+                    starts.insert(p[1].to_string(), t);
+                }
+                _ => out.push((p[1].to_string(), starts[p[1]], t)),
+            }
+        }
+        out.sort_by_key(|x| x.1);
+        out
+    }
+}
+
+fn wait_all(children: Vec<Child>, limit: Duration) -> Vec<i32> {
+    let deadline = Instant::now() + limit;
+    children
+        .into_iter()
+        .map(|mut c| loop {
+            if let Some(s) = c.try_wait().unwrap() {
+                break s.code().unwrap_or(-1);
+            }
+            if Instant::now() > deadline {
+                let _ = c.kill();
+                panic!("calmrun did not finish in {limit:?}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        })
+        .collect()
+}
+
+/// Highest number of overlapping intervals, weighted by cost.
+fn max_overlap(iv: &[(String, u64, u64)], cost: impl Fn(&str) -> u32) -> u32 {
+    let mut events: Vec<(u64, i64)> = Vec::new();
+    for (id, s, e) in iv {
+        events.push((*s, cost(id) as i64));
+        events.push((*e, -(cost(id) as i64)));
+    }
+    // Ends sort before starts at the same millisecond.
+    events.sort_by_key(|&(t, d)| (t, d));
+    let (mut cur, mut max) = (0i64, 0i64);
+    for (_, d) in events {
+        cur += d;
+        max = max.max(cur);
+    }
+    max as u32
+}
+
+#[test]
+fn concurrency_never_exceeds_budget() {
+    let env = Env::new();
+    let kids: Vec<Child> = (0..5)
+        .map(|i| env.probe(2, &["--cost", "1", "--kind", "test"], &format!("p{i}"), 700, None))
+        .collect();
+    assert!(wait_all(kids, Duration::from_secs(60)).iter().all(|&c| c == 0));
+    let iv = env.intervals();
+    assert_eq!(iv.len(), 5);
+    let max = max_overlap(&iv, |_| 1);
+    assert!(max <= 2, "overlap {max} exceeds budget 2: {iv:?}");
+    assert_eq!(max, 2, "expected two jobs to run side by side: {iv:?}");
+}
+
+#[test]
+fn cost_two_jobs_run_one_at_a_time() {
+    let env = Env::new();
+    let kids: Vec<Child> = (0..3)
+        .map(|i| env.probe(2, &["--cost", "2"], &format!("c{i}"), 400, None))
+        .collect();
+    assert!(wait_all(kids, Duration::from_secs(60)).iter().all(|&c| c == 0));
+    assert_eq!(max_overlap(&env.intervals(), |_| 1), 1);
+}
+
+#[test]
+fn exclusive_node_modules_key() {
+    let env = Env::new();
+    let proj = env.home.path().join("proj");
+    std::fs::create_dir_all(proj.join("node_modules")).unwrap();
+    std::fs::create_dir_all(proj.join("pkg")).unwrap();
+    let other = env.home.path().join("other");
+    std::fs::create_dir_all(other.join("node_modules")).unwrap();
+    let mut kids = Vec::new();
+    for i in 0..3 {
+        let dir = if i == 1 { proj.join("pkg") } else { proj.clone() };
+        kids.push(env.probe(
+            8,
+            &["--kind", "vitest", "--cost", "1"],
+            &format!("same{i}"),
+            400,
+            Some(&dir),
+        ));
+    }
+    kids.push(env.probe(
+        8,
+        &["--kind", "vitest", "--cost", "1"],
+        "other",
+        400,
+        Some(&other),
+    ));
+    assert!(wait_all(kids, Duration::from_secs(60)).iter().all(|&c| c == 0));
+    let iv = env.intervals();
+    let same: Vec<_> = iv.iter().filter(|x| x.0.starts_with("same")).cloned().collect();
+    assert_eq!(same.len(), 3);
+    assert_eq!(
+        max_overlap(&same, |_| 1),
+        1,
+        "same node_modules overlapped: {same:?}"
+    );
+}
+
+#[test]
+fn first_come_first_served() {
+    let env = Env::new();
+    let a = env.probe(2, &["--cost", "2"], "a", 1500, None);
+    std::thread::sleep(Duration::from_millis(400));
+    let b = env.probe(2, &["--cost", "2"], "b", 200, None);
+    std::thread::sleep(Duration::from_millis(400));
+    let c = env.probe(2, &["--cost", "2"], "c", 200, None);
+    assert!(wait_all(vec![a, b, c], Duration::from_secs(60))
+        .iter()
+        .all(|&x| x == 0));
+    let order: Vec<String> = env.intervals().into_iter().map(|x| x.0).collect();
+    assert_eq!(order, vec!["a", "b", "c"]);
+}
+
+#[test]
+fn prio_high_jumps_the_queue() {
+    let env = Env::new();
+    let a = env.probe(2, &["--cost", "2"], "a", 1500, None);
+    std::thread::sleep(Duration::from_millis(400));
+    let b = env.probe(2, &["--cost", "2"], "b", 200, None);
+    std::thread::sleep(Duration::from_millis(400));
+    let c = env.probe(2, &["--cost", "2", "--prio", "high"], "c", 200, None);
+    assert!(wait_all(vec![a, b, c], Duration::from_secs(60))
+        .iter()
+        .all(|&x| x == 0));
+    let order: Vec<String> = env.intervals().into_iter().map(|x| x.0).collect();
+    assert_eq!(order, vec!["a", "c", "b"]);
+}
+
+#[test]
+fn exit_code_passes_through() {
+    let env = Env::new();
+    let code = env
+        .cmd(2)
+        .args(["--", EXE, "__probe", "--exit", "7"])
+        .status()
+        .unwrap()
+        .code();
+    assert_eq!(code, Some(7));
+    let hist = std::fs::read_to_string(env.home.path().join("history.jsonl")).unwrap();
+    assert!(hist.contains("\"status\":\"7\""), "{hist}");
+}
+
+#[test]
+fn missing_command_is_127() {
+    let env = Env::new();
+    let code = env
+        .cmd(2)
+        .args(["--", "calmrun-no-such-command-xyz"])
+        .status()
+        .unwrap()
+        .code();
+    assert_eq!(code, Some(127));
+}
+
+#[test]
+fn nested_run_does_not_deadlock() {
+    let env = Env::new();
+    let mut c = env.cmd(2);
+    c.args([
+        "--cost", "2", "--", EXE, "--cost", "2", "--", EXE, "__probe", "--id", "inner", "--log",
+    ])
+    .arg(&env.log);
+    let child = c.spawn().unwrap();
+    assert_eq!(wait_all(vec![child], Duration::from_secs(20)), vec![0]);
+    assert_eq!(env.intervals().len(), 1);
+}
+
+#[test]
+fn killed_waiter_leaves_the_queue() {
+    let env = Env::new();
+    let a = env.probe(2, &["--cost", "2"], "a", 2500, None);
+    std::thread::sleep(Duration::from_millis(400));
+    let mut b = env.probe(2, &["--cost", "2", "--label", "victim"], "b", 100, None);
+    std::thread::sleep(Duration::from_millis(600));
+    let status = |env: &Env| -> serde_json::Value {
+        let out = env
+            .cmd(2)
+            .args(["status", "--json"])
+            .stdout(Stdio::piped())
+            .output()
+            .unwrap();
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let s = status(&env);
+    assert_eq!(s["running"].as_array().unwrap().len(), 1);
+    assert_eq!(s["waiting"][0]["label"], "victim");
+    b.kill().unwrap();
+    let _ = b.wait();
+    let s = status(&env);
+    assert_eq!(s["waiting"].as_array().unwrap().len(), 0, "{s}");
+    assert_eq!(wait_all(vec![a], Duration::from_secs(20)), vec![0]);
+}
+
+#[test]
+fn bump_moves_a_waiter_forward() {
+    let env = Env::new();
+    let a = env.probe(2, &["--cost", "2"], "a", 1500, None);
+    std::thread::sleep(Duration::from_millis(400));
+    let b = env.probe(2, &["--cost", "2", "--label", "first"], "b", 200, None);
+    std::thread::sleep(Duration::from_millis(300));
+    let c = env.probe(2, &["--cost", "2", "--label", "urgent-e2e"], "c", 200, None);
+    std::thread::sleep(Duration::from_millis(300));
+    let out = env.cmd(2).args(["bump", "URGENT"]).status().unwrap();
+    assert!(out.success());
+    assert!(wait_all(vec![a, b, c], Duration::from_secs(60))
+        .iter()
+        .all(|&x| x == 0));
+    let order: Vec<String> = env.intervals().into_iter().map(|x| x.0).collect();
+    assert_eq!(order, vec!["a", "c", "b"]);
+}
+
+#[test]
+fn hook_denies_heavy_and_allows_light() {
+    let env = Env::new();
+    let run = |cmd: &str| -> String {
+        let input = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": cmd}
+        });
+        let mut child = env
+            .cmd(2)
+            .args(["hook", "claude"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let denied = run("npx vitest run");
+    let v: serde_json::Value = serde_json::from_str(&denied).unwrap();
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+    assert_eq!(run("git status"), "");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_cmd_shim_arguments_survive() {
+    let env = Env::new();
+    let dir = env.home.path().join("bin");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("echoargs.cmd"),
+        format!("@\"{EXE}\" __probe --print-args -- %*\r\n"),
+    )
+    .unwrap();
+    let args = [
+        "a b", "x&y", "100%", "%PATH%", "q\"t", "c^d", "p|q", "(paren)", "tr\\",
+    ];
+    let path = format!("{};{}", dir.display(), std::env::var("PATH").unwrap_or_default());
+    let out = env
+        .cmd(2)
+        .env("PATH", path)
+        .arg("--")
+        .arg("echoargs")
+        .args(args)
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let got: Vec<String> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(got, args);
+}
