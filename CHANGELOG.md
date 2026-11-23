@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-23
+
 ### Added
 
 - Hooks for Codex (`calmrun hook codex`), Antigravity (`calmrun hook antigravity`) and OpenCode
