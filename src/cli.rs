@@ -101,9 +101,11 @@ pub enum Sub {
         /// Take the calmrun block (and with --hook, the hook) out again.
         #[arg(long)]
         remove: bool,
-        /// Also add the Claude Code PreToolUse hook to its settings.json (a backup is kept).
-        #[arg(long)]
-        hook: bool,
+        /// Also install the hook of these agents (claude, codex, antigravity, opencode, all;
+        /// default claude), in their user-level files; other hooks there are kept.
+        #[arg(long, value_name = "AGENTS", num_args = 0..=1, default_missing_value = "claude",
+              value_delimiter = ',')]
+        hook: Option<Vec<String>>,
         /// Which agents (claude, codex, gemini, opencode). Default: those whose folder exists.
         #[arg(long, value_delimiter = ',')]
         agents: Option<Vec<String>>,
@@ -137,6 +139,12 @@ pub enum Sub {
 pub enum HookTarget {
     /// Claude Code PreToolUse hook: reads the hook JSON on stdin.
     Claude,
+    /// Codex CLI PreToolUse hook: reads the hook JSON on stdin.
+    Codex,
+    /// Antigravity PreToolUse hook: reads the hook JSON on stdin.
+    Antigravity,
+    /// Behind calmrun's OpenCode plugin: reads the bash call as JSON on stdin.
+    Opencode,
 }
 
 /// Arguments of the hidden test helper `__probe`.

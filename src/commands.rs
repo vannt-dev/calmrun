@@ -1,6 +1,6 @@
 //! The CLI subcommands. Each returns the process exit code.
 
-use crate::cli::{Cli, Prio, ProbeArgs};
+use crate::cli::{Cli, HookTarget, Prio, ProbeArgs};
 use crate::config::{self, bytes_to_gb};
 use crate::error::Error;
 use crate::queue::{self, now_ms, Ctx};
@@ -237,7 +237,13 @@ pub fn stats(days: u32, as_json: bool) -> i32 {
 }
 
 /// `calmrun hook claude`. Fails open: any problem means no output and exit 0.
-pub fn hook() -> i32 {
+pub fn hook(target: &HookTarget) -> i32 {
+    let agent = match target {
+        HookTarget::Claude => hook::Agent::Claude,
+        HookTarget::Codex => hook::Agent::Codex,
+        HookTarget::Antigravity => hook::Agent::Antigravity,
+        HookTarget::Opencode => hook::Agent::OpenCode,
+    };
     let mut input = String::new();
     if std::io::stdin().read_to_string(&mut input).is_err() {
         return 0;
@@ -246,7 +252,8 @@ pub fn hook() -> i32 {
     let kinds = config::read_file_config(&config::config_path(&home))
         .map(|f| f.kinds)
         .unwrap_or_default();
-    if let Some(out) = hook::handle(&input, hook::Mode::from_env(), &kinds, &hook::program_name()) {
+    let program = hook::program_name();
+    if let Some(out) = hook::run(agent, &input, hook::Mode::from_env(), &kinds, &program) {
         println!("{out}");
     }
     0

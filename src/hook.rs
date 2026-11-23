@@ -1,10 +1,19 @@
-//! `calmrun hook claude`: a Claude Code PreToolUse hook.
+//! `calmrun hook <agent>`: PreToolUse hooks for coding agents.
 //!
-//! Contract (https://code.claude.com/docs/en/hooks): the hook reads JSON with `tool_name` and
-//! `tool_input` on stdin. To block a call it prints
+//! One decision for every agent ([`plan`]): which parts of a shell command are heavy, the
+//! command with each of them wrapped in `calmrun --`, and a `--wait-timeout` below the tool's
+//! own time limit. Each agent has a thin adapter that reads its tool call and writes its answer:
+//! Claude Code here ([`handle`]), Codex, Antigravity and OpenCode in the child modules.
+//!
+//! Claude Code contract (https://code.claude.com/docs/en/hooks): the hook reads JSON with
+//! `tool_name` and `tool_input` on stdin. To block a call it prints
 //! `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny",
 //! "permissionDecisionReason":"..."}}` and exits 0; the reason is shown to Claude.
 //! `updatedInput` replaces the whole tool input. Printing nothing leaves the call alone.
+
+pub mod antigravity;
+pub mod codex;
+pub mod opencode;
 
 use crate::config::KindConfig;
 use crate::detect::{detect_words, disposition, parse, tool_name, Disposition};
@@ -17,6 +26,154 @@ use std::collections::BTreeMap;
 pub enum Mode {
     Deny,
     Rewrite,
+}
+
+/// The agents calmrun has a hook for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Agent {
+    Claude,
+    Codex,
+    Antigravity,
+    OpenCode,
+}
+
+/// Process one hook input of `agent`: the text to print, or `None` to stay silent (allow).
+pub fn run(
+    agent: Agent,
+    input: &str,
+    mode: Mode,
+    kinds: &BTreeMap<String, KindConfig>,
+    program: &str,
+) -> Option<String> {
+    match agent {
+        Agent::Claude => handle(input, mode, kinds, program),
+        Agent::Codex => codex::handle(input, mode, kinds, program),
+        Agent::Antigravity => antigravity::handle(input, mode, kinds, program),
+        Agent::OpenCode => opencode::handle(input, mode, kinds, program),
+    }
+}
+
+/// The shell that runs the command, as far as the agent tells.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Shell {
+    /// sh/bash (Git Bash on Windows), or a shell the agent does not name: the program path
+    /// gets forward slashes, which every shell accepts.
+    Posix,
+    /// PowerShell: backslashes stay, and a quoted path is called with `&`.
+    PowerShell,
+}
+
+/// A shell tool call, as every adapter reduces its agent's call to.
+#[derive(Debug, Clone, Copy)]
+pub struct Call<'a> {
+    pub command: &'a str,
+    pub shell: Shell,
+    /// The tool's time limit in ms for a foreground command, after which it kills it.
+    /// `None`: the tool does not kill long commands (or nothing is known about it).
+    pub limit_ms: Option<u64>,
+    /// The call already runs in the background (no time limit applies).
+    pub background: bool,
+}
+
+/// What to do with a heavy call.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Plan {
+    /// The kinds found, in order.
+    pub kinds: Vec<String>,
+    /// The command with each heavy part wrapped, no `--wait-timeout`.
+    pub plain: String,
+    /// The same with `--wait-timeout` below the tool's limit (foreground calls with a limit).
+    pub capped: Option<String>,
+    /// The `--wait-timeout` value in `capped`.
+    pub wait_secs: Option<u64>,
+    /// Some kind found usually takes minutes (tests, builds, containers, monorepo runs).
+    pub long: bool,
+    /// The call already runs in the background.
+    pub background: bool,
+}
+
+impl Plan {
+    /// The command to suggest for the call as it is: capped when there is a limit.
+    pub fn command(&self) -> &str {
+        self.capped.as_deref().unwrap_or(&self.plain)
+    }
+}
+
+/// Kinds that usually run for minutes: worth the background where the agent has one.
+const LONG_KINDS: &[&str] = &[
+    "vitest", "jest", "capture", "docker", "build", "test", "pytest", "monorepo",
+];
+
+/// A `--wait-timeout` a little below a tool limit of `limit_ms`, so calmrun gives up waiting
+/// (exit 75, place kept) before the tool kills it: 120 s -> 108 s, 600 s -> 570 s.
+pub fn wait_secs(limit_ms: u64) -> u64 {
+    let total = limit_ms / 1000;
+    let margin = (total / 10).clamp(5, 30);
+    total.saturating_sub(margin).max(1)
+}
+
+/// The program as the call's shell runs it.
+fn program_for(program: &str, shell: Shell) -> String {
+    match shell {
+        // Bash (Git Bash on Windows) eats backslashes in an unquoted path; C:/x/calmrun.exe works.
+        Shell::Posix => program.replace('\\', "/"),
+        // A quoted path is a string in PowerShell, not a command: call it with `&`.
+        Shell::PowerShell if program.starts_with(['"', '\'']) => format!("& {program}"),
+        Shell::PowerShell => program.to_string(),
+    }
+}
+
+/// The shared decision: `None` when nothing in the call needs the queue.
+pub fn plan(call: &Call, kinds: &BTreeMap<String, KindConfig>, program: &str) -> Option<Plan> {
+    let program = program_for(program, call.shell);
+    let (plain, found) = wrap_with(call.command, kinds, &program)?;
+    let wait = call.limit_ms.filter(|_| !call.background).map(wait_secs);
+    let capped = wait
+        .and_then(|s| wrap_with(call.command, kinds, &format!("{program} --wait-timeout {s}")).map(|w| w.0));
+    let long = found.iter().any(|k| LONG_KINDS.contains(&k.as_str()));
+    Some(Plan {
+        kinds: found,
+        plain,
+        capped,
+        wait_secs: wait,
+        long,
+        background: call.background,
+    })
+}
+
+/// How an agent can run a command in the background, for the deny text.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Background {
+    /// Name the tool parameter (`run_in_background: true` for Claude Code).
+    Param(&'static str),
+    /// Only a general hint.
+    Hint,
+}
+
+/// The deny reason every agent shows its model: the command to run instead, and what to do
+/// about long waits and long runs.
+pub fn deny_reason(p: &Plan, bg: Background) -> String {
+    let mut s = format!(
+        "Heavy command ({}) must go through the machine-wide calmrun queue so parallel agents \
+         do not freeze this computer. Run this instead:\n{}",
+        p.kinds.join(", "),
+        p.command()
+    );
+    if p.capped.is_some() {
+        s.push_str(
+            "\nExit 75 means it is still waiting in line: run the `calmrun: next:` command it \
+             prints to keep its place.",
+        );
+        if let (true, Background::Param(param)) = (p.long, bg) {
+            s.push_str(&format!(
+                "\nIt may take minutes: better run it with {param}, without --wait-timeout:\n{}",
+                p.plain
+            ));
+        }
+    } else if !p.background {
+        s.push_str("\nIf it may take more than a minute or two, run it in the background.");
+    }
+    s
 }
 
 impl Mode {
@@ -168,9 +325,12 @@ pub fn program_name() -> String {
         .unwrap_or_else(|_| "calmrun".to_string())
 }
 
-/// Process one hook input. Returns the JSON to print, or `None` to stay silent (allow).
-/// `program` is what the suggestion runs: `calmrun`, or its absolute path when `calmrun` is
-/// not on PATH (see [`program_name`]).
+/// Claude Code's Bash tool limit when the call sets no `timeout` (2 minutes).
+const CLAUDE_DEFAULT_LIMIT_MS: u64 = 120_000;
+
+/// Claude Code: process one hook input. Returns the JSON to print, or `None` to stay silent
+/// (allow). `program` is what the suggestion runs: `calmrun`, or its absolute path when
+/// `calmrun` is not on PATH (see [`program_name`]).
 pub fn handle(
     input: &str,
     mode: Mode,
@@ -179,34 +339,47 @@ pub fn handle(
 ) -> Option<String> {
     let v: Value = serde_json::from_str(input).ok()?;
     let tool = v.get("tool_name")?.as_str()?;
-    if tool != "Bash" && tool != "PowerShell" {
-        return None;
-    }
-    let tool_input = v.get("tool_input")?.as_object()?;
-    let cmd = tool_input.get("command")?.as_str()?;
-    // Bash (Git Bash on Windows) eats backslashes in an unquoted path; C:/x/calmrun.exe works.
-    let program = if tool == "Bash" {
-        program.replace('\\', "/")
-    } else {
-        program.to_string()
+    let shell = match tool {
+        "Bash" => Shell::Posix,
+        "PowerShell" => Shell::PowerShell,
+        _ => return None,
     };
-    let (wrapped, found) = wrap_with(cmd, kinds, &program)?;
+    let tool_input = v.get("tool_input")?.as_object()?;
+    let background = tool_input
+        .get("run_in_background")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let call = Call {
+        command: tool_input.get("command")?.as_str()?,
+        shell,
+        limit_ms: Some(
+            tool_input
+                .get("timeout")
+                .and_then(Value::as_u64)
+                .unwrap_or(CLAUDE_DEFAULT_LIMIT_MS),
+        ),
+        background,
+    };
+    let p = plan(&call, kinds, program)?;
     let out = match mode {
         Mode::Deny => json!({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
-                "permissionDecisionReason": format!(
-                    "Heavy command ({}) must go through the machine-wide calmrun queue so parallel \
-                     agents do not freeze this computer. Run this instead:\n{wrapped}\n\
-                     If it may take more than a minute or two, run it in the background.",
-                    found.join(", ")
-                ),
+                "permissionDecisionReason": deny_reason(&p, Background::Param("run_in_background: true")),
             }
         }),
         Mode::Rewrite => {
             let mut new_input = tool_input.clone();
-            new_input.insert("command".to_string(), Value::String(wrapped));
+            // A long run goes to the background, where no time limit applies; anything else
+            // gives up waiting before the limit, with its place kept.
+            let command = if p.long && !background {
+                new_input.insert("run_in_background".to_string(), Value::Bool(true));
+                p.plain.clone()
+            } else {
+                p.command().to_string()
+            };
+            new_input.insert("command".to_string(), Value::String(command));
             json!({
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
@@ -250,7 +423,93 @@ mod tests {
         let v = run("Bash", "npx vitest run", Mode::Deny).unwrap();
         assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
         assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
-        assert!(reason(&v).contains("\ncalmrun -- npx vitest run\n"));
+        let r = reason(&v);
+        assert!(
+            r.contains("\ncalmrun --wait-timeout 108 -- npx vitest run\nExit 75 means"),
+            "{r}"
+        );
+        // A long kind also gets the background form, without the cap.
+        assert!(
+            r.ends_with("run_in_background: true, without --wait-timeout:\ncalmrun -- npx vitest run"),
+            "{r}"
+        );
+    }
+
+    fn claude(tool_input: Value, mode: Mode) -> Value {
+        let input = json!({"tool_name": "Bash", "tool_input": tool_input}).to_string();
+        serde_json::from_str(&handle(&input, mode, &BTreeMap::new(), "calmrun").unwrap()).unwrap()
+    }
+
+    #[test]
+    fn the_wait_is_capped_below_the_tool_timeout() {
+        // No timeout: Claude Code's default of 2 minutes.
+        let v = claude(json!({"command": "npx tsc --noEmit"}), Mode::Deny);
+        let r = reason(&v);
+        assert!(
+            r.contains("\ncalmrun --wait-timeout 108 -- npx tsc --noEmit\n"),
+            "{r}"
+        );
+        assert!(!r.contains("run_in_background"), "a short kind: {r}");
+        let v = claude(json!({"command": "cargo build", "timeout": 600000}), Mode::Deny);
+        assert!(reason(&v).contains("calmrun --wait-timeout 570 -- cargo build"));
+        // Already in the background: no limit, no cap, no background advice.
+        let v = claude(
+            json!({"command": "npx vitest run", "run_in_background": true}),
+            Mode::Deny,
+        );
+        let r = reason(&v);
+        assert!(r.ends_with("Run this instead:\ncalmrun -- npx vitest run"), "{r}");
+        assert_eq!(wait_secs(30_000), 25);
+        assert_eq!(wait_secs(3_000), 1);
+    }
+
+    #[test]
+    fn rewrite_sends_long_runs_to_the_background_and_caps_short_ones() {
+        let v = claude(
+            json!({"command": "npx vitest run", "timeout": 60000}),
+            Mode::Rewrite,
+        );
+        let u = &v["hookSpecificOutput"]["updatedInput"];
+        assert_eq!(u["command"], "calmrun -- npx vitest run");
+        assert_eq!(u["run_in_background"], true);
+        assert_eq!(u["timeout"], 60000);
+        let v = claude(json!({"command": "npx eslint ."}), Mode::Rewrite);
+        let u = &v["hookSpecificOutput"]["updatedInput"];
+        assert_eq!(u["command"], "calmrun --wait-timeout 108 -- npx eslint .");
+        assert!(u.get("run_in_background").is_none());
+    }
+
+    #[test]
+    fn capped_suggestions_parse_as_calmrun_commands() {
+        use clap::Parser;
+        for c in MIXED {
+            let call = Call {
+                command: c,
+                shell: Shell::Posix,
+                limit_ms: Some(120_000),
+                background: false,
+            };
+            let Some(p) = plan(&call, &BTreeMap::new(), "calmrun") else {
+                continue;
+            };
+            let words = crate::shell::tokenize(p.command());
+            let cli = crate::cli::Cli::try_parse_from(&words).unwrap_or_else(|e| panic!("{c}: {e}"));
+            assert_eq!(cli.wait_timeout, Some(108.0), "{c}");
+            let n = words.iter().position(|w| w == "--").unwrap();
+            assert_eq!(disposition(&words[n + 1..], true), Disposition::Queue, "{c}");
+        }
+    }
+
+    #[test]
+    fn powershell_calls_a_quoted_path_with_the_call_operator() {
+        let call = Call {
+            command: "npm test",
+            shell: Shell::PowerShell,
+            limit_ms: None,
+            background: false,
+        };
+        let p = plan(&call, &BTreeMap::new(), r#""C:\My Tools\calmrun.exe""#).unwrap();
+        assert_eq!(p.plain, r#"& "C:\My Tools\calmrun.exe" -- npm test"#);
     }
 
     #[test]

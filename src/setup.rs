@@ -1,7 +1,8 @@
 //! `calmrun setup`: add (or remove) calmrun instructions in coding agents' global instruction
-//! files, between marker comments, and optionally the Claude Code hook.
+//! files, between marker comments, and optionally agents' hooks (see [`hooks`]).
 
-use serde_json::{json, Value};
+pub mod hooks;
+
 use std::path::{Path, PathBuf};
 
 /// Marker before the calmrun block.
@@ -9,8 +10,6 @@ pub const START: &str =
     "<!-- calmrun:start (managed by `calmrun setup`; remove with `calmrun setup --remove --write`) -->";
 /// Marker after the calmrun block.
 pub const END: &str = "<!-- calmrun:end -->";
-/// The hook command `--hook` installs.
-pub const HOOK_COMMAND: &str = "calmrun hook claude";
 
 /// The instructions inside the block.
 pub const BLOCK_BODY: &str = "## Heavy commands (calmrun)
@@ -75,9 +74,6 @@ pub const AGENTS: &[AgentSpec] = &[
         shadowed_by: None,
     },
 ];
-
-/// The agent whose settings get the hook.
-const HOOK_AGENT: &str = "claude";
 
 /// One agent and where its global instructions live on this machine.
 #[derive(Debug, Clone, PartialEq)]
@@ -163,71 +159,14 @@ pub fn without_block(text: &str) -> String {
     }
 }
 
-fn has_hook(settings: &Value) -> bool {
-    settings["hooks"]["PreToolUse"].as_array().is_some_and(|groups| {
-        groups.iter().any(|g| {
-            g["hooks"].as_array().is_some_and(|hs| {
-                hs.iter()
-                    .any(|h| h["command"].as_str().is_some_and(|c| c.contains(HOOK_COMMAND)))
-            })
-        })
-    })
-}
-
-/// Settings with the PreToolUse hook added. `None` when it is already there.
-pub fn merge_hook(mut settings: Value) -> Option<Value> {
-    if has_hook(&settings) {
-        return None;
-    }
-    if !settings.is_object() {
-        settings = json!({});
-    }
-    let hooks = settings
-        .as_object_mut()?
-        .entry("hooks")
-        .or_insert_with(|| json!({}));
-    if !hooks.is_object() {
-        *hooks = json!({});
-    }
-    let pre = hooks
-        .as_object_mut()?
-        .entry("PreToolUse")
-        .or_insert_with(|| json!([]));
-    if !pre.is_array() {
-        *pre = json!([]);
-    }
-    pre.as_array_mut()?.push(json!({
-        "matcher": "Bash|PowerShell",
-        "hooks": [{"type": "command", "command": HOOK_COMMAND}]
-    }));
-    Some(settings)
-}
-
-/// Settings with calmrun's hook removed. `None` when there was none.
-pub fn unmerge_hook(mut settings: Value) -> Option<Value> {
-    if !has_hook(&settings) {
-        return None;
-    }
-    let pre = settings["hooks"]["PreToolUse"].as_array_mut()?;
-    for g in pre.iter_mut() {
-        if let Some(hs) = g["hooks"].as_array_mut() {
-            hs.retain(|h| !h["command"].as_str().is_some_and(|c| c.contains(HOOK_COMMAND)));
-        }
-    }
-    pre.retain(|g| g["hooks"].as_array().is_none_or(|hs| !hs.is_empty()));
-    if pre.is_empty() {
-        if let Some(h) = settings["hooks"].as_object_mut() {
-            h.remove("PreToolUse");
-        }
-    }
-    Some(settings)
-}
-
 /// What `setup` was asked to do.
 pub struct Options {
     pub write: bool,
     pub remove: bool,
-    pub hook: bool,
+    /// Agents whose hook to install or remove (`--hook`): names or `all`.
+    pub hook: Vec<String>,
+    /// How hooks start calmrun: `calmrun`, or its absolute path when it is not on PATH.
+    pub program: String,
     pub agents: Option<Vec<String>>,
     pub home: PathBuf,
 }
@@ -258,6 +197,10 @@ pub fn run(opts: &Options, env: &dyn Fn(&str) -> Option<String>) -> (String, i32
         Ok(c) => c,
         Err(msg) => return (msg, 2),
     };
+    let hook_agents = match hooks::chosen(&opts.hook) {
+        Ok(h) => h,
+        Err(msg) => return (msg, 2),
+    };
     let mut r = Report::default();
     if chosen.is_empty() {
         r.fail(
@@ -268,11 +211,7 @@ pub fn run(opts: &Options, env: &dyn Fn(&str) -> Option<String>) -> (String, i32
     for a in &chosen {
         apply_block(&mut r, a, opts);
     }
-    if opts.hook {
-        if let Some(a) = all.iter().find(|a| a.name == HOOK_AGENT) {
-            apply_hook(&mut r, &a.dir.join("settings.json"), opts);
-        }
-    }
+    hooks::apply(&mut r, opts, &all, &hook_agents);
     if !opts.write {
         if !opts.remove {
             r.text += "\nThe block:\n\n";
@@ -393,50 +332,6 @@ fn apply_block(r: &mut Report, a: &Agent, opts: &Options) {
     }
 }
 
-fn apply_hook(r: &mut Report, path: &Path, opts: &Options) {
-    let text = match read_existing(path) {
-        Ok(t) => t,
-        Err(msg) => return r.fail(msg),
-    };
-    let parsed = if text.trim().is_empty() {
-        Ok(json!({}))
-    } else {
-        serde_json::from_str::<Value>(&text)
-    };
-    let settings = match parsed {
-        Ok(v) => v,
-        Err(e) => {
-            return r.fail(format!(
-                "calmrun: {} is not valid JSON ({e}); left it alone",
-                path.display()
-            ))
-        }
-    };
-    let changed = if opts.remove {
-        unmerge_hook(settings)
-    } else {
-        merge_hook(settings)
-    };
-    let Some(new) = changed else {
-        return r.line(format!("hook      {}: unchanged", path.display()));
-    };
-    let what = if opts.remove { "remove" } else { "add" };
-    r.line(format!(
-        "hook      {}: {}{what} the PreToolUse hook (`{HOOK_COMMAND}`, matcher Bash|PowerShell)",
-        path.display(),
-        verb(opts)
-    ));
-    if !opts.write {
-        return;
-    }
-    let mut s = match serde_json::to_string_pretty(&new) {
-        Ok(s) => s,
-        Err(e) => return r.fail(format!("calmrun: cannot write {}: {e}", path.display())),
-    };
-    s.push('\n');
-    report_write(r, path, write_with_backup(path, &s));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,21 +349,6 @@ mod tests {
         assert_eq!(without_block(&block()), "");
         let middle = format!("a\n\n{}\nb\n", block());
         assert_eq!(without_block(&middle), "a\n\nb\n");
-    }
-
-    #[test]
-    fn hook_merge_keeps_other_settings() {
-        let s = json!({"model": "x", "hooks": {"PreToolUse": [{"matcher": "Edit", "hooks": [{"type": "command", "command": "fmt"}]}]}});
-        let merged = merge_hook(s.clone()).unwrap();
-        assert_eq!(merged["model"], "x");
-        assert_eq!(merged["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
-        assert!(merge_hook(merged.clone()).is_none(), "already there");
-        let back = unmerge_hook(merged).unwrap();
-        assert_eq!(back, s);
-        assert!(unmerge_hook(s).is_none());
-        let fresh = merge_hook(json!({})).unwrap();
-        assert_eq!(fresh["hooks"]["PreToolUse"][0]["matcher"], "Bash|PowerShell");
-        assert_eq!(unmerge_hook(fresh).unwrap(), json!({"hooks": {}}));
     }
 
     #[test]

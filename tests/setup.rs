@@ -71,10 +71,10 @@ fn hook_is_merged_with_a_backup() {
     assert_eq!(code, 0, "{out}");
     let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
     assert_eq!(v["model"], "opus");
-    assert_eq!(
-        v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
-        "calmrun hook claude"
-    );
+    let cmd = v["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    assert!(cmd.contains("calmrun") && cmd.ends_with(" hook claude"), "{cmd}");
     assert!(home.path().join(".claude/settings.json.calmrun.bak").exists());
     let (_, out) = setup(home.path(), &["--write", "--hook", "--agents", "claude"]);
     assert!(out.contains("hook") && out.contains("unchanged"), "{out}");
@@ -104,4 +104,119 @@ fn unknown_agent_is_an_error() {
     let (code, out) = setup(home.path(), &["--agents", "nope"]);
     assert_eq!(code, 2);
     assert!(out.contains("unknown agent"));
+}
+
+fn read_json(path: &Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+#[test]
+fn codex_and_antigravity_hooks_keep_other_entries() {
+    let home = tempfile::tempdir().unwrap();
+    let codex = home.path().join(".codex/hooks.json");
+    let agy = home.path().join(".gemini/config/hooks.json");
+    std::fs::create_dir_all(codex.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(agy.parent().unwrap()).unwrap();
+    let aiws_codex = serde_json::json!({"hooks": {"PreToolUse": [{"matcher": "", "hooks": [
+        {"type": "command", "command": "node aiws.js guard --from codex", "timeout": 30}]}]}});
+    let aiws_agy = serde_json::json!({"aiws-guard": {"PreToolUse": [{"matcher": ".*", "hooks": [
+        {"type": "command", "command": "aiws guard --from antigravity", "timeout": 30}]}]}});
+    std::fs::write(&codex, aiws_codex.to_string()).unwrap();
+    std::fs::write(&agy, aiws_agy.to_string()).unwrap();
+
+    // Dry run first: nothing changes.
+    let (code, out) = setup(home.path(), &["--hook", "codex,antigravity", "--agents", "codex"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("would add the codex PreToolUse hook"), "{out}");
+    assert!(out.contains("/hooks"), "trust note: {out}");
+    assert_eq!(read_json(&codex), aiws_codex);
+
+    let args = ["--write", "--hook", "codex,antigravity", "--agents", "codex"];
+    let (code, out) = setup(home.path(), &args);
+    assert_eq!(code, 0, "{out}");
+    let c = read_json(&codex);
+    assert_eq!(c["hooks"]["PreToolUse"][0], aiws_codex["hooks"]["PreToolUse"][0]);
+    let ours = c["hooks"]["PreToolUse"][1]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    assert!(ours.ends_with(" hook codex"), "{ours}");
+    let a = read_json(&agy);
+    assert_eq!(a["aiws-guard"], aiws_agy["aiws-guard"]);
+    assert_eq!(a["calmrun"]["PreToolUse"][0]["matcher"], "run_command");
+
+    // Again: unchanged, byte for byte (Codex trusts a hook by its hash).
+    let before = std::fs::read(&codex).unwrap();
+    let (_, out) = setup(home.path(), &args);
+    assert_eq!(out.matches("unchanged").count(), 3, "{out}");
+    assert_eq!(std::fs::read(&codex).unwrap(), before);
+
+    let (code, _) = setup(
+        home.path(),
+        &[
+            "--write",
+            "--remove",
+            "--hook",
+            "codex,antigravity",
+            "--agents",
+            "codex",
+        ],
+    );
+    assert_eq!(code, 0);
+    assert_eq!(read_json(&codex), aiws_codex);
+    assert_eq!(read_json(&agy), aiws_agy);
+}
+
+#[test]
+fn opencode_plugin_is_written_and_only_its_own_file_replaced() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join(".config/opencode");
+    std::fs::create_dir_all(&dir).unwrap();
+    let args = ["--write", "--hook", "opencode", "--agents", "opencode"];
+    let (code, out) = setup(home.path(), &args);
+    assert_eq!(code, 0, "{out}");
+    let plugin = dir.join("plugins/calmrun.js");
+    let text = std::fs::read_to_string(&plugin).unwrap();
+    assert!(text.starts_with("// calmrun:plugin"), "{text}");
+    assert!(text.contains(" hook opencode"), "{text}");
+    let (_, out) = setup(home.path(), &args);
+    assert!(out.contains("calmrun.js: unchanged"), "{out}");
+    let (code, _) = setup(
+        home.path(),
+        &[
+            "--write", "--remove", "--hook", "opencode", "--agents", "opencode",
+        ],
+    );
+    assert_eq!(code, 0);
+    assert!(!plugin.exists());
+    // Someone else's calmrun.js is left alone.
+    std::fs::write(
+        &plugin,
+        "export const Mine = 1;
+",
+    )
+    .unwrap();
+    let (code, out) = setup(home.path(), &args);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("not written by calmrun"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(&plugin).unwrap(),
+        "export const Mine = 1;
+"
+    );
+}
+
+#[test]
+fn a_hook_for_a_missing_agent_creates_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+    let (code, out) = setup(home.path(), &["--write", "--hook", "codex", "--agents", "claude"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("is codex installed?"), "{out}");
+    assert!(!home.path().join(".codex").exists());
+    // Under `all`, missing agents are only noted.
+    let (code, out) = setup(home.path(), &["--hook", "all", "--agents", "claude"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("is antigravity installed?"), "{out}");
+    let (code, out) = setup(home.path(), &["--hook", "gemini"]);
+    assert_eq!(code, 2, "{out}");
 }
