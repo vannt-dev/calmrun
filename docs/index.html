@@ -134,6 +134,10 @@
       thead th { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); width: auto; }
       table.kinds th { width: 18%; }
       table.kinds td.n { width: 12%; color: var(--fg); font-weight: 700; font-variant-numeric: tabular-nums; }
+      table.eco { min-width: 640px; }
+      table.eco th { width: 16%; }
+      table.eco td:nth-child(2) { width: 38%; }
+      table.eco td code { white-space: nowrap; }
       ul { margin: 0; padding-left: 20px; }
       li { margin: 4px 0; }
       footer { padding: 32px 0 48px; border-top: 1px solid var(--line); color: var(--muted); font-size: 14px; }
@@ -205,6 +209,15 @@
         th { width: 38%; }
         table { font-size: 14px; }
         th, td { padding: 8px 6px; }
+        /* the ecosystem table becomes one block per ecosystem */
+        table.eco { min-width: 0; }
+        table.eco thead { display: none; }
+        table.eco tr { display: block; padding: 8px 0; border-bottom: 1px solid var(--line); }
+        table.eco th, table.eco td:nth-child(n) { display: block; width: auto; border: 0; padding: 2px 0; }
+        table.eco td:nth-child(3)::before { content: 'Key: '; color: var(--fg); font-weight: 600; }
+        table.eco td:nth-child(4)::before { content: 'Worker hint: '; color: var(--fg); font-weight: 600; }
+        html[lang='vi'] table.eco td:nth-child(3)::before { content: 'Khóa: '; }
+        html[lang='vi'] table.eco td:nth-child(4)::before { content: 'Gợi ý số worker: '; }
       }
     </style>
   </head>
@@ -372,8 +385,9 @@ calmrun: waiting — 4 of 6 points in use, 2nd in line (needs 2); running: npx v
           <div class="card">
             <h3 data-i18n="how.1.h">Points by kind</h3>
             <p data-i18n="how.1">
-              calmrun reads the command and picks a kind: vitest, jest, tsc and builds cost 2 points, linters and plain test runs cost 1.
-              <code>--cost</code> and <code>--kind</code> override it, and your own kinds go in the config.
+              calmrun reads the command and picks a kind: vitest, jest, type checks and builds cost 2 points, monorepo runners 3,
+              linters, plain test runs and a single compiler call 1. <code>--cost</code> and <code>--kind</code> override it, and your own
+              kinds go in the config.
             </p>
           </div>
           <div class="card">
@@ -386,8 +400,9 @@ calmrun: waiting — 4 of 6 points in use, 2nd in line (needs 2); running: npx v
           <div class="card">
             <h3 data-i18n="how.3.h">One run per folder</h3>
             <p data-i18n="how.3">
-              vitest, jest and build jobs take their nearest <code>node_modules</code>; Cargo takes its <code>target</code> folder. Two jobs
-              on the same folder never run together, so caches don't fight.
+              vitest, jest and JavaScript builds take their nearest <code>node_modules</code>, Cargo its <code>target</code> folder, and
+              Gradle, Maven, .NET, CMake, Swift or Flutter builds their project folder. Two jobs on the same folder never run together, so
+              caches and build output don't fight.
             </p>
           </div>
           <div class="card">
@@ -400,8 +415,9 @@ calmrun: waiting — 4 of 6 points in use, 2nd in line (needs 2); running: npx v
           <div class="card">
             <h3 data-i18n="how.5.h">No endless commands</h3>
             <p data-i18n="how.5">
-              Watch modes and attached <code>docker compose up</code> would hold points forever, so calmrun refuses them and prints the
-              one-shot command to run instead. Dev servers run at once, outside the queue.
+              Watch modes (<code>vitest watch</code>, <code>tsc -w</code>, <code>gradle -t</code>, <code>dotnet watch</code>, …) and attached
+              <code>docker compose up</code> would hold points forever, so calmrun refuses them and prints the one-shot command to run
+              instead. Dev servers and app runs start at once, outside the queue.
             </p>
           </div>
           <div class="card">
@@ -423,13 +439,47 @@ calmrun: waiting — 4 of 6 points in use, 2nd in line (needs 2); running: npx v
               <tr><th><code>vitest</code></th><td class="n">2</td><td><code>vitest</code></td></tr>
               <tr><th><code>jest</code></th><td class="n">2</td><td><code>jest</code></td></tr>
               <tr><th><code>tsc</code></th><td class="n">2</td><td><code>tsc</code>, <code>vue-tsc</code>, <code>tsgo</code>, <code>npm run typecheck</code></td></tr>
-              <tr><th><code>build</code></th><td class="n">2</td><td><code>vite/next/ng build</code>, <code>webpack</code>, <code>rollup</code>, <code>esbuild</code>, <code>gradle</code>, <code>mvn</code>, <code>cargo build/check/clippy</code>, <code>go/flutter/dotnet build</code>, <code>npm run build</code></td></tr>
+              <tr><th><code>typecheck</code></th><td class="n">2</td><td><code>mypy</code>, <code>pyright</code>, <code>deno check</code>, <code>phpstan</code>, <code>psalm</code></td></tr>
+              <tr><th><code>build</code></th><td class="n">2</td><td data-i18n="kinds.build"><code>vite/next/ng build</code>, <code>webpack</code>, <code>npm run build</code> and the build tools of every ecosystem below; 1 point for one compiler call (<code>gcc</code>, <code>clang</code>, <code>cl</code>)</td></tr>
+              <tr><th><code>monorepo</code></th><td class="n">3</td><td><code>turbo run</code>, <code>nx run-many/affected</code>, <code>pnpm -r</code>, <code>lerna run</code>, <code>rush build</code>, <code>moon run</code></td></tr>
               <tr><th><code>capture</code></th><td class="n">2</td><td><code>playwright</code>, <code>puppeteer</code>, <code>cypress</code></td></tr>
-              <tr><th><code>docker</code></th><td class="n">2</td><td><code>docker compose up/build/run/create</code>, <code>docker build/run/buildx</code></td></tr>
+              <tr><th><code>docker</code></th><td class="n">2</td><td><code>docker compose up/build/run/create</code>, <code>docker build/run/buildx</code>, <code>podman</code>, <code>buildah build</code>, <code>packer build</code></td></tr>
               <tr><th><code>eslint</code></th><td class="n">1</td><td><code>eslint</code>, <code>oxlint</code>, <code>biome</code>, <code>npm run lint</code></td></tr>
+              <tr><th><code>lint</code></th><td class="n">1</td><td><code>ruff</code>, <code>pylint</code>, <code>flake8</code>, <code>go vet</code>, <code>golangci-lint run</code>, <code>rubocop</code></td></tr>
               <tr><th><code>pytest</code></th><td class="n">1</td><td><code>pytest</code>, <code>python -m pytest</code></td></tr>
-              <tr><th><code>test</code></th><td class="n">1</td><td><code>cargo test</code>, <code>go test</code>, <code>flutter test</code>, <code>dotnet test</code>, <code>npm test</code></td></tr>
+              <tr><th><code>test</code></th><td class="n">1</td><td data-i18n="kinds.test"><code>npm test</code>, <code>tox</code>, <code>mocha</code> and the test runners of every ecosystem below</td></tr>
               <tr><th><code>other</code></th><td class="n">1</td><td data-i18n="kinds.other">anything else</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 data-i18n="eco.h">By ecosystem</h3>
+        <p class="note" data-i18n="eco.sub">
+          <b>Key</b>: the folder two jobs never share (the nearest one holding that file). <b>Worker hint</b>: what calmrun passes so a
+          tool that uses every core takes only its share. A flag or variable you set yourself wins, and tools that run one job at a time
+          unless asked (<code>make</code>, <code>ctest</code>, plain Maven) are left alone. A dash means none.
+        </p>
+        <div class="tbl">
+          <table class="eco">
+            <thead>
+              <tr><th data-i18n="eco.c1">Ecosystem</th><th data-i18n="eco.c2">Tools</th><th data-i18n="eco.c3">Key</th><th data-i18n="eco.c4">Worker hint</th></tr>
+            </thead>
+            <tbody>
+              <tr><th>JavaScript · TypeScript</th><td><code>vitest</code>, <code>jest</code>, <code>tsc</code>, <code>eslint</code>, <code>vite build</code>, <code>webpack</code>, <code>npm test</code>, <code>deno test</code></td><td><code>node_modules</code> (vitest, jest, builds)</td><td><code>--maxWorkers</code> (vitest), <code>DENO_JOBS</code></td></tr>
+              <tr><th>Python</th><td><code>pytest</code>, <code>mypy</code>, <code>pyright</code>, <code>ruff</code>, <code>tox</code>, <code>nox</code></td><td><code>tox.ini</code> (tox)</td><td><code>pytest -n auto</code>, <code>tox -p auto</code> → N</td></tr>
+              <tr><th>Rust</th><td><code>cargo build/check/clippy/test</code>, <code>nextest</code>, <code>maturin</code></td><td><code>target</code></td><td><code>CARGO_BUILD_JOBS</code>, <code>NEXTEST_TEST_THREADS</code></td></tr>
+              <tr><th>Go</th><td><code>go build/test/vet</code>, <code>golangci-lint</code></td><td>–</td><td><code>-p N</code>, <code>--concurrency N</code></td></tr>
+              <tr><th>C · C++</th><td><code>make</code>, <code>cmake --build</code>, <code>ctest</code>, <code>ninja</code>, <code>meson</code>, <code>bazel</code>, <code>buck2</code>, <code>scons</code>, <code>xmake</code>, <code>gcc</code>, <code>clang</code>, <code>cl</code></td><td><code>Makefile</code>, <code>CMakeCache.txt</code>, <code>build.ninja</code>, <code>MODULE.bazel</code>, …</td><td><code>--parallel N</code>, <code>-jN</code>, <code>--jobs=N</code></td></tr>
+              <tr><th>JVM</th><td><code>gradle</code>, <code>mvn</code>, <code>mvnd</code>, <code>sbt</code>, <code>ant</code></td><td><code>settings.gradle</code>, <code>pom.xml</code>, <code>build.sbt</code></td><td><code>--max-workers=N</code>, <code>-T N</code> (mvnd)</td></tr>
+              <tr><th>.NET</th><td><code>dotnet build/test/publish</code>, <code>msbuild</code></td><td><code>*.sln</code>, <code>*.csproj</code>, …</td><td><code>-m:N</code> (dotnet)</td></tr>
+              <tr><th>Swift · Xcode</th><td><code>swift build/test</code>, <code>xcodebuild</code></td><td><code>Package.swift</code>, <code>*.xcodeproj</code></td><td><code>-j N</code>, <code>-jobs N</code></td></tr>
+              <tr><th>Flutter · Dart</th><td><code>flutter build/test</code>, <code>dart test</code>, <code>build_runner</code></td><td><code>pubspec.yaml</code></td><td><code>--concurrency=N</code> (tests)</td></tr>
+              <tr><th>Ruby</th><td><code>rspec</code>, <code>cucumber</code>, <code>rake test</code>, <code>rails test</code>, <code>parallel_rspec</code>, <code>rubocop</code></td><td>–</td><td><code>PARALLEL_WORKERS</code>, <code>PARALLEL_TEST_PROCESSORS</code></td></tr>
+              <tr><th>PHP</th><td><code>phpunit</code>, <code>pest</code>, <code>paratest</code>, <code>composer test</code>, <code>artisan test</code>, <code>phpstan</code></td><td>–</td><td><code>--processes=N</code> (paratest)</td></tr>
+              <tr><th>Elixir · Erlang</th><td><code>mix test/compile</code>, <code>rebar3</code></td><td><code>mix.exs</code>, <code>rebar.config</code></td><td><code>--max-cases N</code> (mix test)</td></tr>
+              <tr><th>Haskell · OCaml · Zig</th><td><code>stack</code>, <code>cabal</code>, <code>dune</code>, <code>zig build</code></td><td><code>stack.yaml</code>, <code>cabal.project</code>, <code>dune-project</code>, <code>build.zig</code></td><td><code>-j N</code></td></tr>
+              <tr><th data-i18n="eco.mono">Monorepo runners</th><td><code>turbo</code>, <code>nx</code>, <code>lerna</code>, <code>pnpm -r</code>, <code>rush</code>, <code>moon</code></td><td><code>node_modules</code></td><td data-i18n="eco.mono.hint">their concurrency flag or variable; turbo, nx and pnpm never above their own default</td></tr>
+              <tr><th data-i18n="eco.ctr">Containers</th><td><code>docker</code> / <code>podman</code> <code>compose</code>, <code>build</code>; <code>buildah</code>, <code>packer</code></td><td>–</td><td>–</td></tr>
             </tbody>
           </table>
         </div>
@@ -508,7 +558,10 @@ tool_timeout_sec = 3600
 This machine is shared by several agents. Run heavy commands
 through the calmrun queue: `calmrun -- &lt;command&gt;` (tests, type
 checks, linters, builds, Playwright, docker compose, pytest,
-cargo/gradle builds). Example: `calmrun -- npx vitest run`.
+cargo/gradle/make/dotnet/go builds).
+Example: `calmrun -- npx vitest run`.
+Run anything that may take more than a minute or two in the
+background and check on it later.
 Use `calmrun status` to see what is running or waiting.
 Do not wrap light commands (git, ls, cat, package installs).</pre>
           </div>
@@ -706,19 +759,19 @@ patterns = ["make", "bazel build"]</pre>
             'Ngân sách mặc định là số lõi logic − 2, tối đa một điểm cho mỗi 4 GB RAM, ít nhất 2. <code>calmrun doctor</code> cho biết các con số trên máy của bạn.',
           'how.1.h': 'Điểm theo loại lệnh',
           'how.1':
-            'calmrun đọc lệnh và chọn loại: vitest, jest, tsc và build tốn 2 điểm, linter và các lần chạy test thường tốn 1. <code>--cost</code> và <code>--kind</code> ghi đè cách chọn này, còn loại lệnh của riêng bạn thì khai báo trong file cấu hình.',
+            'calmrun đọc lệnh và chọn loại: vitest, jest, kiểm tra kiểu và build tốn 2 điểm, công cụ chạy monorepo tốn 3, còn linter, các lần chạy test thường và một lần gọi trình biên dịch đơn lẻ tốn 1. <code>--cost</code> và <code>--kind</code> ghi đè cách chọn này, còn loại lệnh của riêng bạn thì khai báo trong file cấu hình.',
           'how.2.h': 'Điều kiện RAM và ổ đĩa',
           'how.2':
             'Một việc cũng phải chờ khi RAM trống ít hơn <code>min_free_gb</code> hoặc ổ đĩa của nó còn ít hơn <code>min_free_disk_gb</code>. Khi máy không chạy gì khác thì nó vẫn bắt đầu, nên không việc nào phải chờ mãi.',
           'how.3.h': 'Mỗi thư mục một lần chạy',
           'how.3':
-            'Việc vitest, jest và build giữ thư mục <code>node_modules</code> gần nhất; Cargo giữ thư mục <code>target</code>. Hai việc trên cùng một thư mục không bao giờ chạy cùng lúc, nên cache không giành nhau.',
+            'Việc vitest, jest và build JavaScript giữ thư mục <code>node_modules</code> gần nhất, Cargo giữ thư mục <code>target</code>, còn build của Gradle, Maven, .NET, CMake, Swift hay Flutter giữ thư mục project. Hai việc trên cùng một thư mục không bao giờ chạy cùng lúc, nên cache và kết quả build không giành nhau.',
           'how.4.h': 'Ưu tiên thấp, bộ nhớ có giới hạn',
           'how.4':
             'Lệnh chạy dưới mức ưu tiên thường (<code>nice +10</code> trên Unix), nên trình soạn thảo vẫn mượt. Việc nào có cây tiến trình dùng quá <code>ceiling_gb</code> sẽ bị dừng với mã thoát 137.',
           'how.5.h': 'Không nhận lệnh chạy mãi',
           'how.5':
-            'Chế độ watch và <code>docker compose up</code> không có <code>-d</code> sẽ giữ điểm mãi mãi, nên calmrun từ chối và in ra lệnh chạy một lần để dùng thay. Dev server thì chạy ngay, không qua hàng chờ.',
+            'Chế độ watch (<code>vitest watch</code>, <code>tsc -w</code>, <code>gradle -t</code>, <code>dotnet watch</code>, …) và <code>docker compose up</code> không có <code>-d</code> sẽ giữ điểm mãi mãi, nên calmrun từ chối và in ra lệnh chạy một lần để dùng thay. Dev server và lệnh chạy ứng dụng thì bắt đầu ngay, không qua hàng chờ.',
           'how.6.h': 'Vé chờ, tài nguyên, hàng riêng',
           'how.6':
             '<code>--wait-timeout</code> thôi chờ sau một khoảng thời gian (mã thoát 75) và giữ chỗ trong hàng 10 phút dưới dạng một vé. <code>--needs db</code> giữ một tài nguyên có tên; <code>--id</code> dùng một hàng chờ riêng.',
@@ -727,6 +780,19 @@ patterns = ["make", "bazel build"]</pre>
           'kinds.c2': 'Điểm',
           'kinds.c3': 'Nhận ra từ',
           'kinds.other': 'mọi lệnh khác',
+          'kinds.build':
+            '<code>vite/next/ng build</code>, <code>webpack</code>, <code>npm run build</code> và các công cụ build của mọi hệ sinh thái bên dưới; một lần gọi trình biên dịch (<code>gcc</code>, <code>clang</code>, <code>cl</code>) chỉ tốn 1 điểm',
+          'kinds.test': '<code>npm test</code>, <code>tox</code>, <code>mocha</code> và các trình chạy test của mọi hệ sinh thái bên dưới',
+          'eco.h': 'Theo hệ sinh thái',
+          'eco.sub':
+            '<b>Khóa</b>: thư mục mà hai việc không bao giờ dùng chung (thư mục gần nhất chứa file đó). <b>Gợi ý số worker</b>: giá trị calmrun truyền vào để một công cụ vốn dùng hết mọi lõi chỉ lấy phần của nó. Cờ hay biến môi trường do bạn tự đặt luôn được ưu tiên, còn công cụ mặc định chạy từng việc một (<code>make</code>, <code>ctest</code>, Maven thường) thì được để nguyên. Dấu gạch nghĩa là không có.',
+          'eco.c1': 'Hệ sinh thái',
+          'eco.c2': 'Công cụ',
+          'eco.c3': 'Khóa',
+          'eco.c4': 'Gợi ý số worker',
+          'eco.mono': 'Công cụ chạy monorepo',
+          'eco.mono.hint': 'cờ hoặc biến song song của từng công cụ; turbo, nx và pnpm không bao giờ vượt mức mặc định của chính chúng',
+          'eco.ctr': 'Container',
           'ag.h2': 'Tích hợp với agent',
           'ag.sub':
             'Agent không cần nhớ gì cả: hook của Claude Code bắt các lệnh shell nặng, MCP server cho mọi client MCP một công cụ <code>run_task</code> có xếp hàng, còn <code>setup</code> ghi hướng dẫn vào file toàn cục của từng agent.',

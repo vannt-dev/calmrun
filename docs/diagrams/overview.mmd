@@ -1,0 +1,29 @@
+%% Re-render both SVGs after editing (from the repository root):
+%% npx -y @mermaid-js/mermaid-cli@12.2.0 -i docs/diagrams/overview.mmd -c docs/diagrams/mermaid.config.json -b transparent -t default -o docs/diagrams/overview-light.svg
+%% npx -y @mermaid-js/mermaid-cli@12.2.0 -i docs/diagrams/overview.mmd -c docs/diagrams/mermaid.config.json -b transparent -t dark -o docs/diagrams/overview-dark.svg
+flowchart TD
+  src["Several agents and terminals<br/>on one machine"]
+  hook["Claude Code hook<br/>a heavy command without calmrun:<br/>denies it with the wrapped form,<br/>or rewrites it"]
+  entry["calmrun -- cmd<br/>or the MCP tool run_task"]
+  check(["Command rules:<br/>endless or light?"])
+  refuse["Watch mode: refused, exit 2<br/>prints the one-shot form<br/>vitest run, compose up -d"]
+  light["Dev server or app run<br/>starts at once,<br/>outside the queue"]
+  detect["Detect from the command<br/>kind and cost, exclusive key,<br/>worker hint for its share"]
+  queue["Machine-wide queue<br/>one state file under an OS lock<br/>prio high first, then first come"]
+  gates["Starts when all gates hold<br/>budget points free<br/>enough free RAM and disk<br/>its exclusive key is free<br/>a named resource slot is free"]
+  ticket["--wait-timeout passed:<br/>exit 75, place kept<br/>as a ticket"]
+  run["Runs at low CPU priority<br/>process-tree memory ceiling:<br/>above it, stopped with exit 137"]
+  done["Its exit code passed back<br/>history for calmrun stats"]
+
+  src -- "calmrun -- cmd" --> entry
+  src -. "heavy command" .-> hook
+  hook -- "wrapped" --> entry
+  entry --> check
+  check -- "watch mode" --> refuse
+  check -- "dev server" --> light
+  check -- "one-shot" --> detect
+  detect --> queue
+  queue --> gates
+  gates -. "still waiting" .-> ticket
+  gates -- "admitted" --> run
+  run --> done
