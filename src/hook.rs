@@ -237,7 +237,10 @@ pub fn wrap_with(
     let mut out = String::with_capacity(cmd.len() + 16);
     let mut last = 0;
     let mut found = Vec::new();
-    for r in split_segments(cmd).into_iter().flat_map(|r| pieces(cmd, r)) {
+    for r in split_segments(cmd)
+        .into_iter()
+        .flat_map(|r| commands(cmd, r, kinds))
+    {
         let Some((range, text, kinds_here)) = wrap_piece(cmd, r, kinds, program) else {
             continue;
         };
@@ -318,6 +321,22 @@ fn shell_script(seg: &str, spans: &[Word], start: usize, program: &str) -> Optio
     let raw = seg[w.start..end].trim_end();
     let q = raw.chars().next().filter(|c| matches!(c, '"' | '\''))?;
     (raw.len() >= 2 && raw.ends_with(q) && !program.contains(q)).then(|| w.start + 1..w.start + raw.len() - 1)
+}
+
+/// The commands of one segment: the whole segment when it is a command calmrun judges
+/// (`npx jest src/{a,b} --watch`, `docker compose -f $(pwd)/c.yml up`), else the commands
+/// inside its blocks (`if ($?) { npm test }`, `echo $(npm test)`), see [`pieces`].
+fn commands(cmd: &str, r: Range<usize>, kinds: &BTreeMap<String, KindConfig>) -> Vec<Range<usize>> {
+    let words = crate::shell::tokenize(&cmd[r.clone()]);
+    let whole = already_wrapped(&words)
+        || !matches!(disposition(&words, true), Disposition::Queue)
+        || parse(&words)
+            .is_some_and(|p| detect_words(&words, kinds).kind.is_some() || SHELLS.contains(&p.tool.as_str()));
+    if whole {
+        vec![r]
+    } else {
+        pieces(cmd, r)
+    }
 }
 
 /// The commands inside one segment: split again at unquoted braces and parentheses, so a
@@ -793,6 +812,38 @@ mod tests {
             ("pnpm -C web build", "calmrun -- pnpm -C web build"),
             ("node --test test/", "calmrun -- node --test test/"),
             ("node --test --watch", "calmrun -- node --test"),
+        ] {
+            assert_eq!(w(c).as_deref(), Some(want), "{c}");
+        }
+        // Every `calmrun -- …` written into a block runs a command calmrun accepts.
+        for c in [
+            r"cd F:\x; if ($?) { npx vitest }",
+            "try { npx jest --watch } catch { }",
+            "for d in a b; do npx vitest --watch; done",
+            "echo $(docker compose up)",
+            "bash -c 'npx vitest'",
+        ] {
+            let w = w(c).unwrap_or_else(|| panic!("{c}"));
+            for part in w.split("calmrun -- ").skip(1) {
+                let end = part
+                    .find([';', '}', ')', '&', '|', '"', '\''])
+                    .unwrap_or(part.len());
+                let words = crate::shell::tokenize(&part[..end]);
+                assert_eq!(disposition(&words, true), Disposition::Queue, "{c} -> {w}");
+            }
+        }
+        // A whole command calmrun judges is not split at its braces or `$(...)`.
+        for (c, want) in [
+            ("npx jest src/{a,b} --watch", "calmrun -- npx jest src/{a,b}"),
+            ("npx tsc -p $(pwd) --watch", "calmrun -- npx tsc -p $(pwd)"),
+            (
+                "docker compose -f $(pwd)/c.yml up --build",
+                "calmrun -- docker compose -f $(pwd)/c.yml up -d --build",
+            ),
+            (
+                "npm --prefix $(git rev-parse --show-toplevel) test",
+                "calmrun -- npm --prefix $(git rev-parse --show-toplevel) test",
+            ),
         ] {
             assert_eq!(w(c).as_deref(), Some(want), "{c}");
         }

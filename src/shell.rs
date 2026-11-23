@@ -31,6 +31,8 @@ pub fn words(s: &str) -> Vec<Word> {
     let mut cur = String::new();
     let mut start: Option<usize> = None;
     let mut quote: Option<char> = None;
+    // Open parentheses of a `$( … )` command substitution, inside which spaces do not split.
+    let mut depth = 0usize;
     let mut chars = s.char_indices().peekable();
     while let Some((i, c)) = chars.next() {
         let next = chars.peek().map(|&(_, n)| n);
@@ -41,7 +43,7 @@ pub fn words(s: &str) -> Vec<Word> {
                 cur.push('"');
             }
             Some(_) => cur.push(c),
-            None if c.is_whitespace() => {
+            None if c.is_whitespace() && depth == 0 => {
                 if let Some(st) = start.take() {
                     out.push(Word {
                         text: std::mem::take(&mut cur),
@@ -53,6 +55,20 @@ pub fn words(s: &str) -> Vec<Word> {
                 start.get_or_insert(i);
                 match c {
                     '"' | '\'' => quote = Some(c),
+                    // `$(git rev-parse --show-toplevel)` is one word.
+                    '$' if next == Some('(') => {
+                        chars.next();
+                        cur.push_str("$(");
+                        depth += 1;
+                    }
+                    '(' if depth > 0 => {
+                        depth += 1;
+                        cur.push(c);
+                    }
+                    ')' if depth > 0 => {
+                        depth -= 1;
+                        cur.push(c);
+                    }
                     '\\' if next == Some(' ') => {
                         chars.next();
                         cur.push(' ');
@@ -292,6 +308,16 @@ mod tests {
             ["FOO=a b", "BAR=x\"y z", "npx", "jest"]
         );
         assert_eq!(&s[w[2].start..], "npx jest");
+    }
+
+    #[test]
+    fn command_substitution_is_one_word() {
+        assert_eq!(
+            tokenize("npm --prefix $(git rev-parse --show-toplevel) test"),
+            vec!["npm", "--prefix", "$(git rev-parse --show-toplevel)", "test"]
+        );
+        assert_eq!(tokenize("a $(b $(c d) e) f"), vec!["a", "$(b $(c d) e)", "f"]);
+        assert_eq!(tokenize("(a b)"), vec!["(a", "b)"]);
     }
 
     #[test]

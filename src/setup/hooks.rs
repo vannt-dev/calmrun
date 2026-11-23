@@ -249,6 +249,12 @@ fn apply_json(r: &mut Report, p: &Place, opts: &Options) {
              review it with /hooks in Codex"
                 .into(),
         );
+        r.line(
+            "          note: Codex's workspace-write sandbox must let calmrun write its state \
+             directory: add it (`calmrun doctor` shows it) to \
+             sandbox_workspace_write.writable_roots in config.toml"
+                .into(),
+        );
     }
     if !opts.write {
         return;

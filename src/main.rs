@@ -64,7 +64,7 @@ fn dispatch(cli: Cli) -> i32 {
                 write,
                 remove,
                 hook: hook.clone().unwrap_or_default(),
-                program: crate::hook::program_name().replace('\\', "/"),
+                program: crate::hook::program_name(),
                 agents: agents.clone(),
                 home,
             })

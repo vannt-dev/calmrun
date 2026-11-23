@@ -106,6 +106,9 @@ fn watch_mode_is_refused_with_the_one_shot_command() {
     let err = String::from_utf8_lossy(&out.stderr);
     let exe_name = Path::new(EXE).file_name().unwrap().to_string_lossy().to_string();
     assert!(!err.contains("next: calmrun -- "), "{err}");
+    // Forward slashes: Git Bash, an agent's Bash tool on Windows, eats backslashes.
+    let next = err.lines().find(|l| l.starts_with("calmrun: next: ")).unwrap();
+    assert!(!next.contains('\\'), "{next}");
     // The same one-shot form the agent hook suggests.
     assert!(err.contains(&format!("{exe_name} -- npx vitest run")), "{err}");
 }
