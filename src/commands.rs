@@ -277,7 +277,7 @@ pub fn release(mut ctx: Ctx, a: &ReleaseArgs) -> i32 {
             }
             Ok(None) => {
                 eprintln!(
-                    "calmrun: note: no place is kept for ticket {t} (expired, resumed or unknown);                      `calmrun status{}` lists the kept ones",
+                    "calmrun: note: no place is kept for ticket {t} (expired, resumed or unknown); `calmrun status{}` lists the kept ones",
                     queue_flag(&ctx)
                 );
                 0
