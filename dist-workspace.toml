@@ -19,6 +19,11 @@ install-path = "CARGO_HOME"
 install-updater = false
 # Which actions to run on pull requests
 pr-run-mode = "skip"
+# npm is published by our own job (trusted publishing, no token)
+publish-jobs = ["./publish-npm"]
+# dist 0.34 on Windows writes this job's path as "$/..." in release.yml; that line is fixed
+# by hand, so the generated-file check is skipped for CI.
+allow-dirty = ["ci"]
 
 # Pin the actions used by the release workflow to full commit SHAs
 [dist.github-action-commits]

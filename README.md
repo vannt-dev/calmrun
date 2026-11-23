@@ -3,6 +3,8 @@
 [![CI](https://github.com/vannt-dev/calmrun/actions/workflows/ci.yml/badge.svg)](https://github.com/vannt-dev/calmrun/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/vannt-dev/calmrun)](https://github.com/vannt-dev/calmrun/releases/latest)
+[![crates.io](https://img.shields.io/crates/v/calmrun)](https://crates.io/crates/calmrun)
+[![npm](https://img.shields.io/npm/v/calmrun)](https://www.npmjs.com/package/calmrun)
 
 A machine-wide queue for heavy commands, so several coding agents and terminals on one computer
 don't run `vitest`, `tsc`, builds, Playwright and `docker compose` all at once and freeze it.
