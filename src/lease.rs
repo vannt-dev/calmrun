@@ -51,8 +51,15 @@ pub struct HoldArgs {
 #[derive(Debug, clap::Args)]
 pub struct ReleaseArgs {
     /// The id `calmrun hold` printed.
-    #[arg(value_name = "LEASE")]
-    pub lease: String,
+    #[arg(
+        value_name = "LEASE",
+        required_unless_present = "ticket",
+        conflicts_with = "ticket"
+    )]
+    pub lease: Option<String>,
+    /// Instead: give up the place in line kept for this ticket (by a --wait-timeout run).
+    #[arg(long, value_name = "ID")]
+    pub ticket: Option<u64>,
 }
 
 /// Whether `id` looks like a lease id (six hex digits). Returns it in lower case.
@@ -82,6 +89,16 @@ pub fn release(ctx: &mut Ctx, id: &str) -> Result<Option<Lease>> {
     locked(&store, &mut ctx.sys, |s| {
         let at = s.leases.iter().position(|l| l.id == id)?;
         Some(s.leases.remove(at))
+    })
+}
+
+/// Drop the place kept for ticket `id`. Returns the entry, or `None` when no place is kept
+/// under that id (expired, already resumed, or unknown).
+pub fn drop_ticket(ctx: &mut Ctx, id: u64) -> Result<Option<crate::state::Job>> {
+    let store = ctx.store()?;
+    locked(&store, &mut ctx.sys, |s| {
+        let at = s.jobs.iter().position(|j| j.id == id && j.parked())?;
+        Some(s.jobs.remove(at))
     })
 }
 

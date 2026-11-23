@@ -3,7 +3,7 @@
 use crate::cli::{Cli, HookTarget, Prio, ProbeArgs};
 use crate::config::{self, bytes_to_gb};
 use crate::error::Error;
-use crate::lease::{self, HoldArgs};
+use crate::lease::{self, HoldArgs, ReleaseArgs};
 use crate::queue::{self, now_ms, Ctx};
 use crate::state::{Job, State};
 use crate::{doctor, history, hook, kinds, runner, scheduler, setup, status, sys};
@@ -116,18 +116,31 @@ pub fn status(mut ctx: Ctx, as_json: bool) -> i32 {
     if let Some(q) = &ctx.queue {
         println!("queue: {q}");
     }
+    let num = |k: &str| v[k].as_u64().unwrap_or(0);
     println!(
-        "budget: {} of {} points in use · free RAM {:.1} GB (starts need {:.1} GB)",
-        v["used"].as_u64().unwrap_or(0),
-        ctx.cfg.budget,
-        bytes_to_gb(v["free_ram_bytes"].as_u64().unwrap_or(0)),
-        bytes_to_gb(ctx.cfg.min_free_bytes)
+        "budget: {} of {} points in use, free RAM {:.1} GB (starts need {:.1} GB)",
+        num("used"),
+        num("budget"),
+        bytes_to_gb(num("free_ram_bytes")),
+        bytes_to_gb(num("min_free_bytes"))
     );
-    print_jobs(&state, now_ms());
+    let why = |id: u64| {
+        v["waiting"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|w| w["id"].as_u64() == Some(id))
+            .and_then(|w| w["why"].as_str())
+            .map(str::to_string)
+    };
+    print_jobs(&state, now_ms(), &why);
+    for w in v["warnings"].as_array().into_iter().flatten() {
+        println!("warning: {}", w.as_str().unwrap_or_default());
+    }
     0
 }
 
-fn print_jobs(state: &State, now: u64) {
+fn print_jobs(state: &State, now: u64, why: &dyn Fn(u64) -> Option<String>) {
     let header = |first: &str, time: &str| {
         println!(
             "  {first:<4} {:<24} {:<8} {:>4} {:>7}  {time:>7}  cwd",
@@ -159,6 +172,9 @@ fn print_jobs(state: &State, now: u64) {
     }
     for (i, j) in waiting.iter().enumerate() {
         row(j, format!("{}{}", i + 1, if j.high { "!" } else { "" }));
+        if let Some(w) = why(j.id) {
+            println!("       waits for: {w}");
+        }
     }
     if !state.leases.is_empty() {
         println!("leases ({}):", state.leases.len());
@@ -180,13 +196,13 @@ fn print_jobs(state: &State, now: u64) {
     }
     let kept: Vec<&Job> = state.jobs.iter().filter(|j| j.parked()).collect();
     if !kept.is_empty() {
-        println!("kept for a ticket ({}):", kept.len());
+        println!(
+            "kept for a ticket ({}; `calmrun release --ticket <id>` gives one up):",
+            kept.len()
+        );
     }
     for j in kept {
         println!("  {}", crate::messages::kept_line(j, now));
-    }
-    for w in crate::messages::stuck_warnings(state, now, status::STUCK_MS) {
-        println!("warning: {w}");
     }
 }
 
@@ -248,8 +264,28 @@ pub fn hold(mut ctx: Ctx, a: &HoldArgs) -> i32 {
     }
 }
 
-/// `calmrun release <lease>`.
-pub fn release(mut ctx: Ctx, raw: &str) -> i32 {
+/// `calmrun release <lease>` and `calmrun release --ticket <id>`.
+pub fn release(mut ctx: Ctx, a: &ReleaseArgs) -> i32 {
+    if let Some(t) = a.ticket {
+        return match lease::drop_ticket(&mut ctx, t) {
+            Ok(Some(j)) => {
+                eprintln!(
+                    "calmrun: dropped ticket {t} ({}); its place in line is gone",
+                    j.label
+                );
+                0
+            }
+            Ok(None) => {
+                eprintln!(
+                    "calmrun: note: no place is kept for ticket {t} (expired, resumed or unknown);                      `calmrun status{}` lists the kept ones",
+                    queue_flag(&ctx)
+                );
+                0
+            }
+            Err(e) => fail(&e),
+        };
+    }
+    let raw = a.lease.as_deref().unwrap_or_default();
     let Some(id) = lease::parse_id(raw) else {
         return bad_lease_id(raw);
     };
@@ -315,7 +351,7 @@ pub fn doctor(ctx: Ctx) -> i32 {
 pub fn stats(days: u32, as_json: bool) -> i32 {
     const DAY_MS: u64 = 86_400_000;
     let home = config::home_dir();
-    let text = std::fs::read_to_string(home.join("history.jsonl")).unwrap_or_default();
+    let text = history::read_all(&home.join("history.jsonl"));
     let rows = history::summarize(&text, now_ms().saturating_sub(days as u64 * DAY_MS));
     if as_json {
         println!("{}", serde_json::to_string_pretty(&rows).unwrap_or_default());
@@ -326,27 +362,27 @@ pub fn stats(days: u32, as_json: bool) -> i32 {
         return 0;
     }
     println!("last {days} days:");
-    let line = |a: &str, b: &str, c: String, d: String, e: String, f: String, g: String| {
-        println!("  {a:<24} {b:<8} {c:>5} {d:>5} {e:>9} {f:>9} {g:>9}");
+    let line = |a: &str, b: &str, cols: [String; 6]| {
+        let [c, d, e, f, g, h] = cols;
+        println!("  {a:<24} {b:<8} {c:>5} {d:>5} {e:>9} {f:>9} {g:>9} {h:>7}");
     };
     line(
         "label",
         "kind",
-        "runs".into(),
-        "fail".into(),
-        "avg wait".into(),
-        "max wait".into(),
-        "avg run".into(),
+        ["runs", "fail", "avg wait", "max wait", "avg run", "gave up"].map(String::from),
     );
     for r in rows {
         line(
             &r.label,
             &r.kind,
-            r.runs.to_string(),
-            r.failures.to_string(),
-            history::human_ms(r.avg_wait_ms),
-            history::human_ms(r.max_wait_ms),
-            history::human_ms(r.avg_run_ms),
+            [
+                r.runs.to_string(),
+                r.failures.to_string(),
+                history::human_ms(r.avg_wait_ms),
+                history::human_ms(r.max_wait_ms),
+                history::human_ms(r.avg_run_ms),
+                r.gave_up.to_string(),
+            ],
         );
     }
     0
@@ -386,7 +422,7 @@ pub fn hook(target: &HookTarget) -> i32 {
 fn queue_load() -> Option<String> {
     let mut ctx = Ctx::load().ok()?;
     let state = status::snapshot(&mut ctx).ok()?;
-    let budget = ctx.cfg.budget;
+    let budget = queue::effective_limits(ctx.limits(), &state).budget;
     let used = scheduler::used_points(&state.jobs, budget) + scheduler::leased_points(&state.leases, budget);
     let waiting = scheduler::waiting_in_order(&state.jobs).len();
     Some(format!(

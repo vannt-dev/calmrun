@@ -29,7 +29,7 @@ use cli::{Cli, Sub};
 use queue::Ctx;
 
 fn main() {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(cli::id_flag_first(std::env::args_os().collect()));
     std::process::exit(dispatch(cli));
 }
 
@@ -48,7 +48,7 @@ fn dispatch(cli: Cli) -> i32 {
         Some(Sub::Stats { days, json }) => commands::stats(days, json),
         Some(Sub::Bump { ref label }) => with_ctx(&|c| commands::bump(c, label)),
         Some(Sub::Hold(ref a)) => with_ctx(&|c| commands::hold(c, a)),
-        Some(Sub::Release(ref a)) => with_ctx(&|c| commands::release(c, &a.lease)),
+        Some(Sub::Release(ref a)) => with_ctx(&|c| commands::release(c, a)),
         Some(Sub::Doctor) => with_ctx(&commands::doctor),
         Some(Sub::Hook { ref target }) => commands::hook(target),
         Some(Sub::Init { force }) => commands::init(force),
