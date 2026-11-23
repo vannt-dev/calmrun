@@ -339,7 +339,9 @@ fn prepare(ctx: &Ctx, mut req: Request) -> std::result::Result<Prepared, Box<Out
         detect::Disposition::Queue => {}
         detect::Disposition::Light(what) => light = Some(what),
         detect::Disposition::Refuse { reason, fixed } => {
-            let msg = messages::refused(&reason, fixed.as_deref());
+            // The same one-shot form the agent hook suggests (`npx vitest run`).
+            let fixed = fixed.map(|f| detect::accepted_form(f.clone()).unwrap_or(f));
+            let msg = messages::refused(&reason, fixed.as_deref(), &runner::program_name());
             return Err(Box::new(Outcome::default().ended(
                 EXIT_REFUSED,
                 "refused",

@@ -93,7 +93,21 @@ fn watch_mode_is_refused_with_the_one_shot_command() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("calmrun: next: calmrun -- npx tsc -p ."), "{err}");
+    assert!(err.contains("calmrun: next: "), "{err}");
+    assert!(err.contains(" -- npx tsc -p ."), "{err}");
+    // Not on PATH: the next command names calmrun's own path, so it runs as printed.
+    let empty = tempfile::tempdir().unwrap();
+    let out = calmrun(home.path())
+        .args(["--", "npx", "vitest", "--watch"])
+        .env("PATH", empty.path())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let exe_name = Path::new(EXE).file_name().unwrap().to_string_lossy().to_string();
+    assert!(!err.contains("next: calmrun -- "), "{err}");
+    // The same one-shot form the agent hook suggests.
+    assert!(err.contains(&format!("{exe_name} -- npx vitest run")), "{err}");
 }
 
 #[test]
@@ -163,11 +177,13 @@ fn hook_suggests_an_absolute_path_when_calmrun_is_not_on_path() {
         "tool_input": {"command": "npx vitest run"}
     })
     .to_string();
+    let state = tempfile::tempdir().unwrap();
     let run = |path: &std::ffi::OsStr| {
         use std::io::Write;
         let mut c = Command::new(EXE)
             .args(["hook", "claude"])
             .env("PATH", path)
+            .env("CALMRUN_HOME", state.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -192,7 +208,11 @@ fn hook_suggests_an_absolute_path_when_calmrun_is_not_on_path() {
     let bin = tempfile::tempdir().unwrap();
     std::fs::copy(EXE, bin.path().join(&exe_name)).unwrap();
     let reason = run(bin.path().as_os_str());
-    assert!(reason.contains("\ncalmrun -- npx vitest run\n"), "{reason}");
+    assert!(
+        reason.contains("\ncalmrun --wait-timeout 108 -- npx vitest run\n"),
+        "{reason}"
+    );
+    assert!(reason.contains("\nQueue now: 0 of "), "{reason}");
 }
 
 #[cfg(windows)]

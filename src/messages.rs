@@ -138,9 +138,10 @@ pub fn wait_timeout(
 }
 
 /// The refusal for an attached `docker compose up`, with the fixed command when possible.
-pub fn refused(reason: &str, fixed: Option<&[String]>) -> String {
+/// `program` starts calmrun (`calmrun`, or its path when it is not on PATH).
+pub fn refused(reason: &str, fixed: Option<&[String]>, program: &str) -> String {
     let next = match fixed {
-        Some(f) => format!("calmrun -- {}", f.join(" ")),
+        Some(f) => format!("{program} -- {}", f.join(" ")),
         None => "run it outside calmrun".to_string(),
     };
     format!("calmrun: refused: {reason}.\ncalmrun: next: {next}")

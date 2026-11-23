@@ -115,17 +115,32 @@ fn skip_flags(words: &[String], mut i: usize, value_flags: &[&str]) -> usize {
     i
 }
 
-/// Index of the first word after env assignments and wrappers.
+/// Shell keywords a command can follow in a segment (`if npm test`, `then npm test`).
+const SHELL_KEYWORDS: &[&str] = &["if", "then", "else", "elif", "while", "until", "do", "!"];
+
+/// A `timeout` duration: `600`, `10s`, `1.5m`, `2h`, `1d`.
+fn is_duration(w: &str) -> bool {
+    let num = w.strip_suffix(['s', 'm', 'h', 'd']).unwrap_or(w);
+    !num.is_empty() && num.chars().all(|c| c.is_ascii_digit() || c == '.') && num.parse::<f64>().is_ok()
+}
+
+/// Index of the first word after env assignments, shell keywords and wrappers.
 fn command_start(words: &[String]) -> Option<usize> {
     let mut i = 0;
     loop {
         let w = words.get(i)?;
-        if is_assignment(w) {
+        if is_assignment(w) || SHELL_KEYWORDS.contains(&w.as_str()) {
             i += 1;
             continue;
         }
         let t = tool_name(w);
-        if PREFIX_WRAPPERS.contains(&t.as_str()) {
+        // GNU `timeout [flags] DURATION cmd` (Windows' `timeout /t 5` only sleeps).
+        let after_timeout = (t == "timeout")
+            .then(|| skip_flags(words, i + 1, &["-s", "--signal", "-k", "--kill-after"]))
+            .filter(|&j| words.get(j).is_some_and(|d| is_duration(d)));
+        if let Some(j) = after_timeout {
+            i = j + 1;
+        } else if PREFIX_WRAPPERS.contains(&t.as_str()) {
             i += 1;
             while i < words.len() && (words[i].starts_with('-') || is_assignment(&words[i])) {
                 i += 1;
@@ -510,6 +525,21 @@ pub enum Disposition {
 
 /// Decide whether a command is queued, run at once, or refused. `stdin_tty` matters for
 /// tools that watch by default in a terminal (vitest).
+/// The one-shot form of a refused command that calmrun accepts, as if stdin were a terminal
+/// (the strictest case: plain vitest watches then), fixed again while it would still be
+/// refused (`npx vitest --watch` -> `npx vitest` -> `npx vitest run`). `None` when no
+/// accepted form is found. The runner's `next:` line and the agent hook both use it.
+pub fn accepted_form(mut words: Vec<String>) -> Option<Vec<String>> {
+    for _ in 0..3 {
+        match disposition(&words, true) {
+            Disposition::Queue => return Some(words),
+            Disposition::Refuse { fixed: Some(f), .. } => words = f,
+            _ => return None,
+        }
+    }
+    None
+}
+
 pub fn disposition(argv: &[String], stdin_tty: bool) -> Disposition {
     if is_shell_string(argv) {
         let s = &argv[0];
@@ -1015,6 +1045,19 @@ mod tests {
 
     fn refused(a: &[String]) -> bool {
         matches!(disposition(a, false), Disposition::Refuse { .. })
+    }
+
+    #[test]
+    fn one_shot_forms_end_where_calmrun_accepts_them() {
+        let f = |c: &str| accepted_form(argv(c)).map(|w| w.join(" "));
+        assert_eq!(f("npx vitest --watch").as_deref(), Some("npx vitest run"));
+        assert_eq!(
+            f("npx vitest -w src/a.test.ts").as_deref(),
+            Some("npx vitest run src/a.test.ts")
+        );
+        assert_eq!(f("npx vitest watch").as_deref(), Some("npx vitest run"));
+        assert_eq!(f("npx jest --watch").as_deref(), Some("npx jest"));
+        assert_eq!(f("cargo watch -x test"), None);
     }
 
     #[test]

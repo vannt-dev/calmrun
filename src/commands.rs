@@ -53,7 +53,10 @@ pub fn run_queued(mut ctx: Ctx, cli: Cli) -> i32 {
         }
     }
     let req = queue::Request {
-        rerun_hint: Some(rerun_hint(std::env::args().skip(1).collect())),
+        rerun_hint: Some(rerun_hint(
+            &runner::program_name(),
+            std::env::args().skip(1).collect(),
+        )),
         wait_timeout: cli.wait_timeout.filter(|t| *t > 0.0).map(Duration::from_secs_f64),
         ticket: cli.ticket,
         needs: cli.needs,
@@ -72,10 +75,10 @@ pub fn run_queued(mut ctx: Ctx, cli: Cli) -> i32 {
 }
 
 /// The command line that resumes this run with its ticket: the same arguments with
-/// `--ticket {ticket}` in front (an older --ticket is dropped).
-pub fn rerun_hint(args: Vec<String>) -> String {
+/// `--ticket {ticket}` in front (an older --ticket is dropped). `program` starts calmrun.
+pub fn rerun_hint(program: &str, args: Vec<String>) -> String {
     let mut out = vec![
-        "calmrun".to_string(),
+        program.to_string(),
         "--ticket".to_string(),
         "{ticket}".to_string(),
     ];
@@ -253,10 +256,29 @@ pub fn hook(target: &HookTarget) -> i32 {
         .map(|f| f.kinds)
         .unwrap_or_default();
     let program = hook::program_name();
-    if let Some(out) = hook::run(agent, &input, hook::Mode::from_env(), &kinds, &program) {
+    let opts = hook::Opts {
+        mode: hook::Mode::from_env(),
+        kinds: &kinds,
+        program: &program,
+        load: &queue_load,
+    };
+    if let Some(out) = hook::run(agent, &input, &opts) {
         println!("{out}");
     }
     0
+}
+
+/// One line on the machine-wide queue for an agent that is told to wait in it:
+/// `Queue now: 3 of 3 points in use, 1 waiting.` `None` when the state cannot be read.
+fn queue_load() -> Option<String> {
+    let mut ctx = Ctx::load().ok()?;
+    let state = status::snapshot(&mut ctx).ok()?;
+    let budget = ctx.cfg.budget;
+    let used = scheduler::used_points(&state.jobs, budget);
+    let waiting = scheduler::waiting_in_order(&state.jobs).len();
+    Some(format!(
+        "Queue now: {used} of {budget} points in use, {waiting} waiting."
+    ))
 }
 
 /// `calmrun init [--force]`.
@@ -349,14 +371,14 @@ mod tests {
     #[test]
     fn rerun_hint_keeps_args_and_replaces_ticket() {
         assert_eq!(
-            rerun_hint(v("--wait-timeout 60 -- npx vitest run")),
+            rerun_hint("calmrun", v("--wait-timeout 60 -- npx vitest run")),
             "calmrun --ticket {ticket} --wait-timeout 60 -- npx vitest run"
         );
         assert_eq!(
-            rerun_hint(v("--ticket 4 --cost 2 -- cargo test")),
+            rerun_hint("calmrun", v("--ticket 4 --cost 2 -- cargo test")),
             "calmrun --ticket {ticket} --cost 2 -- cargo test"
         );
-        let h = rerun_hint(vec!["--".into(), "echo".into(), "a b".into()]);
+        let h = rerun_hint("calmrun", vec!["--".into(), "echo".into(), "a b".into()]);
         assert!(
             h.ends_with("-- echo \"a b\"") || h.ends_with("-- echo 'a b'"),
             "{h}"

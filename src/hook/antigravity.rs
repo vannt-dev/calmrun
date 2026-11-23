@@ -9,18 +9,11 @@
 //! A command still running after `WaitMsBeforeAsync` goes on in the background instead of
 //! being stopped, so no `--wait-timeout` is added.
 
-use super::{deny_reason, plan, Background, Call, Mode, Shell};
-use crate::config::KindConfig;
+use super::{deny_reason, plan, Background, Call, Mode, Opts, Shell};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
 
 /// Process one hook input: the JSON to print, or `None` to allow the call as it is.
-pub fn handle(
-    input: &str,
-    mode: Mode,
-    kinds: &BTreeMap<String, KindConfig>,
-    program: &str,
-) -> Option<String> {
+pub fn handle(input: &str, o: &Opts) -> Option<String> {
     let v: Value = serde_json::from_str(input).ok()?;
     let call = v.get("toolCall")?;
     if call.get("name")?.as_str()? != "run_command" {
@@ -33,9 +26,9 @@ pub fn handle(
         limit_ms: None,
         background: false,
     };
-    let p = plan(&c, kinds, program)?;
-    let out = match mode {
-        Mode::Deny => json!({"decision": "deny", "reason": deny_reason(&p, Background::Hint)}),
+    let p = plan(&c, o.kinds, o.program)?;
+    let out = match o.mode {
+        Mode::Deny => json!({"decision": "deny", "reason": deny_reason(&p, Background::Hint, o)}),
         Mode::Rewrite => json!({
             "decision": "allow",
             "reason": "calmrun: wrapped heavy command in the machine-wide queue",
@@ -63,8 +56,11 @@ mod tests {
     }
 
     fn run(name: &str, command: &str, mode: Mode) -> Option<Value> {
-        handle(&input(name, command), mode, &BTreeMap::new(), r"C:\t\calmrun.exe")
-            .map(|s| serde_json::from_str(&s).unwrap())
+        handle(
+            &input(name, command),
+            &super::super::opts(mode, r"C:\t\calmrun.exe"),
+        )
+        .map(|s| serde_json::from_str(&s).unwrap())
     }
 
     #[test]
@@ -90,6 +86,6 @@ mod tests {
     fn other_tools_and_light_commands_pass() {
         assert!(run("run_command", "git status", Mode::Deny).is_none());
         assert!(run("write_file", "npm test", Mode::Deny).is_none());
-        assert!(handle("{}", Mode::Deny, &BTreeMap::new(), "calmrun").is_none());
+        assert!(handle("{}", &super::super::opts(Mode::Deny, "calmrun")).is_none());
     }
 }

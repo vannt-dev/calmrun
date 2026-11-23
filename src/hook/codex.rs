@@ -7,10 +7,8 @@
 //! exit 0. A changed command is `permissionDecision: "allow"` with `updatedInput`, the whole
 //! tool input with a string `command`. Printing nothing leaves the call alone.
 
-use super::{deny_reason, plan, Background, Call, Mode, Shell};
-use crate::config::KindConfig;
+use super::{deny_reason, plan, Background, Call, Mode, Opts, Shell};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
 
 /// The shell command of a Codex `Bash` call: a string, or an argv array (`["bash", "-lc",
 /// "npm test"]` gives the script, anything else its words joined).
@@ -29,12 +27,7 @@ fn command_of(v: &Value) -> Option<String> {
 }
 
 /// Process one hook input: the JSON to print, or `None` to allow the call as it is.
-pub fn handle(
-    input: &str,
-    mode: Mode,
-    kinds: &BTreeMap<String, KindConfig>,
-    program: &str,
-) -> Option<String> {
+pub fn handle(input: &str, o: &Opts) -> Option<String> {
     let v: Value = serde_json::from_str(input).ok()?;
     if v.get("tool_name")?.as_str()? != "Bash" {
         return None;
@@ -47,13 +40,13 @@ pub fn handle(
         limit_ms: None,
         background: false,
     };
-    let p = plan(&call, kinds, program)?;
-    let out = match mode {
+    let p = plan(&call, o.kinds, o.program)?;
+    let out = match o.mode {
         Mode::Deny => json!({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
-                "permissionDecisionReason": deny_reason(&p, Background::Hint),
+                "permissionDecisionReason": deny_reason(&p, Background::Hint, o),
             }
         }),
         Mode::Rewrite => {
@@ -77,7 +70,7 @@ mod tests {
     use super::*;
 
     fn run(input: Value, mode: Mode) -> Option<Value> {
-        handle(&input.to_string(), mode, &BTreeMap::new(), "calmrun")
+        handle(&input.to_string(), &super::super::opts(mode, "calmrun"))
             .map(|s| serde_json::from_str(&s).unwrap())
     }
 
@@ -136,6 +129,6 @@ mod tests {
         assert!(run(mcp, Mode::Deny).is_none());
         assert!(run(bash(json!("ls -la")), Mode::Deny).is_none());
         assert!(run(bash(json!("calmrun -- npm test")), Mode::Deny).is_none());
-        assert!(handle("nope", Mode::Deny, &BTreeMap::new(), "calmrun").is_none());
+        assert!(handle("nope", &super::super::opts(Mode::Deny, "calmrun")).is_none());
     }
 }

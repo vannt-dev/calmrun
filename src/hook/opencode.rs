@@ -6,10 +6,8 @@
 //! shows the reason to the model) or `{"decision":"rewrite","args":{"command":"..."}}` (the
 //! plugin changes the arguments). No output, or any failure, lets the call run unchanged.
 
-use super::{deny_reason, plan, Background, Call, Mode, Shell};
-use crate::config::KindConfig;
+use super::{deny_reason, plan, Background, Call, Mode, Opts, Shell};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
 
 /// OpenCode's bash tool limit when the call sets no `timeout` (2 minutes).
 const DEFAULT_LIMIT_MS: u64 = 120_000;
@@ -18,12 +16,7 @@ const DEFAULT_LIMIT_MS: u64 = 120_000;
 pub const MARKER: &str = "// calmrun:plugin (managed by `calmrun setup --hook opencode`)";
 
 /// Process one hook input: the JSON to print, or `None` to allow the call as it is.
-pub fn handle(
-    input: &str,
-    mode: Mode,
-    kinds: &BTreeMap<String, KindConfig>,
-    program: &str,
-) -> Option<String> {
+pub fn handle(input: &str, o: &Opts) -> Option<String> {
     let v: Value = serde_json::from_str(input).ok()?;
     if v.get("tool")?.as_str()? != "bash" {
         return None;
@@ -39,9 +32,9 @@ pub fn handle(
         ),
         background: false,
     };
-    let p = plan(&call, kinds, program)?;
-    let out = match mode {
-        Mode::Deny => json!({"decision": "deny", "reason": deny_reason(&p, Background::Hint)}),
+    let p = plan(&call, o.kinds, o.program)?;
+    let out = match o.mode {
+        Mode::Deny => json!({"decision": "deny", "reason": deny_reason(&p, Background::Hint, o)}),
         Mode::Rewrite => json!({"decision": "rewrite", "args": {"command": p.command()}}),
     };
     Some(out.to_string())
@@ -88,7 +81,7 @@ mod tests {
     use super::*;
 
     fn run(input: Value, mode: Mode) -> Option<Value> {
-        handle(&input.to_string(), mode, &BTreeMap::new(), "calmrun")
+        handle(&input.to_string(), &super::super::opts(mode, "calmrun"))
             .map(|s| serde_json::from_str(&s).unwrap())
     }
 

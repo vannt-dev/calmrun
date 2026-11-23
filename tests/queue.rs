@@ -420,10 +420,9 @@ fn refusal_prints_the_next_command() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains("calmrun: next: calmrun -- docker compose up -d"),
-        "{err}"
-    );
+    // `calmrun`, or its path when it is not on PATH.
+    assert!(err.contains("calmrun: next: "), "{err}");
+    assert!(err.contains(" -- docker compose up -d"), "{err}");
 }
 
 #[test]

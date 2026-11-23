@@ -521,6 +521,8 @@ pub const RULES: &[Rule] = &[
         hints: &[MOON_HINT],
         ..rule(&["moon"], When::Sub(&["run", "ci", "check"]), "monorepo")
     },
+    // Node's own test runner.
+    rule(&["node"], When::Flag(&["--test"]), "test"),
     // Package-manager scripts.
     rule(PACKAGE_MANAGERS, When::Sub(&["test", "t"]), "test"),
     rule(PACKAGE_MANAGERS, When::Script(&["test", "t"]), "test"),
@@ -940,7 +942,7 @@ pub const ENDLESS: &[EndlessRule] = &[
         ..endless(&["vite"], Endless::Flags(WATCH), Fix::RemoveFlags(WATCH))
     },
     endless(
-        &["deno", "bun"],
+        &["deno", "bun", "node"],
         Endless::Flags(&["--watch"]),
         Fix::RemoveFlags(&["--watch"]),
     ),
@@ -1276,6 +1278,38 @@ pub fn after_docker_compose(rest: &[String]) -> Option<&[String]> {
     Some(&rest[pos + 1..])
 }
 
+/// Package-manager flags that take a value before the command (`npm --prefix web test`).
+const PM_VALUE_FLAGS: &[&str] = &[
+    "--prefix",
+    "-C",
+    "--dir",
+    "--cwd",
+    "--filter",
+    "-F",
+    "--workspace",
+];
+
+/// A package manager's arguments without its leading value flags and their values, so the
+/// command is the first plain word; other tools' arguments as they are.
+fn pm_rest<'a>(tool: &str, rest: &'a [String]) -> std::borrow::Cow<'a, [String]> {
+    if !PACKAGE_MANAGERS.contains(&tool) {
+        return std::borrow::Cow::Borrowed(rest);
+    }
+    let mut out = Vec::with_capacity(rest.len());
+    let mut i = 0;
+    while i < rest.len() && rest[i].starts_with('-') {
+        // npm's `-w` names a workspace; pnpm's and yarn's `-w` take no value.
+        if PM_VALUE_FLAGS.contains(&rest[i].as_str()) || (tool == "npm" && rest[i] == "-w") {
+            i += 2;
+        } else {
+            out.push(rest[i].clone());
+            i += 1;
+        }
+    }
+    out.extend(rest[i.min(rest.len())..].iter().cloned());
+    std::borrow::Cow::Owned(out)
+}
+
 fn script_matches(tool: &str, rest: &[String], names: &[&str]) -> bool {
     let is = |w: &str| names.contains(&w.split(':').next().unwrap_or(w));
     match first_non_flag(rest) {
@@ -1299,6 +1333,7 @@ fn task(w: &str) -> &str {
 impl When {
     /// Whether the condition holds for this tool and its arguments.
     pub fn matches(&self, tool: &str, rest: &[String]) -> bool {
+        let rest = &pm_rest(tool, rest)[..];
         let sub = || first_non_flag(rest).map(str::to_ascii_lowercase);
         let plain = || rest.iter().filter(|w| !w.starts_with('-'));
         match *self {
