@@ -1,0 +1,865 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>calmrun: heavy commands take turns</title>
+    <meta
+      name="description"
+      content="calmrun is a machine-wide queue for heavy dev commands (tests, type checks, builds, docker), so several coding agents and terminals share one Windows, macOS or Linux machine without freezing it. One binary, no daemon."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://vannt-dev.github.io/calmrun/" />
+    <meta property="og:title" content="calmrun: heavy commands take turns" />
+    <meta
+      property="og:description"
+      content="A machine-wide queue for tests, type checks, builds and docker, so parallel coding agents don't freeze the computer."
+    />
+    <meta name="twitter:card" content="summary" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f766e'/%3E%3Cpath d='M7 11h12M7 16h18M7 21h8' fill='none' stroke='%23fff' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E"
+    />
+    <style>
+      /* Self-hosted fonts (SIL OFL 1.1, see fonts/OFL-*.txt). The Vietnamese subset loads only
+         when Vietnamese text is on screen. */
+      @font-face { font-family: 'Be Vietnam Pro'; font-style: normal; font-weight: 400; font-display: swap; src: url(fonts/be-vietnam-pro-latin-400.woff2) format('woff2'); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+      @font-face { font-family: 'Be Vietnam Pro'; font-style: normal; font-weight: 500; font-display: swap; src: url(fonts/be-vietnam-pro-latin-500.woff2) format('woff2'); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+      @font-face { font-family: 'Be Vietnam Pro'; font-style: normal; font-weight: 600; font-display: swap; src: url(fonts/be-vietnam-pro-latin-600.woff2) format('woff2'); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+      @font-face { font-family: 'Be Vietnam Pro'; font-style: normal; font-weight: 700; font-display: swap; src: url(fonts/be-vietnam-pro-latin-700.woff2) format('woff2'); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+      @font-face { font-family: 'Be Vietnam Pro'; font-style: normal; font-weight: 800; font-display: swap; src: url(fonts/be-vietnam-pro-latin-800.woff2) format('woff2'); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+      @font-face { font-family: 'Be Vietnam Pro'; font-style: normal; font-weight: 400; font-display: swap; src: url(fonts/be-vietnam-pro-vietnamese-400.woff2) format('woff2'); unicode-range: U+0102-0103, U+0110-0111, U+0128-0129, U+0168-0169, U+01A0-01A1, U+01AF-01B0, U+0300-0301, U+0303-0304, U+0308-0309, U+0323, U+0329, U+1EA0-1EF9, U+20AB; }
+      @font-face { font-family: 'Be Vietnam Pro'; font-style: normal; font-weight: 500; font-display: swap; src: url(fonts/be-vietnam-pro-vietnamese-500.woff2) format('woff2'); unicode-range: U+0102-0103, U+0110-0111, U+0128-0129, U+0168-0169, U+01A0-01A1, U+01AF-01B0, U+0300-0301, U+0303-0304, U+0308-0309, U+0323, U+0329, U+1EA0-1EF9, U+20AB; }
+      @font-face { font-family: 'Be Vietnam Pro'; font-style: normal; font-weight: 600; font-display: swap; src: url(fonts/be-vietnam-pro-vietnamese-600.woff2) format('woff2'); unicode-range: U+0102-0103, U+0110-0111, U+0128-0129, U+0168-0169, U+01A0-01A1, U+01AF-01B0, U+0300-0301, U+0303-0304, U+0308-0309, U+0323, U+0329, U+1EA0-1EF9, U+20AB; }
+      @font-face { font-family: 'Be Vietnam Pro'; font-style: normal; font-weight: 700; font-display: swap; src: url(fonts/be-vietnam-pro-vietnamese-700.woff2) format('woff2'); unicode-range: U+0102-0103, U+0110-0111, U+0128-0129, U+0168-0169, U+01A0-01A1, U+01AF-01B0, U+0300-0301, U+0303-0304, U+0308-0309, U+0323, U+0329, U+1EA0-1EF9, U+20AB; }
+      @font-face { font-family: 'Be Vietnam Pro'; font-style: normal; font-weight: 800; font-display: swap; src: url(fonts/be-vietnam-pro-vietnamese-800.woff2) format('woff2'); unicode-range: U+0102-0103, U+0110-0111, U+0128-0129, U+0168-0169, U+01A0-01A1, U+01AF-01B0, U+0300-0301, U+0303-0304, U+0308-0309, U+0323, U+0329, U+1EA0-1EF9, U+20AB; }
+      @font-face { font-family: 'JetBrains Mono'; font-style: normal; font-weight: 400 600; font-display: swap; src: url(fonts/jetbrains-mono-latin.woff2) format('woff2'); }
+
+      :root {
+        --bg: #f7f8fc;
+        --fg: #0f172a;
+        --muted: #55607a;
+        --line: #dde2ee;
+        --accent: #0f766e;
+        --accent-2: #4f46e5;
+        --accent-soft: #e6f4f1;
+        --accent-fg: #ffffff;
+        --code-bg: #0f172a;
+        --code-fg: #e2e8f0;
+        --card: #ffffff;
+        --surface-2: #eef1f8;
+        --shadow: 0 1px 2px rgba(15, 23, 42, 0.06), 0 8px 24px rgba(15, 23, 42, 0.06);
+      }
+      @media (prefers-color-scheme: dark) {
+        :root:not([data-theme='light']) {
+          --bg: #0b1020;
+          --fg: #e7ecf6;
+          --muted: #9aa6c2;
+          --line: #26324d;
+          --accent: #2dd4bf;
+          --accent-2: #8b87ff;
+          --accent-soft: #10302d;
+          --accent-fg: #0b1020;
+          --code-bg: #070b16;
+          --code-fg: #dbe4f5;
+          --card: #121a2e;
+          --surface-2: #18223a;
+          --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.25);
+        }
+      }
+      :root[data-theme='dark'] {
+        --bg: #0b1020;
+        --fg: #e7ecf6;
+        --muted: #9aa6c2;
+        --line: #26324d;
+        --accent: #2dd4bf;
+        --accent-2: #8b87ff;
+        --accent-soft: #10302d;
+        --accent-fg: #0b1020;
+        --code-bg: #070b16;
+        --code-fg: #dbe4f5;
+        --card: #121a2e;
+        --surface-2: #18223a;
+        --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.25);
+      }
+      * { box-sizing: border-box; }
+      html { scroll-padding-top: 72px; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font: 16px/1.65 'Be Vietnam Pro', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      a { color: var(--accent); }
+      .wrap { max-width: 1080px; margin: 0 auto; padding: 0 16px; }
+      pre {
+        background: var(--code-bg);
+        color: var(--code-fg);
+        padding: 18px 20px;
+        border-radius: 12px;
+        overflow-x: auto;
+        font: 13.5px/1.55 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        margin: 0;
+      }
+      code { font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92em; }
+      p code, li code, td code, th code, figcaption code {
+        background: var(--card);
+        border: 1px solid var(--line);
+        padding: 1px 5px;
+        border-radius: 4px;
+        overflow-wrap: break-word;
+      }
+      th code { background: transparent; border: 0; padding: 0; }
+      .dim { color: #94a3b8; }
+      figure { margin: 0 0 32px; }
+      figcaption { color: var(--muted); font-size: 14px; margin-top: 10px; }
+      section { padding: 40px 0; border-top: 1px solid var(--line); }
+      h2 { font-size: 26px; margin: 0 0 8px; font-weight: 800; letter-spacing: -0.02em; }
+      h3 { font-size: 17px; margin: 24px 0 8px; }
+      .sub { color: var(--muted); margin: 0 0 20px; max-width: 820px; }
+      .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr)); gap: 16px; }
+      .grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px 24px; }
+      .grid2 > div > h3:first-child { margin-top: 8px; }
+      .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px; box-shadow: var(--shadow); }
+      .card h3 { margin: 0 0 6px; }
+      .card p { margin: 0; color: var(--muted); }
+      .card p code { white-space: nowrap; }
+      .note { color: var(--muted); margin: 8px 0 12px; }
+      .tbl { overflow-x: auto; }
+      table { width: 100%; border-collapse: collapse; font-size: 15px; }
+      th, td { text-align: left; padding: 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+      th { font-weight: 600; width: 30%; }
+      td { color: var(--muted); }
+      thead th { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); width: auto; }
+      table.kinds th { width: 18%; }
+      table.kinds td.n { width: 12%; color: var(--fg); font-weight: 700; font-variant-numeric: tabular-nums; }
+      ul { margin: 0; padding-left: 20px; }
+      li { margin: 4px 0; }
+      footer { padding: 32px 0 48px; border-top: 1px solid var(--line); color: var(--muted); font-size: 14px; }
+      footer a { color: var(--fg); }
+
+      .topbar {
+        position: sticky; top: 0; z-index: 10;
+        backdrop-filter: saturate(160%) blur(10px);
+        background: color-mix(in srgb, var(--bg) 82%, transparent);
+        border-bottom: 1px solid var(--line);
+      }
+      .topbar .wrap { display: flex; align-items: center; gap: 16px; min-height: 60px; flex-wrap: wrap; }
+      .topbar .brand { display: flex; align-items: center; gap: 10px; font-weight: 800; color: var(--fg); text-decoration: none; }
+      .logo { width: 30px; height: 30px; border-radius: 8px; background: var(--accent); display: grid; place-items: center; }
+      .navlinks { display: flex; align-items: center; gap: 18px; margin-left: auto; font-size: 14px; font-weight: 500; }
+      .navlinks a { color: var(--muted); text-decoration: none; }
+      .navlinks a:hover { color: var(--fg); }
+      .lang-select, .theme-btn { font: 600 13px 'Be Vietnam Pro', system-ui, sans-serif; color: var(--fg); background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px; }
+      .theme-btn { cursor: pointer; line-height: 1; }
+      @media (max-width: 860px) { .navlinks a.sec { display: none; } }
+      header.hero { display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr); gap: 48px; align-items: center; padding: 72px 0 48px; }
+      @media (max-width: 860px) { header.hero { grid-template-columns: minmax(0, 1fr); gap: 36px; padding-top: 44px; } }
+      .eyebrow {
+        display: inline-flex; align-items: center; gap: 10px; margin: 0 0 18px; padding: 6px 12px;
+        font: 600 11.5px/1.2 'JetBrains Mono', monospace; letter-spacing: 0.12em; text-transform: uppercase;
+        color: var(--accent); background: var(--accent-soft);
+        border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent); border-radius: 999px;
+      }
+      .pulse { width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 20%, transparent); }
+      h1 { font-size: clamp(34px, 5.4vw, 56px); line-height: 1.1; letter-spacing: -0.03em; font-weight: 800; margin: 0 0 18px; }
+      h1 .grad { background: linear-gradient(90deg, var(--accent), var(--accent-2)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+      .lead { font-size: clamp(17px, 2vw, 19px); color: var(--muted); max-width: 760px; margin: 0 0 24px; }
+      .cta { display: flex; gap: 12px; flex-wrap: wrap; }
+      .btn { display: inline-block; border-radius: 10px; padding: 12px 20px; font-weight: 600; background: var(--card); border: 1px solid var(--line); color: var(--fg); text-decoration: none; }
+      .btn.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+      .btn:hover { border-color: var(--accent); }
+      .trust { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 22px 0 0; padding: 0; list-style: none; color: var(--muted); font-size: 13px; }
+      .trust li::before { content: '·'; margin-right: 8px; color: var(--accent); font-weight: 800; }
+      .hero-term { position: relative; min-width: 0; }
+      .hero-term::before { content: ''; position: absolute; inset: 12% -4% -8% 8%; z-index: 0; background: color-mix(in srgb, var(--accent) 30%, transparent); filter: blur(52px); opacity: 0.55; }
+      .term { position: relative; z-index: 1; overflow: hidden; transform: rotate(1deg); background: var(--code-bg); color: var(--code-fg); border-radius: 14px; border: 1px solid color-mix(in srgb, var(--code-fg) 14%, transparent); box-shadow: 0 28px 60px rgba(15, 23, 42, 0.25); }
+      .term-bar { display: flex; align-items: center; gap: 7px; padding: 12px 16px; border-bottom: 1px solid color-mix(in srgb, var(--code-fg) 12%, transparent); }
+      .term-bar span { width: 9px; height: 9px; border-radius: 50%; background: color-mix(in srgb, var(--code-fg) 28%, transparent); }
+      .term-bar code { margin-left: auto; font-size: 12px; color: color-mix(in srgb, var(--code-fg) 60%, transparent); }
+      .term pre { background: transparent; border-radius: 0; padding: 18px 20px 22px; font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere; }
+      .term .p { color: color-mix(in srgb, var(--accent) 45%, #ffffff); }
+      .term .ok { color: color-mix(in srgb, var(--accent) 30%, #ffffff); font-weight: 600; }
+      @media (max-width: 860px) { .term { transform: none; } }
+      .install-tabs { display: grid; gap: 10px; }
+      .install-tabs h3 { margin: 18px 0 6px; font-size: 15px; }
+
+      /* the diagram: inline SVG coloured with the theme tokens, so it reads in light and dark */
+      .diagram { overflow-x: auto; border: 1px solid var(--line); border-radius: 14px; padding: 12px; background: var(--surface-2); }
+      .diagram svg { display: block; width: 100%; height: auto; min-width: 680px; }
+      .dg-box { fill: var(--card); stroke: var(--line); stroke-width: 1.5; }
+      .dg-chip { fill: var(--accent-soft); stroke: color-mix(in srgb, var(--accent) 45%, transparent); stroke-width: 1; }
+      .dg-t { fill: var(--fg); font: 700 15px 'Be Vietnam Pro', system-ui, sans-serif; }
+      .dg-s { fill: var(--fg); font: 500 13px 'Be Vietnam Pro', system-ui, sans-serif; }
+      .dg-c { fill: var(--fg); font: 500 12.5px 'JetBrains Mono', ui-monospace, monospace; }
+      .dg-m { fill: var(--muted); font: 400 12.5px 'Be Vietnam Pro', system-ui, sans-serif; }
+      .dg-arrow { stroke: var(--muted); stroke-width: 1.8; fill: none; }
+      .dg-head { fill: var(--muted); }
+      .dg-on { fill: var(--accent); }
+      .dg-off { fill: none; stroke: var(--muted); stroke-width: 1.2; stroke-dasharray: 3 2; }
+      .dg-ok { fill: var(--accent); }
+
+      @media (max-width: 720px) {
+        .grid2 { grid-template-columns: minmax(0, 1fr); }
+        th { width: 38%; }
+        table { font-size: 14px; }
+        th, td { padding: 8px 6px; }
+      }
+    </style>
+  </head>
+  <body>
+    <nav class="topbar" aria-label="Main">
+      <div class="wrap">
+        <a class="brand" href="#top">
+          <span class="logo" aria-hidden="true"
+            ><svg width="18" height="18" viewBox="0 0 32 32">
+              <path d="M7 11h12M7 16h18M7 21h8" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" /></svg
+          ></span>
+          calmrun
+        </a>
+        <div class="navlinks">
+          <a class="sec" href="#problem" data-i18n="nav.problem">The problem</a>
+          <a class="sec" href="#how" data-i18n="nav.how">How it works</a>
+          <a class="sec" href="#agents" data-i18n="nav.agents">Agents</a>
+          <a class="sec" href="#commands" data-i18n="nav.commands">Commands</a>
+          <a class="sec" href="#install" data-i18n="nav.install">Install</a>
+          <a href="https://github.com/vannt-dev/calmrun">GitHub ↗</a>
+          <button type="button" id="theme" class="theme-btn" aria-label="Light or dark theme" title="Light / dark">◐</button>
+          <select id="lang" class="lang-select" aria-label="Language">
+            <option value="en">English</option>
+            <option value="vi">Tiếng Việt</option>
+          </select>
+        </div>
+      </div>
+    </nav>
+    <div class="wrap" id="top">
+      <header class="hero">
+        <div>
+          <p class="eyebrow"><span class="pulse" aria-hidden="true"></span><span data-i18n="hero.eyebrow">A queue for parallel coding agents</span></p>
+          <h1 data-i18n="hero.h1">Heavy commands <span class="grad">take turns</span>. The machine stays calm.</h1>
+          <p class="lead" data-i18n="hero.lead">
+            calmrun is a machine-wide queue for tests, type checks, builds and docker. Put <code>calmrun --</code> in front of a heavy
+            command and it waits until the machine has room, then runs it at low CPU priority and passes its exit code back. Several coding
+            agents and terminals can share one computer without freezing it.
+          </p>
+          <div class="cta">
+            <a class="btn primary" href="#install" data-i18n="cta.install">Install</a>
+            <a class="btn" href="https://github.com/vannt-dev/calmrun">GitHub</a>
+          </div>
+          <ul class="trust">
+            <li data-i18n="hero.t1">One binary, no daemon</li>
+            <li data-i18n="hero.t2">Windows, macOS, Linux</li>
+            <li>MIT</li>
+          </ul>
+        </div>
+        <div class="hero-term" aria-label="Installing calmrun and running a queued test">
+          <div class="term">
+            <div class="term-bar"><span></span><span></span><span></span><code>calmrun</code></div>
+            <pre><span class="dim"># macOS / Linux</span>
+<span class="p">$</span> curl --proto '=https' --tlsv1.2 -LsSf https://github.com/vannt-dev/calmrun/releases/latest/download/calmrun-installer.sh | sh
+<span class="dim"># Windows (PowerShell)</span>
+<span class="p">&gt;</span> powershell -ExecutionPolicy Bypass -c "irm https://github.com/vannt-dev/calmrun/releases/latest/download/calmrun-installer.ps1 | iex"
+
+<span class="p">$</span> calmrun -- npx vitest run
+calmrun: waiting — 4 of 6 points in use, 2nd in line (needs 2); running: npx vitest in web (3m10s), cargo build in api (1m02s)</pre>
+          </div>
+        </div>
+      </header>
+
+      <section id="problem">
+        <h2 data-i18n="pb.h2">The problem</h2>
+        <p class="sub" data-i18n="pb.sub">
+          One test run is fine. Four agents that each start <code>vitest</code> with a worker per core, plus a <code>tsc</code> and a build,
+          are not: they all start in the same minute, and nobody is in charge of the machine.
+        </p>
+        <div class="grid">
+          <div class="card">
+            <h3 data-i18n="pb.1.h">Everything starts at once</h3>
+            <p data-i18n="pb.1">Each agent decides on its own to run the tests, the type check and the build. None of them knows the others are doing the same.</p>
+          </div>
+          <div class="card">
+            <h3 data-i18n="pb.2.h">The machine stalls</h3>
+            <p data-i18n="pb.2">RAM runs out and the system swaps. The editor, the terminal and the agents themselves stop responding.</p>
+          </div>
+          <div class="card">
+            <h3 data-i18n="pb.3.h">Tests time out</h3>
+            <p data-i18n="pb.3">Starved runs fail on timeouts that have nothing to do with the code. Agents retry, which adds even more load.</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="how">
+        <h2 data-i18n="how.h2">How it works</h2>
+        <p class="sub" data-i18n="how.sub">
+          Every <code>calmrun</code> process adds its job to a small state file guarded by an OS file lock, and every waiter applies the
+          same rules to it. There is no daemon to start or keep alive.
+        </p>
+        <figure>
+          <div class="diagram">
+            <svg viewBox="0 0 980 310" role="img" aria-labelledby="dg-title">
+              <title id="dg-title" data-i18n="dg.title">Jobs from agents and terminals wait in one queue; a job starts when its gates are open and runs at low priority.</title>
+              <defs>
+                <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+                  <path class="dg-head" d="M0 0L10 5L0 10z" />
+                </marker>
+              </defs>
+              <!-- sources -->
+              <rect class="dg-box" x="10" y="40" width="170" height="54" rx="10" />
+              <text class="dg-s" x="95" y="72" text-anchor="middle">Claude Code</text>
+              <rect class="dg-box" x="10" y="118" width="170" height="54" rx="10" />
+              <text class="dg-s" x="95" y="150" text-anchor="middle">Codex · Cursor · Gemini</text>
+              <rect class="dg-box" x="10" y="196" width="170" height="54" rx="10" />
+              <text class="dg-s" x="95" y="228" text-anchor="middle" data-i18n="dg.term">your terminal</text>
+              <text class="dg-m" x="95" y="280" text-anchor="middle" data-i18n="dg.src">hook, MCP or calmrun --</text>
+              <path class="dg-arrow" d="M182 67 C220 67 220 120 256 130" marker-end="url(#ah)" />
+              <path class="dg-arrow" d="M182 145 L256 145" marker-end="url(#ah)" />
+              <path class="dg-arrow" d="M182 223 C220 223 220 170 256 160" marker-end="url(#ah)" />
+              <!-- queue -->
+              <rect class="dg-box" x="260" y="20" width="230" height="270" rx="12" />
+              <text class="dg-t" x="375" y="50" text-anchor="middle" data-i18n="dg.q">The queue</text>
+              <text class="dg-m" x="375" y="70" text-anchor="middle" data-i18n="dg.q.sub">--prio high first, then first come</text>
+              <rect class="dg-chip" x="278" y="88" width="194" height="40" rx="8" />
+              <text class="dg-c" x="292" y="113">vitest run</text>
+              <text class="dg-m" x="458" y="113" text-anchor="end" data-i18n="dg.p2a">2 points</text>
+              <rect class="dg-chip" x="278" y="138" width="194" height="40" rx="8" />
+              <text class="dg-c" x="292" y="163">tsc --noEmit</text>
+              <text class="dg-m" x="458" y="163" text-anchor="end" data-i18n="dg.p2b">2 points</text>
+              <rect class="dg-chip" x="278" y="188" width="194" height="40" rx="8" />
+              <text class="dg-c" x="292" y="213">eslint .</text>
+              <text class="dg-m" x="458" y="213" text-anchor="end" data-i18n="dg.p1">1 point</text>
+              <text class="dg-m" x="375" y="264" text-anchor="middle" data-i18n="dg.q.foot">one state file, no daemon</text>
+              <path class="dg-arrow" d="M492 155 L546 155" marker-end="url(#ah)" />
+              <!-- gates -->
+              <rect class="dg-box" x="550" y="20" width="200" height="270" rx="12" />
+              <text class="dg-t" x="650" y="50" text-anchor="middle" data-i18n="dg.g">Starts when</text>
+              <circle class="dg-ok" cx="574" cy="92" r="5" />
+              <text class="dg-s" x="588" y="97" data-i18n="dg.g1">its points are free</text>
+              <circle class="dg-ok" cx="574" cy="128" r="5" />
+              <text class="dg-s" x="588" y="133" data-i18n="dg.g2">enough RAM is free</text>
+              <circle class="dg-ok" cx="574" cy="164" r="5" />
+              <text class="dg-s" x="588" y="169" data-i18n="dg.g3">the disk has room</text>
+              <circle class="dg-ok" cx="574" cy="200" r="5" />
+              <text class="dg-s" x="588" y="205" data-i18n="dg.g4">its folder is not busy</text>
+              <circle class="dg-ok" cx="574" cy="236" r="5" />
+              <text class="dg-s" x="588" y="241" data-i18n="dg.g5">a resource slot is free</text>
+              <path class="dg-arrow" d="M752 155 L796 155" marker-end="url(#ah)" />
+              <!-- running -->
+              <rect class="dg-box" x="800" y="20" width="170" height="270" rx="12" />
+              <text class="dg-t" x="885" y="50" text-anchor="middle" data-i18n="dg.r">Running</text>
+              <text class="dg-m" x="885" y="70" text-anchor="middle" data-i18n="dg.r.sub">at low CPU priority</text>
+              <rect class="dg-on" x="822" y="88" width="18" height="24" rx="3" />
+              <rect class="dg-on" x="844" y="88" width="18" height="24" rx="3" />
+              <rect class="dg-on" x="866" y="88" width="18" height="24" rx="3" />
+              <rect class="dg-on" x="888" y="88" width="18" height="24" rx="3" />
+              <rect class="dg-off" x="910" y="88" width="18" height="24" rx="3" />
+              <rect class="dg-off" x="932" y="88" width="18" height="24" rx="3" />
+              <text class="dg-m" x="885" y="134" text-anchor="middle" data-i18n="dg.r.pts">4 of 6 points in use</text>
+              <rect class="dg-chip" x="816" y="150" width="138" height="34" rx="8" />
+              <text class="dg-c" x="885" y="172" text-anchor="middle">vitest</text>
+              <rect class="dg-chip" x="816" y="192" width="138" height="34" rx="8" />
+              <text class="dg-c" x="885" y="214" text-anchor="middle">cargo build</text>
+              <text class="dg-m" x="885" y="264" text-anchor="middle" data-i18n="dg.r.foot">memory ceiling watched</text>
+            </svg>
+          </div>
+          <figcaption data-i18n="dg.cap">
+            The default budget is logical cores − 2, capped at one point per 4 GB of RAM, at least 2. <code>calmrun doctor</code> shows the
+            numbers for your machine.
+          </figcaption>
+        </figure>
+
+        <div class="grid">
+          <div class="card">
+            <h3 data-i18n="how.1.h">Points by kind</h3>
+            <p data-i18n="how.1">
+              calmrun reads the command and picks a kind: vitest, jest, tsc and builds cost 2 points, linters and plain test runs cost 1.
+              <code>--cost</code> and <code>--kind</code> override it, and your own kinds go in the config.
+            </p>
+          </div>
+          <div class="card">
+            <h3 data-i18n="how.2.h">RAM and disk gates</h3>
+            <p data-i18n="how.2">
+              A job also waits while free RAM is below <code>min_free_gb</code> or its drive has less than <code>min_free_disk_gb</code>
+              free. On an idle machine it starts anyway, so nothing waits forever.
+            </p>
+          </div>
+          <div class="card">
+            <h3 data-i18n="how.3.h">One run per folder</h3>
+            <p data-i18n="how.3">
+              vitest, jest and build jobs take their nearest <code>node_modules</code>; Cargo takes its <code>target</code> folder. Two jobs
+              on the same folder never run together, so caches don't fight.
+            </p>
+          </div>
+          <div class="card">
+            <h3 data-i18n="how.4.h">Low priority, bounded memory</h3>
+            <p data-i18n="how.4">
+              Commands run below normal priority (<code>nice +10</code> on Unix), so your editor stays responsive. A job whose process tree
+              goes above <code>ceiling_gb</code> is stopped with exit 137.
+            </p>
+          </div>
+          <div class="card">
+            <h3 data-i18n="how.5.h">No endless commands</h3>
+            <p data-i18n="how.5">
+              Watch modes and attached <code>docker compose up</code> would hold points forever, so calmrun refuses them and prints the
+              one-shot command to run instead. Dev servers run at once, outside the queue.
+            </p>
+          </div>
+          <div class="card">
+            <h3 data-i18n="how.6.h">Tickets, resources, queues</h3>
+            <p data-i18n="how.6">
+              <code>--wait-timeout</code> gives up after a while (exit 75) and keeps the place in line for 10 minutes as a ticket.
+              <code>--needs db</code> takes a named resource; <code>--id</code> uses a separate queue.
+            </p>
+          </div>
+        </div>
+
+        <h3 data-i18n="kinds.h">Kinds and default costs</h3>
+        <div class="tbl">
+          <table class="kinds">
+            <thead>
+              <tr><th data-i18n="kinds.c1">Kind</th><th data-i18n="kinds.c2">Points</th><th data-i18n="kinds.c3">Detected from</th></tr>
+            </thead>
+            <tbody>
+              <tr><th><code>vitest</code></th><td class="n">2</td><td><code>vitest</code></td></tr>
+              <tr><th><code>jest</code></th><td class="n">2</td><td><code>jest</code></td></tr>
+              <tr><th><code>tsc</code></th><td class="n">2</td><td><code>tsc</code>, <code>vue-tsc</code>, <code>tsgo</code>, <code>npm run typecheck</code></td></tr>
+              <tr><th><code>build</code></th><td class="n">2</td><td><code>vite/next/ng build</code>, <code>webpack</code>, <code>rollup</code>, <code>esbuild</code>, <code>gradle</code>, <code>mvn</code>, <code>cargo build/check/clippy</code>, <code>go/flutter/dotnet build</code>, <code>npm run build</code></td></tr>
+              <tr><th><code>capture</code></th><td class="n">2</td><td><code>playwright</code>, <code>puppeteer</code>, <code>cypress</code></td></tr>
+              <tr><th><code>docker</code></th><td class="n">2</td><td><code>docker compose up/build/run/create</code>, <code>docker build/run/buildx</code></td></tr>
+              <tr><th><code>eslint</code></th><td class="n">1</td><td><code>eslint</code>, <code>oxlint</code>, <code>biome</code>, <code>npm run lint</code></td></tr>
+              <tr><th><code>pytest</code></th><td class="n">1</td><td><code>pytest</code>, <code>python -m pytest</code></td></tr>
+              <tr><th><code>test</code></th><td class="n">1</td><td><code>cargo test</code>, <code>go test</code>, <code>flutter test</code>, <code>dotnet test</code>, <code>npm test</code></td></tr>
+              <tr><th><code>other</code></th><td class="n">1</td><td data-i18n="kinds.other">anything else</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="agents">
+        <h2 data-i18n="ag.h2">Agent integration</h2>
+        <p class="sub" data-i18n="ag.sub">
+          Agents don't need to remember anything: the Claude Code hook catches heavy shell commands, the MCP server gives any MCP client a
+          queued <code>run_task</code> tool, and <code>setup</code> writes the instructions into each agent's global file.
+        </p>
+        <div class="grid2">
+          <div>
+            <h3 data-i18n="ag.hook.h">Claude Code hook</h3>
+            <p class="note" data-i18n="ag.hook">
+              <code>calmrun hook claude</code> is a PreToolUse hook for the Bash and PowerShell tools. When a command runs a heavy tool
+              without calmrun, the hook denies it and tells Claude the exact command with each heavy part wrapped. Light commands pass.
+              Put it in <code>~/.claude/settings.json</code> or a project's <code>.claude/settings.json</code>:
+            </p>
+            <pre>{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [{ "type": "command", "command": "calmrun hook claude" }]
+      }
+    ]
+  }
+}</pre>
+            <p class="note" data-i18n="ag.hook.ex">
+              <code>cd web &amp;&amp; npx vitest run</code> becomes <code>cd web &amp;&amp; calmrun -- npx vitest run</code>. With
+              <code>CALMRUN_HOOK_MODE=rewrite</code> the hook rewrites the command itself instead of denying it.
+            </p>
+          </div>
+          <div>
+            <h3 data-i18n="ag.mcp.h">MCP server</h3>
+            <p class="note" data-i18n="ag.mcp">
+              <code>calmrun mcp</code> serves three tools over stdio: <code>run_task</code> (waits in the same queue, runs the command,
+              returns the exit code and the last 200 lines of output), <code>queue_status</code> and <code>bump</code>.
+            </p>
+            <pre><span class="dim"># Claude Code</span>
+claude mcp add calmrun -- calmrun mcp
+
+<span class="dim"># Codex: ~/.codex/config.toml</span>
+[mcp_servers.calmrun]
+command = "calmrun"
+args = ["mcp"]
+tool_timeout_sec = 3600
+
+<span class="dim">// Cursor: ~/.cursor/mcp.json</span>
+{ "mcpServers": { "calmrun": { "type": "stdio", "command": "calmrun", "args": ["mcp"] } } }
+
+<span class="dim">// Gemini CLI: ~/.gemini/settings.json (timeout in ms)</span>
+{ "mcpServers": { "calmrun": { "command": "calmrun", "args": ["mcp"], "timeout": 3600000 } } }</pre>
+          </div>
+          <div>
+            <h3 data-i18n="ag.setup.h">calmrun setup</h3>
+            <p class="note" data-i18n="ag.setup">
+              Adds a short calmrun section to the global instruction file of Claude Code, Codex, Gemini CLI and OpenCode. It is a dry run
+              until you add <code>--write</code>; every file it changes is backed up first.
+            </p>
+            <pre><span class="p">$</span> calmrun setup                          <span class="dim" data-i18n="ag.setup.c1"># show what would change</span>
+<span class="p">$</span> calmrun setup --write                  <span class="dim" data-i18n="ag.setup.c2"># apply</span>
+<span class="p">$</span> calmrun setup --write --agents codex   <span class="dim" data-i18n="ag.setup.c3"># only some agents</span>
+<span class="p">$</span> calmrun setup --write --hook           <span class="dim" data-i18n="ag.setup.c4"># also the Claude Code hook</span>
+<span class="p">$</span> calmrun setup --write --remove --hook  <span class="dim" data-i18n="ag.setup.c5"># take both out again</span></pre>
+          </div>
+          <div>
+            <h3 data-i18n="ag.guide.h">calmrun guide</h3>
+            <p class="note" data-i18n="ag.guide">
+              Prints short instructions to paste into an agent's context. Or add this to <code>CLAUDE.md</code> or <code>AGENTS.md</code>
+              by hand:
+            </p>
+            <pre>## Heavy commands
+
+This machine is shared by several agents. Run heavy commands
+through the calmrun queue: `calmrun -- &lt;command&gt;` (tests, type
+checks, linters, builds, Playwright, docker compose, pytest,
+cargo/gradle builds). Example: `calmrun -- npx vitest run`.
+Use `calmrun status` to see what is running or waiting.
+Do not wrap light commands (git, ls, cat, package installs).</pre>
+          </div>
+        </div>
+      </section>
+
+      <section id="commands">
+        <h2 data-i18n="cmd.h2">Commands</h2>
+        <div class="tbl">
+          <table>
+            <tr>
+              <th><code>calmrun [flags] -- &lt;cmd&gt;</code></th>
+              <td data-i18n="cmd.run">
+                Queue the command, then run it at low priority. Flags: <code>--kind</code>, <code>--cost N</code>,
+                <code>--prio high</code>, <code>--label L</code>, <code>--needs db,gpu</code>, <code>--id QUEUE</code>,
+                <code>--wait-timeout SECS</code>, <code>--ticket ID</code>. One quoted string runs through the shell.
+              </td>
+            </tr>
+            <tr><th><code>calmrun status</code></th><td data-i18n="cmd.status">What runs, what waits and why, the budget and free RAM. <code>--json</code> for tools.</td></tr>
+            <tr><th><code>calmrun stats</code></th><td data-i18n="cmd.stats">Runs, failures, wait and run times per label over <code>--days N</code> (default 7).</td></tr>
+            <tr><th><code>calmrun bump &lt;label&gt;</code></th><td data-i18n="cmd.bump">Move waiting jobs whose label contains the text to the front.</td></tr>
+            <tr><th><code>calmrun doctor</code></th><td data-i18n="cmd.doctor">Cores, RAM, disk, battery, where state lives, and the suggested config.</td></tr>
+            <tr><th><code>calmrun init</code></th><td data-i18n="cmd.init">Write a commented <code>config.toml</code> with this machine's defaults (<code>--force</code> overwrites).</td></tr>
+            <tr><th><code>calmrun guide</code></th><td data-i18n="cmd.guide">Short instructions for coding agents.</td></tr>
+            <tr><th><code>calmrun setup</code></th><td data-i18n="cmd.setup">Write or remove the calmrun block in agents' global instruction files: <code>--write</code>, <code>--remove</code>, <code>--hook</code>, <code>--agents</code>.</td></tr>
+            <tr><th><code>calmrun hook claude</code></th><td data-i18n="cmd.hook">The Claude Code PreToolUse hook; reads the hook JSON on stdin.</td></tr>
+            <tr><th><code>calmrun mcp</code></th><td data-i18n="cmd.mcp">The MCP server on stdio: <code>run_task</code>, <code>queue_status</code>, <code>bump</code>.</td></tr>
+          </table>
+        </div>
+        <h3 data-i18n="exit.h">Exit codes</h3>
+        <div class="tbl">
+          <table>
+            <tr><th data-i18n="exit.cmd">the command's own</th><td data-i18n="exit.cmd.d">it ran (a Unix signal <code>n</code> becomes 128 + n)</td></tr>
+            <tr><th>2</th><td data-i18n="exit.2">refused (watch mode, attached <code>docker compose up</code>), bad arguments or an invalid <code>--id</code></td></tr>
+            <tr><th>75</th><td data-i18n="exit.75">not started within <code>--wait-timeout</code>; the place is kept, run the printed <code>calmrun: next:</code> line</td></tr>
+            <tr><th>124</th><td data-i18n="exit.124">stopped by the MCP <code>timeout_s</code></td></tr>
+            <tr><th>126 · 127</th><td data-i18n="exit.127">the command could not be started · was not found</td></tr>
+            <tr><th>130</th><td data-i18n="exit.130">Ctrl+C</td></tr>
+            <tr><th>137</th><td data-i18n="exit.137">stopped by the memory ceiling or the critical free-RAM floor</td></tr>
+          </table>
+        </div>
+      </section>
+
+      <section id="config">
+        <h2 data-i18n="cfg.h2">Config and environment</h2>
+        <p class="sub" data-i18n="cfg.sub">
+          Every setting is optional. <code>calmrun init</code> writes a commented <code>config.toml</code> in the state directory; an
+          environment variable wins over the file.
+        </p>
+        <div class="tbl">
+          <table>
+            <thead>
+              <tr><th data-i18n="cfg.c1">Key · variable</th><th data-i18n="cfg.c2">Default and meaning</th></tr>
+            </thead>
+            <tr><th><code>budget</code><br /><code>CALMRUN_BUDGET</code></th><td data-i18n="cfg.budget">Logical cores − 2, capped at floor(RAM GB / 4), at least 2. Points that may run at once.</td></tr>
+            <tr><th><code>min_free_gb</code><br /><code>CALMRUN_MIN_FREE_GB</code></th><td data-i18n="cfg.minfree">max(3, RAM / 8). Free RAM a job needs to start while others run; 0 turns it off.</td></tr>
+            <tr><th><code>min_free_disk_gb</code><br /><code>CALMRUN_MIN_FREE_DISK_GB</code></th><td data-i18n="cfg.disk">5. Free space needed on the drive of the job's folder; 0 turns it off.</td></tr>
+            <tr><th><code>pass_limit_min</code><br /><code>CALMRUN_PASS_MIN</code></th><td data-i18n="cfg.pass">10. Minutes a waiter may be passed by smaller jobs that fit; 0 means strict order.</td></tr>
+            <tr><th><code>vitest_workers</code><br /><code>CALMRUN_VITEST_WORKERS</code></th><td data-i18n="cfg.vitest">1 up to 4 cores, 2 below 12, else 3. The <code>--maxWorkers</code> given to direct vitest calls.</td></tr>
+            <tr><th><code>ceiling_gb</code><br /><code>CALMRUN_CEILING_GB</code></th><td data-i18n="cfg.ceiling">Half the RAM. Memory one job's process tree may use; 0 turns it off.</td></tr>
+            <tr><th><code>critical_free_gb</code><br /><code>CALMRUN_CRITICAL_FREE_GB</code></th><td data-i18n="cfg.critical">5% of RAM, at most 1 GB. Below this for 3 seconds, the biggest job is stopped; 0 turns it off.</td></tr>
+            <tr><th><code>[resources]</code><br /><code>CALMRUN_RESOURCES</code></th><td data-i18n="cfg.res">Slots per named resource, e.g. <code>db = 1</code> or <code>db=1,gpu=2</code>. Unlisted resources have 1 slot.</td></tr>
+            <tr><th><code>[kinds.&lt;name&gt;]</code></th><td data-i18n="cfg.kinds"><code>cost</code> overrides a kind's points; <code>patterns = ["make"]</code> adds a kind of your own.</td></tr>
+            <tr><th><code>CALMRUN_LOW_CPU</code></th><td data-i18n="cfg.lowcpu"><code>0</code> keeps normal priority.</td></tr>
+            <tr><th><code>CALMRUN_HOOK_MODE</code></th><td data-i18n="cfg.hookmode"><code>rewrite</code> makes the hook wrap commands itself instead of denying them.</td></tr>
+            <tr><th><code>CALMRUN_HOME</code> · <code>CALMRUN_CONFIG</code></th><td data-i18n="cfg.home">The state directory and the config file path.</td></tr>
+          </table>
+        </div>
+        <pre style="margin-top: 16px">budget = 6
+min_free_gb = 4
+ceiling_gb = 8          <span class="dim"># 0 = off</span>
+
+[resources]
+db = 1
+
+[kinds.heavy]
+cost = 2
+patterns = ["make", "bazel build"]</pre>
+      </section>
+
+      <section id="platforms">
+        <h2 data-i18n="pl.h2">Platform notes</h2>
+        <ul>
+          <li data-i18n="pl.1">
+            <b>Windows</b>: where calmrun is built, and checked by hand on a real machine as well as in CI. <code>npm</code>, <code>npx</code> and other <code>.cmd</code> shims
+            work; the command runs in a Job Object, so its whole tree ends if calmrun is killed.
+          </li>
+          <li data-i18n="pl.2">
+            <b>macOS and Linux</b>: covered by the test suite in CI (GitHub's macOS and Ubuntu runners), not checked by hand yet. The command gets its own
+            process group with <code>nice +10</code> and dies with calmrun.
+          </li>
+          <li data-i18n="pl.3">
+            Release binaries are built for x64 and arm64 on all three systems. CI runs the tests on Windows x64, Linux x64 and macOS arm64
+            only; the other builds are not tested.
+          </li>
+          <li data-i18n="pl.4">
+            Memory is counted as resident memory per process (working set on Windows, RSS elsewhere); shared pages count more than once,
+            so a tree's total can read high.
+          </li>
+          <li data-i18n="pl.5">Ctrl+Z and handing the terminal over are not covered by CI, because CI runners have no terminal.</li>
+        </ul>
+      </section>
+
+      <section id="install">
+        <h2 data-i18n="in.h2">Install</h2>
+        <p class="sub" data-i18n="in.sub">
+          One binary, no runtime. The installers put <code>calmrun</code> in <code>~/.cargo/bin</code> (<code>%USERPROFILE%\.cargo\bin</code>
+          on Windows) and add it to PATH; open a new terminal afterwards.
+        </p>
+        <div class="grid2">
+          <div class="install-tabs">
+            <h3 data-i18n="in.sh">macOS / Linux</h3>
+            <pre>curl --proto '=https' --tlsv1.2 -LsSf https://github.com/vannt-dev/calmrun/releases/latest/download/calmrun-installer.sh | sh</pre>
+            <h3 data-i18n="in.ps">Windows (PowerShell)</h3>
+            <pre>powershell -ExecutionPolicy Bypass -c "irm https://github.com/vannt-dev/calmrun/releases/latest/download/calmrun-installer.ps1 | iex"</pre>
+          </div>
+          <div class="install-tabs">
+            <h3 data-i18n="in.npm">npm (any OS)</h3>
+            <pre>npm install -g calmrun</pre>
+            <h3 data-i18n="in.cargo">From source (Rust 1.95 or newer)</h3>
+            <pre>cargo install calmrun --locked</pre>
+            <h3 data-i18n="in.man">Manual download</h3>
+            <p class="note" data-i18n="in.man.d">
+              From <a href="https://github.com/vannt-dev/calmrun/releases/latest">Releases</a>: <code>calmrun-x86_64-pc-windows-msvc.zip</code>,
+              <code>calmrun-aarch64-pc-windows-msvc.zip</code>, <code>calmrun-x86_64-apple-darwin.tar.xz</code>,
+              <code>calmrun-aarch64-apple-darwin.tar.xz</code>, <code>calmrun-x86_64-unknown-linux-gnu.tar.xz</code>,
+              <code>calmrun-aarch64-unknown-linux-gnu.tar.xz</code>, each with a <code>.sha256</code>. Unpack and put the binary on PATH.
+            </p>
+          </div>
+        </div>
+        <h3 data-i18n="in.first">First steps</h3>
+        <pre><span class="p">$</span> calmrun doctor                  <span class="dim" data-i18n="in.c1"># what this machine has, the suggested budget</span>
+<span class="p">$</span> calmrun -- npx vitest run       <span class="dim" data-i18n="in.c2"># queue, then run at low priority</span>
+<span class="p">$</span> calmrun "npm ci &amp;&amp; npm test"    <span class="dim" data-i18n="in.c3"># one quoted string runs in the shell</span>
+<span class="p">$</span> calmrun status                  <span class="dim" data-i18n="in.c4"># what runs, what waits, and why</span>
+<span class="p">$</span> calmrun setup --write --hook    <span class="dim" data-i18n="in.c5"># teach your agents to use it</span></pre>
+      </section>
+
+      <footer>
+        calmrun · <a href="https://github.com/vannt-dev/calmrun/blob/main/LICENSE">MIT</a> ·
+        <a href="https://github.com/vannt-dev/calmrun">GitHub</a> ·
+        <a href="https://github.com/vannt-dev/calmrun/blob/main/README.md">README</a> ·
+        <a href="https://github.com/vannt-dev/calmrun/blob/main/CHANGELOG.md">Changelog</a> ·
+        <a href="https://github.com/vannt-dev">vannt-dev</a>
+      </footer>
+    </div>
+
+    <script>
+      var I18N = {
+        vi: {
+          'nav.problem': 'Vấn đề',
+          'nav.how': 'Cách hoạt động',
+          'nav.agents': 'Agent',
+          'nav.commands': 'Các lệnh',
+          'nav.install': 'Cài đặt',
+          'hero.eyebrow': 'Hàng chờ cho các coding agent chạy song song',
+          'hero.h1': 'Lệnh nặng <span class="grad">chạy lần lượt</span>. Máy vẫn êm.',
+          'hero.lead':
+            'calmrun là một hàng chờ dùng chung cho cả máy, dành cho test, kiểm tra kiểu, build và docker. Thêm <code>calmrun --</code> trước một lệnh nặng: calmrun chờ tới khi máy còn chỗ, chạy lệnh ở mức ưu tiên CPU thấp rồi trả lại đúng mã thoát của lệnh. Nhiều coding agent và cửa sổ terminal dùng chung một máy mà máy không bị đơ.',
+          'cta.install': 'Cài đặt',
+          'hero.t1': 'Một file chạy, không có tiến trình nền',
+          'hero.t2': 'Windows, macOS, Linux',
+          'pb.h2': 'Vấn đề',
+          'pb.sub':
+            'Một lần chạy test thì không sao. Bốn agent cùng chạy <code>vitest</code> với mỗi lõi một worker, thêm một <code>tsc</code> và một bản build, thì có chuyện: tất cả bắt đầu trong cùng một phút, và không ai trông coi cái máy.',
+          'pb.1.h': 'Mọi thứ chạy cùng lúc',
+          'pb.1': 'Mỗi agent tự quyết định chạy test, kiểm tra kiểu và build. Không agent nào biết các agent khác cũng đang làm y như vậy.',
+          'pb.2.h': 'Máy bị đơ',
+          'pb.2': 'RAM cạn, hệ thống phải dùng swap. Trình soạn thảo, terminal và chính các agent ngừng phản hồi.',
+          'pb.3.h': 'Test hết thời gian chờ',
+          'pb.3': 'Các lần chạy bị thiếu tài nguyên hỏng vì timeout, chẳng liên quan gì tới code. Agent chạy lại, máy càng tải nặng hơn.',
+          'how.h2': 'Cách hoạt động',
+          'how.sub':
+            'Mỗi tiến trình <code>calmrun</code> ghi việc của mình vào một file trạng thái nhỏ có khóa file của hệ điều hành bảo vệ, và mọi tiến trình đang chờ đều áp dụng cùng một bộ luật lên file đó. Không có tiến trình nền nào phải khởi động hay giữ cho sống.',
+          'dg.title': 'Việc từ các agent và terminal chờ trong một hàng; một việc bắt đầu khi mọi điều kiện đã thỏa và chạy ở mức ưu tiên thấp.',
+          'dg.term': 'terminal của bạn',
+          'dg.src': 'hook, MCP hoặc calmrun --',
+          'dg.q': 'Hàng chờ',
+          'dg.q.sub': '--prio high trước, rồi theo lượt',
+          'dg.p2a': '2 điểm',
+          'dg.p2b': '2 điểm',
+          'dg.p1': '1 điểm',
+          'dg.q.foot': 'một file trạng thái chung',
+          'dg.g': 'Bắt đầu khi',
+          'dg.g1': 'đủ điểm còn trống',
+          'dg.g2': 'còn đủ RAM trống',
+          'dg.g3': 'ổ đĩa còn chỗ',
+          'dg.g4': 'thư mục không bận',
+          'dg.g5': 'còn slot tài nguyên',
+          'dg.r': 'Đang chạy',
+          'dg.r.sub': 'ở mức ưu tiên CPU thấp',
+          'dg.r.pts': 'đã dùng 4 trên 6 điểm',
+          'dg.r.foot': 'có trần bộ nhớ canh chừng',
+          'dg.cap':
+            'Ngân sách mặc định là số lõi logic − 2, tối đa một điểm cho mỗi 4 GB RAM, ít nhất 2. <code>calmrun doctor</code> cho biết các con số trên máy của bạn.',
+          'how.1.h': 'Điểm theo loại lệnh',
+          'how.1':
+            'calmrun đọc lệnh và chọn loại: vitest, jest, tsc và build tốn 2 điểm, linter và các lần chạy test thường tốn 1. <code>--cost</code> và <code>--kind</code> ghi đè cách chọn này, còn loại lệnh của riêng bạn thì khai báo trong file cấu hình.',
+          'how.2.h': 'Điều kiện RAM và ổ đĩa',
+          'how.2':
+            'Một việc cũng phải chờ khi RAM trống ít hơn <code>min_free_gb</code> hoặc ổ đĩa của nó còn ít hơn <code>min_free_disk_gb</code>. Khi máy không chạy gì khác thì nó vẫn bắt đầu, nên không việc nào phải chờ mãi.',
+          'how.3.h': 'Mỗi thư mục một lần chạy',
+          'how.3':
+            'Việc vitest, jest và build giữ thư mục <code>node_modules</code> gần nhất; Cargo giữ thư mục <code>target</code>. Hai việc trên cùng một thư mục không bao giờ chạy cùng lúc, nên cache không giành nhau.',
+          'how.4.h': 'Ưu tiên thấp, bộ nhớ có giới hạn',
+          'how.4':
+            'Lệnh chạy dưới mức ưu tiên thường (<code>nice +10</code> trên Unix), nên trình soạn thảo vẫn mượt. Việc nào có cây tiến trình dùng quá <code>ceiling_gb</code> sẽ bị dừng với mã thoát 137.',
+          'how.5.h': 'Không nhận lệnh chạy mãi',
+          'how.5':
+            'Chế độ watch và <code>docker compose up</code> không có <code>-d</code> sẽ giữ điểm mãi mãi, nên calmrun từ chối và in ra lệnh chạy một lần để dùng thay. Dev server thì chạy ngay, không qua hàng chờ.',
+          'how.6.h': 'Vé chờ, tài nguyên, hàng riêng',
+          'how.6':
+            '<code>--wait-timeout</code> thôi chờ sau một khoảng thời gian (mã thoát 75) và giữ chỗ trong hàng 10 phút dưới dạng một vé. <code>--needs db</code> giữ một tài nguyên có tên; <code>--id</code> dùng một hàng chờ riêng.',
+          'kinds.h': 'Các loại lệnh và số điểm mặc định',
+          'kinds.c1': 'Loại',
+          'kinds.c2': 'Điểm',
+          'kinds.c3': 'Nhận ra từ',
+          'kinds.other': 'mọi lệnh khác',
+          'ag.h2': 'Tích hợp với agent',
+          'ag.sub':
+            'Agent không cần nhớ gì cả: hook của Claude Code bắt các lệnh shell nặng, MCP server cho mọi client MCP một công cụ <code>run_task</code> có xếp hàng, còn <code>setup</code> ghi hướng dẫn vào file toàn cục của từng agent.',
+          'ag.hook.h': 'Hook cho Claude Code',
+          'ag.hook':
+            '<code>calmrun hook claude</code> là một PreToolUse hook cho công cụ Bash và PowerShell. Khi một lệnh chạy công cụ nặng mà không qua calmrun, hook chặn lại và đưa cho Claude đúng câu lệnh với từng phần nặng đã được bọc. Lệnh nhẹ đi qua bình thường. Thêm vào <code>~/.claude/settings.json</code> hoặc <code>.claude/settings.json</code> của một project:',
+          'ag.hook.ex':
+            '<code>cd web &amp;&amp; npx vitest run</code> trở thành <code>cd web &amp;&amp; calmrun -- npx vitest run</code>. Với <code>CALMRUN_HOOK_MODE=rewrite</code>, hook tự sửa lệnh thay vì chặn.',
+          'ag.mcp.h': 'MCP server',
+          'ag.mcp':
+            '<code>calmrun mcp</code> cung cấp ba công cụ qua stdio: <code>run_task</code> (chờ trong cùng hàng chờ, chạy lệnh, trả về mã thoát và 200 dòng output cuối), <code>queue_status</code> và <code>bump</code>.',
+          'ag.setup.h': 'calmrun setup',
+          'ag.setup':
+            'Thêm một đoạn ngắn về calmrun vào file hướng dẫn toàn cục của Claude Code, Codex, Gemini CLI và OpenCode. Lệnh chỉ chạy thử cho tới khi bạn thêm <code>--write</code>; file nào bị sửa đều được sao lưu trước.',
+          'ag.setup.c1': '# xem sẽ thay đổi gì',
+          'ag.setup.c2': '# áp dụng',
+          'ag.setup.c3': '# chỉ một số agent',
+          'ag.setup.c4': '# thêm cả hook cho Claude Code',
+          'ag.setup.c5': '# gỡ cả hai ra',
+          'ag.guide.h': 'calmrun guide',
+          'ag.guide': 'In ra hướng dẫn ngắn để dán vào ngữ cảnh của agent. Hoặc tự thêm đoạn này vào <code>CLAUDE.md</code> hay <code>AGENTS.md</code>:',
+          'cmd.h2': 'Các lệnh',
+          'cmd.run':
+            'Xếp lệnh vào hàng chờ rồi chạy ở mức ưu tiên thấp. Tùy chọn: <code>--kind</code>, <code>--cost N</code>, <code>--prio high</code>, <code>--label L</code>, <code>--needs db,gpu</code>, <code>--id QUEUE</code>, <code>--wait-timeout SECS</code>, <code>--ticket ID</code>. Một chuỗi trong dấu nháy sẽ chạy qua shell.',
+          'cmd.status': 'Việc nào đang chạy, việc nào đang chờ và vì sao, ngân sách điểm và RAM trống. <code>--json</code> cho công cụ.',
+          'cmd.stats': 'Số lần chạy, số lần lỗi, thời gian chờ và chạy theo nhãn trong <code>--days N</code> ngày (mặc định 7).',
+          'cmd.bump': 'Đưa các việc đang chờ có nhãn chứa đoạn chữ này lên đầu hàng.',
+          'cmd.doctor': 'Số lõi, RAM, ổ đĩa, pin, nơi lưu trạng thái và cấu hình gợi ý.',
+          'cmd.init': 'Ghi một <code>config.toml</code> có chú thích với giá trị mặc định của máy này (<code>--force</code> để ghi đè).',
+          'cmd.guide': 'Hướng dẫn ngắn cho coding agent.',
+          'cmd.setup': 'Ghi hoặc gỡ đoạn calmrun trong file hướng dẫn toàn cục của các agent: <code>--write</code>, <code>--remove</code>, <code>--hook</code>, <code>--agents</code>.',
+          'cmd.hook': 'PreToolUse hook cho Claude Code; đọc JSON của hook từ stdin.',
+          'cmd.mcp': 'MCP server qua stdio: <code>run_task</code>, <code>queue_status</code>, <code>bump</code>.',
+          'exit.h': 'Mã thoát',
+          'exit.cmd': 'mã của chính lệnh',
+          'exit.cmd.d': 'lệnh đã chạy (trên Unix, tín hiệu <code>n</code> thành 128 + n)',
+          'exit.2': 'bị từ chối (chế độ watch, <code>docker compose up</code> không tách nền), tham số sai hoặc <code>--id</code> không hợp lệ',
+          'exit.75': 'chưa bắt đầu trong <code>--wait-timeout</code>; chỗ trong hàng vẫn được giữ, chạy dòng <code>calmrun: next:</code> được in ra',
+          'exit.124': 'bị dừng bởi <code>timeout_s</code> của MCP',
+          'exit.127': 'không khởi động được lệnh · không tìm thấy lệnh',
+          'exit.130': 'Ctrl+C',
+          'exit.137': 'bị dừng bởi trần bộ nhớ hoặc ngưỡng RAM trống tối thiểu',
+          'cfg.h2': 'Cấu hình và biến môi trường',
+          'cfg.sub':
+            'Mọi thiết lập đều không bắt buộc. <code>calmrun init</code> ghi một <code>config.toml</code> có chú thích trong thư mục trạng thái; biến môi trường được ưu tiên hơn file.',
+          'cfg.c1': 'Khóa · biến',
+          'cfg.c2': 'Mặc định và ý nghĩa',
+          'cfg.budget': 'Số lõi logic − 2, tối đa floor(RAM GB / 4), ít nhất 2. Số điểm được chạy cùng lúc.',
+          'cfg.minfree': 'max(3, RAM / 8). RAM trống cần có để một việc bắt đầu khi đang có việc khác chạy; 0 để tắt.',
+          'cfg.disk': '5. Dung lượng trống cần có trên ổ chứa thư mục của việc; 0 để tắt.',
+          'cfg.pass': '10. Số phút một việc đang chờ có thể bị các việc nhỏ hơn vừa chỗ vượt lên; 0 là giữ đúng thứ tự.',
+          'cfg.vitest': '1 khi tới 4 lõi, 2 khi dưới 12 lõi, còn lại 3. Giá trị <code>--maxWorkers</code> cho các lần gọi vitest trực tiếp.',
+          'cfg.ceiling': 'Một nửa RAM. Bộ nhớ tối đa cho cây tiến trình của một việc; 0 để tắt.',
+          'cfg.critical': '5% RAM, tối đa 1 GB. Thấp hơn mức này trong 3 giây thì việc lớn nhất bị dừng; 0 để tắt.',
+          'cfg.res': 'Số slot cho mỗi tài nguyên có tên, ví dụ <code>db = 1</code> hoặc <code>db=1,gpu=2</code>. Tài nguyên không khai báo có 1 slot.',
+          'cfg.kinds': '<code>cost</code> ghi đè số điểm của một loại; <code>patterns = ["make"]</code> thêm một loại của riêng bạn.',
+          'cfg.lowcpu': '<code>0</code> để giữ mức ưu tiên thường.',
+          'cfg.hookmode': '<code>rewrite</code> cho hook tự bọc lệnh thay vì chặn.',
+          'cfg.home': 'Thư mục trạng thái và đường dẫn file cấu hình.',
+          'pl.h2': 'Ghi chú theo hệ điều hành',
+          'pl.1':
+            '<b>Windows</b>: nơi calmrun được làm ra, đã kiểm tra bằng tay trên máy thật và trên CI. <code>npm</code>, <code>npx</code> và các shim <code>.cmd</code> khác đều chạy được; lệnh chạy trong một Job Object nên cả cây tiến trình kết thúc nếu calmrun bị tắt.',
+          'pl.2':
+            '<b>macOS và Linux</b>: được bộ test trên CI kiểm tra (máy chạy macOS và Ubuntu của GitHub), chưa kiểm tra bằng tay. Lệnh có nhóm tiến trình riêng với <code>nice +10</code> và kết thúc cùng calmrun.',
+          'pl.3':
+            'Bản phát hành được build cho x64 và arm64 trên cả ba hệ điều hành. CI chỉ chạy test trên Windows x64, Linux x64 và macOS arm64; các bản build còn lại chưa được test.',
+          'pl.4':
+            'Bộ nhớ được tính theo bộ nhớ thường trú của từng tiến trình (working set trên Windows, RSS ở nơi khác); trang nhớ dùng chung bị tính nhiều lần, nên tổng của một cây có thể cao hơn thực tế.',
+          'pl.5': 'Ctrl+Z và việc chuyển quyền điều khiển terminal không được CI kiểm tra, vì máy chạy CI không có terminal.',
+          'in.h2': 'Cài đặt',
+          'in.sub':
+            'Một file chạy, không cần runtime. Trình cài đặt đặt <code>calmrun</code> vào <code>~/.cargo/bin</code> (<code>%USERPROFILE%\\.cargo\\bin</code> trên Windows) và thêm vào PATH; mở terminal mới sau khi cài.',
+          'in.sh': 'macOS / Linux',
+          'in.ps': 'Windows (PowerShell)',
+          'in.npm': 'npm (mọi hệ điều hành)',
+          'in.cargo': 'Từ mã nguồn (Rust 1.95 trở lên)',
+          'in.man': 'Tải thủ công',
+          'in.man.d':
+            'Từ <a href="https://github.com/vannt-dev/calmrun/releases/latest">Releases</a>: <code>calmrun-x86_64-pc-windows-msvc.zip</code>, <code>calmrun-aarch64-pc-windows-msvc.zip</code>, <code>calmrun-x86_64-apple-darwin.tar.xz</code>, <code>calmrun-aarch64-apple-darwin.tar.xz</code>, <code>calmrun-x86_64-unknown-linux-gnu.tar.xz</code>, <code>calmrun-aarch64-unknown-linux-gnu.tar.xz</code>, mỗi file kèm một <code>.sha256</code>. Giải nén rồi đặt file chạy vào PATH.',
+          'in.first': 'Những bước đầu tiên',
+          'in.c1': '# máy này có gì, ngân sách gợi ý',
+          'in.c2': '# xếp hàng, rồi chạy ở mức ưu tiên thấp',
+          'in.c3': '# một chuỗi trong dấu nháy chạy qua shell',
+          'in.c4': '# việc nào chạy, việc nào chờ, và vì sao',
+          'in.c5': '# dạy các agent dùng calmrun',
+        },
+      };
+      var sel = document.getElementById('lang');
+      var EN = {};
+      document.querySelectorAll('[data-i18n]').forEach(function (el) {
+        EN[el.getAttribute('data-i18n')] = el.innerHTML;
+      });
+      function apply(lang) {
+        var dict = lang === 'en' ? EN : I18N[lang] || EN;
+        document.querySelectorAll('[data-i18n]').forEach(function (el) {
+          var k = el.getAttribute('data-i18n');
+          if (dict[k] !== undefined) el.innerHTML = dict[k];
+        });
+        document.documentElement.lang = lang;
+        sel.value = lang;
+        try {
+          localStorage.setItem('lang', lang);
+        } catch (e) {}
+      }
+      var saved = null;
+      try {
+        saved = localStorage.getItem('lang');
+      } catch (e) {}
+      var initial = saved || (navigator.language && navigator.language.toLowerCase().indexOf('vi') === 0 ? 'vi' : 'en');
+      if (initial !== 'en') apply(initial);
+      sel.addEventListener('change', function () {
+        apply(sel.value);
+      });
+
+      // Light / dark: follows the system until the visitor picks one.
+      (function () {
+        var root = document.documentElement;
+        var btn = document.getElementById('theme');
+        var t = null;
+        try {
+          t = localStorage.getItem('theme');
+        } catch (e) {}
+        if (t === 'light' || t === 'dark') root.setAttribute('data-theme', t);
+        btn.addEventListener('click', function () {
+          var cur = root.getAttribute('data-theme');
+          if (!cur) cur = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+          var next = cur === 'dark' ? 'light' : 'dark';
+          root.setAttribute('data-theme', next);
+          try {
+            localStorage.setItem('theme', next);
+          } catch (e) {}
+        });
+      })();
+    </script>
+  </body>
+</html>

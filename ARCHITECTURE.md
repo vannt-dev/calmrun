@@ -118,6 +118,8 @@ pure. Integration tests in `tests/` drive the real binary against a temporary
 - `memory.rs`: the memory ceiling.
 - `mcp.rs`: the JSON-RPC protocol.
 - `setup.rs`: setup against a temporary home.
+- `review.rs`: regression tests for review findings (watch refusal, setup backups, tickets in
+  `status`, the hook's absolute path, `npm.cmd` shadowing, a hard-killed calmrun).
 
 The hidden `__probe` subcommand is the test workload. It sleeps, logs start and end times,
 allocates memory, prints its arguments or environment, and spawns a daemon.

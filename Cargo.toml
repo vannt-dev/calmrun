@@ -10,7 +10,7 @@ homepage = "https://github.com/vannt-dev/calmrun"
 readme = "README.md"
 keywords = ["queue", "cli", "agents", "scheduler", "build"]
 categories = ["command-line-utilities", "development-tools"]
-exclude = [".github/"]
+exclude = [".github/", "docs/"]
 
 [dependencies]
 clap = { version = "4.6.9", features = ["derive"] }
