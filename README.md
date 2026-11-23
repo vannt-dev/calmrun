@@ -7,7 +7,8 @@
 [![npm](https://img.shields.io/npm/v/calmrun)](https://www.npmjs.com/package/calmrun)
 
 A machine-wide queue for heavy commands, so several coding agents and terminals on one computer
-don't run `vitest`, `tsc`, builds, Playwright and `docker compose` all at once and freeze it.
+don't run their builds and tests all at once and freeze it, in any stack: `vitest`, `pytest`,
+`cargo`, `gradle`, `dotnet`, `go`, `cmake`, Playwright, `docker compose` and more.
 
 ```sh
 calmrun -- npx vitest run
@@ -16,6 +17,11 @@ calmrun -- npx vitest run
 calmrun waits until the machine has room (budget points, free RAM, free disk), then runs the
 command at low CPU priority and passes its exit code back. There is no daemon: every `calmrun`
 process coordinates through a small state file guarded by an OS file lock.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vannt-dev/calmrun/main/docs/diagrams/overview-dark.svg">
+  <img alt="Several agents and terminals on one machine send heavy commands to calmrun, either directly as calmrun -- cmd or through the MCP tool run_task; the Claude Code hook catches a heavy command started without calmrun and denies it with the wrapped form, or rewrites it. calmrun first applies its command rules: a watch mode is refused with exit 2 and the one-shot form to run instead, and a dev server or app run starts at once outside the queue. Any other command is detected for its kind and cost, its exclusive key and a worker hint, then waits in the machine-wide queue until all gates hold: free budget points, enough free RAM and disk, its exclusive key and any named resource. With --wait-timeout it gives up with exit 75 and keeps its place as a ticket. Once admitted it runs at low CPU priority under a process-tree memory ceiling, and its exit code is passed back and recorded in the history." src="https://raw.githubusercontent.com/vannt-dev/calmrun/main/docs/diagrams/overview-light.svg">
+</picture>
 
 Works on Windows, macOS and Linux. Website: <https://vannt-dev.github.io/calmrun/>
 
@@ -32,8 +38,10 @@ nothing to do with the code, and every run gets slower than if they had taken tu
 makes them take turns:
 
 - Jobs start only while budget points are free, and wait while free RAM or disk is low.
-- Two test runs or builds on the same `node_modules` / Cargo `target` folder never run together.
-- Direct vitest, gradle and cargo calls get a worker count that fits their share of the machine.
+- Two test runs or builds on the same `node_modules`, Cargo `target` or project folder (Gradle,
+  Maven, .NET, CMake, Swift, Flutter, …) never run together.
+- Direct calls of vitest, cargo, gradle, dotnet, go, cmake, ninja, bazel and other tools that
+  use every core get a worker count that fits their share of the machine.
 - Commands run at low CPU priority, so your editor and the agents stay responsive.
 - A job whose process tree grows past a memory ceiling is stopped instead of taking the machine.
 - A killed terminal does not leave orphaned workers: the command's tree dies with calmrun.
