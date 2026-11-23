@@ -12,6 +12,11 @@ use std::path::{Path, PathBuf};
 /// Agents with a hook, in the order `all` installs them.
 pub const HOOK_AGENTS: &[&str] = &["claude", "codex", "antigravity", "opencode"];
 
+/// Hooks `all` leaves out when installing: they work, but what they suggest does not run yet
+/// in the agent's default setup. Antigravity runs commands in a terminal sandbox (on by
+/// default) that hides the other processes and blocks calmrun's state folder.
+pub const EXPERIMENTAL: &[&str] = &["antigravity"];
+
 /// The command line an agent runs for its hook.
 pub fn command(program: &str, agent: &str) -> String {
     format!("{program} hook {agent}")
@@ -157,12 +162,18 @@ fn place(agent: &'static str, home: &Path, all: &[Agent]) -> Place {
     Place { agent, dir, file }
 }
 
-/// The agents `--hook` names (`all` = every one), or an error for an unknown name.
-pub fn chosen(names: &[String]) -> Result<Vec<&'static str>, String> {
+/// The agents `--hook` names, or an error for an unknown name. `all` is every agent but the
+/// experimental ones when installing, and every one when removing.
+pub fn chosen(names: &[String], remove: bool) -> Result<Vec<&'static str>, String> {
     let mut out = Vec::new();
     for n in names {
         let found: Vec<&'static str> = match n.trim() {
-            "all" => HOOK_AGENTS.to_vec(),
+            "all" if remove => HOOK_AGENTS.to_vec(),
+            "all" => HOOK_AGENTS
+                .iter()
+                .copied()
+                .filter(|a| !EXPERIMENTAL.contains(a))
+                .collect(),
             n => match HOOK_AGENTS.iter().find(|a| **a == n) {
                 Some(a) => vec![*a],
                 None => {
@@ -186,6 +197,12 @@ pub fn chosen(names: &[String]) -> Result<Vec<&'static str>, String> {
 /// an error when it was named, a note under `--hook all`.
 pub(super) fn apply(r: &mut Report, opts: &Options, all: &[Agent], agents: &[&'static str]) {
     let every = opts.hook.iter().any(|n| n.trim() == "all");
+    if every && !opts.remove {
+        r.line(format!(
+            "hook      all: leaves out {} (experimental; name it to install it)",
+            EXPERIMENTAL.join(", ")
+        ));
+    }
     for &agent in agents {
         let p = place(agent, &opts.home, all);
         if !p.dir.is_dir() && !opts.remove {
@@ -202,6 +219,10 @@ pub(super) fn apply(r: &mut Report, opts: &Options, all: &[Agent], agents: &[&'s
         }
         match agent {
             "opencode" => apply_plugin(r, &p, opts),
+            "codex" => {
+                apply_json(r, &p, opts);
+                apply_codex_sandbox(r, &p.dir, &opts.state_dir, opts);
+            }
             _ => apply_json(r, &p, opts),
         }
     }
@@ -249,22 +270,225 @@ fn apply_json(r: &mut Report, p: &Place, opts: &Options) {
              review it with /hooks in Codex"
                 .into(),
         );
+    }
+    if p.agent == "antigravity" && !opts.remove {
         r.line(
-            "          note: Codex's workspace-write sandbox must let calmrun write its state \
-             directory: add it (`calmrun doctor` shows it) to \
-             sandbox_workspace_write.writable_roots in config.toml"
+            "          note: experimental: Antigravity's terminal sandbox (on by default) hides \
+             other processes and blocks calmrun's state folder, so the wrapped command fails \
+             there; allow calmrun to run outside it (see the README)"
                 .into(),
         );
     }
-    if !opts.write {
+    if opts.write {
+        let mut s = match serde_json::to_string_pretty(&new) {
+            Ok(s) => s,
+            Err(e) => return r.fail(format!("calmrun: cannot write {}: {e}", p.file.display())),
+        };
+        s.push('\n');
+        report_write(r, &p.file, write_with_backup(&p.file, &s));
+    }
+}
+
+/// Codex's config.toml, where its workspace-write sandbox lists the folders commands may
+/// write besides the workspace.
+const CODEX_CONFIG: &str = "config.toml";
+
+/// Make calmrun's state directory writable in Codex's workspace-write sandbox: add it to
+/// `sandbox_workspace_write.writable_roots` in Codex's config.toml, keeping everything else.
+/// When the file's layout is one calmrun does not edit, print the line to add instead.
+fn apply_codex_sandbox(r: &mut Report, codex_dir: &Path, state_dir: &Path, opts: &Options) {
+    let file = codex_dir.join(CODEX_CONFIG);
+    let dir = state_dir.to_string_lossy().to_string();
+    if opts.remove {
         return;
     }
-    let mut s = match serde_json::to_string_pretty(&new) {
-        Ok(s) => s,
-        Err(e) => return r.fail(format!("calmrun: cannot write {}: {e}", p.file.display())),
+    let text = match read_existing(&file) {
+        Ok(t) => t,
+        Err(msg) => return r.fail(msg),
     };
-    s.push('\n');
-    report_write(r, &p.file, write_with_backup(&p.file, &s));
+    match add_writable_root(&text, &dir) {
+        Ok(None) => r.line(format!(
+            "sandbox   {}: calmrun's state directory is already in \
+             sandbox_workspace_write.writable_roots",
+            file.display()
+        )),
+        Ok(Some(new)) => {
+            r.line(format!(
+                "sandbox   {}: {}let Codex's workspace-write sandbox write calmrun's state \
+                 directory:",
+                file.display(),
+                verb(opts)
+            ));
+            for l in added_lines(&text, &new) {
+                r.line(format!("          + {l}"));
+            }
+            if opts.write {
+                report_write(r, &file, write_with_backup(&file, &new));
+            }
+        }
+        Err(why) => {
+            r.line(format!(
+                "sandbox   {}: {why}; add calmrun's state directory yourself:",
+                file.display()
+            ));
+            r.line("          [sandbox_workspace_write]".into());
+            r.line(format!("          writable_roots = [{}]", toml_string(&dir)));
+        }
+    }
+}
+
+#[cfg(test)]
+mod sandbox_tests {
+    use super::*;
+
+    const DIR: &str = r"C:\Users\me\AppData\Local\calmrun";
+
+    fn roots(text: &str) -> Vec<String> {
+        let t: toml::Table = toml::from_str(text).unwrap();
+        t["sandbox_workspace_write"]["writable_roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn adds_the_section_and_keeps_the_rest() {
+        let old = "# my settings\nmodel = \"gpt\"\n\n[profiles.x]\nmodel = \"y\" # note\n";
+        let new = add_writable_root(old, DIR).unwrap().unwrap();
+        assert!(new.starts_with(old), "{new}");
+        assert_eq!(roots(&new), vec![DIR]);
+        assert!(new.contains(r"writable_roots = ['C:\Users\me\AppData\Local\calmrun']"));
+        // Already there (any case or slash on Windows): nothing to do.
+        assert_eq!(add_writable_root(&new, DIR).unwrap(), None);
+        assert_eq!(roots(&add_writable_root("", DIR).unwrap().unwrap()), vec![DIR]);
+    }
+
+    #[test]
+    fn adds_to_an_existing_table_or_one_line_array() {
+        let old = "[sandbox_workspace_write]\nnetwork_access = true\n";
+        let new = add_writable_root(old, DIR).unwrap().unwrap();
+        assert_eq!(roots(&new), vec![DIR]);
+        assert!(new.contains("network_access = true"));
+        let old = "[sandbox_workspace_write]\nwritable_roots = [\"/x\"]\n[other]\na = 1\n";
+        let new = add_writable_root(old, DIR).unwrap().unwrap();
+        assert_eq!(roots(&new), vec!["/x", DIR]);
+        assert!(new.contains("[other]\na = 1"));
+    }
+
+    #[test]
+    fn other_layouts_get_the_line_to_add() {
+        let multi = "[sandbox_workspace_write]\nwritable_roots = [\n  \"/x\",\n]\n";
+        assert!(add_writable_root(multi, DIR).is_err());
+        let dotted = "sandbox_workspace_write.network_access = true\n";
+        assert!(add_writable_root(dotted, DIR).is_err());
+        assert!(add_writable_root("not toml = = 1", DIR).is_err());
+        assert_eq!(toml_string("it's"), "\"it's\"");
+    }
+}
+
+/// `dir` as a TOML string: a literal string (no escapes for Windows backslashes) when it can.
+pub fn toml_string(dir: &str) -> String {
+    if dir.contains('\'') || dir.contains('\n') {
+        toml::Value::String(dir.to_string()).to_string()
+    } else {
+        format!("'{dir}'")
+    }
+}
+
+/// The lines of `new` that `old` lacks (for the dry run).
+fn added_lines(old: &str, new: &str) -> Vec<String> {
+    let before: std::collections::HashSet<&str> = old.lines().collect();
+    new.lines()
+        .filter(|l| !before.contains(l) && !l.trim().is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether two folder names are the same folder (case and slashes aside on Windows).
+fn same_dir(a: &str, b: &str) -> bool {
+    let norm = |s: &str| {
+        let s = s.trim_end_matches(['/', '\\']);
+        if cfg!(windows) {
+            s.replace('/', "\\").to_lowercase()
+        } else {
+            s.to_string()
+        }
+    };
+    norm(a) == norm(b)
+}
+
+/// `text` (Codex's config.toml) with `dir` in `sandbox_workspace_write.writable_roots`, by
+/// adding lines and never rewriting the rest. `Ok(None)`: already there. `Err`: a layout this
+/// does not edit (the caller prints the line to add).
+pub fn add_writable_root(text: &str, dir: &str) -> Result<Option<String>, String> {
+    let doc: toml::Table = toml::from_str(text).map_err(|_| "not valid TOML".to_string())?;
+    let section = doc.get("sandbox_workspace_write");
+    let roots = section.and_then(|s| s.get("writable_roots"));
+    if let Some(list) = roots.and_then(toml::Value::as_array) {
+        if list
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .any(|r| same_dir(r, dir))
+        {
+            return Ok(None);
+        }
+    }
+    let entry = toml_string(dir);
+    let lines: Vec<&str> = text.lines().collect();
+    let bare = |l: &str| l.split('#').next().unwrap_or("").trim().to_string();
+    let header = lines.iter().position(|l| bare(l) == "[sandbox_workspace_write]");
+    let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    match (header, roots) {
+        (None, None) if section.is_none() => {
+            if out.last().is_some_and(|l| !l.trim().is_empty()) {
+                out.push(String::new());
+            }
+            out.push("[sandbox_workspace_write]".into());
+            out.push(format!("writable_roots = [{entry}]"));
+        }
+        (Some(h), None) => out.insert(h + 1, format!("writable_roots = [{entry}]")),
+        (Some(h), Some(_)) => {
+            // A one-line array in the section: add the entry before its `]`.
+            let end = lines[h + 1..]
+                .iter()
+                .position(|l| bare(l).starts_with('['))
+                .map_or(lines.len(), |p| h + 1 + p);
+            let at = (h + 1..end)
+                .find(|&i| bare(lines[i]).starts_with("writable_roots"))
+                .filter(|&i| lines[i].trim_end().ends_with(']'))
+                .ok_or_else(|| "writable_roots spans several lines".to_string())?;
+            let line = lines[at].trim_end();
+            let inner = line[..line.len() - 1].trim_end();
+            let sep = if inner.ends_with('[') || inner.ends_with(',') {
+                ""
+            } else {
+                ", "
+            };
+            out[at] = format!("{inner}{sep}{entry}]");
+        }
+        _ => return Err("sandbox_workspace_write is not a [sandbox_workspace_write] table".into()),
+    }
+    let mut new = out.join("\n");
+    new.push('\n');
+    // Only an edit that parses and says what was meant is kept.
+    let check: toml::Table = toml::from_str(&new).map_err(|_| "could not edit it safely".to_string())?;
+    let ok = check
+        .get("sandbox_workspace_write")
+        .and_then(|s| s.get("writable_roots"))
+        .and_then(toml::Value::as_array)
+        .is_some_and(|l| l.iter().filter_map(toml::Value::as_str).any(|r| r == dir));
+    // Every other setting reads back the same.
+    let kept = doc
+        .iter()
+        .filter(|(k, _)| *k != "sandbox_workspace_write")
+        .all(|(k, v)| check.get(k) == Some(v));
+    if ok && kept {
+        Ok(Some(new))
+    } else {
+        Err("could not edit it safely".into())
+    }
 }
 
 fn apply_plugin(r: &mut Report, p: &Place, opts: &Options) {
@@ -382,11 +606,25 @@ mod tests {
     #[test]
     fn hook_names_are_checked() {
         assert_eq!(
-            chosen(&["codex".into(), "claude".into()]).unwrap(),
+            chosen(&["codex".into(), "claude".into()], false).unwrap(),
             ["codex", "claude"]
         );
-        assert_eq!(chosen(&["all".into(), "codex".into()]).unwrap(), HOOK_AGENTS);
-        assert!(chosen(&["gemini".into()]).unwrap_err().contains("known: claude"));
+        assert_eq!(
+            chosen(&["all".into(), "codex".into()], true).unwrap(),
+            HOOK_AGENTS
+        );
+        // Installing `all` leaves the experimental Antigravity hook out unless it is named.
+        assert_eq!(
+            chosen(&["all".into()], false).unwrap(),
+            ["claude", "codex", "opencode"]
+        );
+        assert_eq!(
+            chosen(&["all".into(), "antigravity".into()], false).unwrap(),
+            ["claude", "codex", "opencode", "antigravity"]
+        );
+        assert!(chosen(&["gemini".into()], false)
+            .unwrap_err()
+            .contains("known: claude"));
     }
 
     #[test]

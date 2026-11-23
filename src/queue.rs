@@ -129,8 +129,12 @@ impl Ctx {
         }
     }
 
-    /// The files of the selected queue.
+    /// The files of the selected queue. Refused inside a sandbox that hides the other
+    /// processes: every owner would look dead there.
     pub fn store(&self) -> Result<Store> {
+        if crate::sys::in_app_container() {
+            return Err(Error::Sandboxed);
+        }
         let opened = match &self.queue {
             Some(id) => Store::open_queue(&self.home, id),
             None => Store::open(&self.home),

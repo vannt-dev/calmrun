@@ -9,6 +9,7 @@ fn setup(home: &Path, args: &[&str]) -> (i32, String) {
     let mut c = Command::new(EXE);
     c.env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("CODEX_HOME")
+        .env("CALMRUN_HOME", home.join("calmrun state"))
         .arg("setup")
         .arg("--home")
         .arg(home)
@@ -216,7 +217,52 @@ fn a_hook_for_a_missing_agent_creates_nothing() {
     // Under `all`, missing agents are only noted.
     let (code, out) = setup(home.path(), &["--hook", "all", "--agents", "claude"]);
     assert_eq!(code, 0, "{out}");
-    assert!(out.contains("is antigravity installed?"), "{out}");
+    assert!(out.contains("is opencode installed?"), "{out}");
+    assert!(out.contains("leaves out antigravity (experimental"), "{out}");
+    assert!(!out.contains("is antigravity installed?"), "{out}");
     let (code, out) = setup(home.path(), &["--hook", "gemini"]);
     assert_eq!(code, 2, "{out}");
+}
+
+#[test]
+fn codex_sandbox_gets_the_state_directory_as_a_writable_root() {
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join(".codex/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let mine = "# mine
+model = \"gpt-5\"
+
+[sandbox_workspace_write]
+network_access = true
+";
+    std::fs::write(&config, mine).unwrap();
+    let state = home.path().join("calmrun state").to_string_lossy().to_string();
+    // The dry run shows the line and changes nothing.
+    let (code, out) = setup(home.path(), &["--hook", "codex", "--agents", "codex"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains(&format!("+ writable_roots = ['{state}']")), "{out}");
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), mine);
+    let (code, out) = setup(home.path(), &["--write", "--hook", "codex", "--agents", "codex"]);
+    assert_eq!(code, 0, "{out}");
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(
+        text.starts_with(
+            "# mine
+model = \"gpt-5\"
+"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("network_access = true"), "{text}");
+    let t: toml::Table = toml::from_str(&text).unwrap();
+    assert_eq!(
+        t["sandbox_workspace_write"]["writable_roots"][0].as_str(),
+        Some(state.as_str())
+    );
+    // Again: already there.
+    let (_, out) = setup(home.path(), &["--write", "--hook", "codex", "--agents", "codex"]);
+    assert!(
+        out.contains("already in sandbox_workspace_write.writable_roots"),
+        "{out}"
+    );
 }

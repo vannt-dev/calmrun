@@ -71,6 +71,7 @@ fn dispatch(cli: Cli) -> i32 {
                 program: crate::hook::program_name(),
                 agents: agents.clone(),
                 home,
+                state_dir: config::home_dir(),
             })
         }
         Some(Sub::Guide) => {

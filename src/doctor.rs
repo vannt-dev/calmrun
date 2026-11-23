@@ -32,6 +32,9 @@ pub fn report(
     s += &format!("disk (cwd):   {}\n", crate::sys::disk_kind(&cwd));
     s += &format!("battery:      {battery}\n");
     s += &format!("state dir:    {}\n", home.display());
+    if crate::sys::in_app_container() {
+        s += "sandbox:      yes (Windows AppContainer): calmrun cannot use the queue from here\n";
+    }
     s += &format!(
         "config file:  {}{}\n",
         config_file.display(),

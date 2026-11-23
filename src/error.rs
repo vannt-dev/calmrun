@@ -45,6 +45,17 @@ pub enum Error {
     #[error("cannot read system information: {0}")]
     SystemInfo(String),
 
+    /// Running inside a sandbox that hides the other processes (a Windows AppContainer).
+    #[error(
+        "this calmrun runs inside a sandbox (a Windows AppContainer, such as Antigravity's \
+         terminal sandbox) that hides the other processes and the shared state folder, so it \
+         cannot take part in the queue\n\
+         calmrun: next: let the agent run calmrun outside its sandbox (Antigravity: a \
+         `command(regex:...calmrun...)` allow rule, see the README), or run the command \
+         without calmrun"
+    )]
+    Sandboxed,
+
     /// A file could not be written.
     #[error("cannot write {path}: {source}")]
     Write {
@@ -100,5 +111,12 @@ mod tests {
         let text = e.to_string();
         assert!(text.starts_with("cannot run vitestt: command not found: vitestt\ncalmrun: next:"));
         assert_eq!(Error::InvalidQueue("../x".into()).exit_code(), 2);
+        assert!(Error::Sandboxed.to_string().contains("\ncalmrun: next: "));
+        assert!(Error::Sandboxed.to_string().is_ascii());
+    }
+
+    #[test]
+    fn tests_do_not_run_in_a_sandbox() {
+        assert!(!crate::sys::in_app_container());
     }
 }

@@ -22,7 +22,12 @@ pub fn handle(input: &str, o: &Opts) -> Option<String> {
     let command = call.get("args")?.get("CommandLine")?.as_str()?;
     let c = Call {
         command,
-        shell: Shell::Posix,
+        // run_command runs PowerShell on Windows.
+        shell: if cfg!(windows) {
+            Shell::PowerShell
+        } else {
+            Shell::Posix
+        },
         limit_ms: None,
         background: false,
     };
@@ -68,7 +73,13 @@ mod tests {
         let v = run("run_command", "npm run build", Mode::Deny).unwrap();
         assert_eq!(v["decision"], "deny");
         let reason = v["reason"].as_str().unwrap();
-        assert!(reason.contains("\nC:/t/calmrun.exe -- npm run build"), "{reason}");
+        // PowerShell on Windows keeps the backslashes; sh elsewhere gets forward slashes.
+        let exe = if cfg!(windows) {
+            r"C:\t\calmrun.exe"
+        } else {
+            "C:/t/calmrun.exe"
+        };
+        assert!(reason.contains(&format!("\n{exe} -- npm run build")), "{reason}");
         assert!(!reason.contains("--wait-timeout"), "{reason}");
     }
 
@@ -76,9 +87,29 @@ mod tests {
     fn rewrite_overwrites_only_the_command_line() {
         let v = run("run_command", "cd web && npx vitest run", Mode::Rewrite).unwrap();
         assert_eq!(v["decision"], "allow");
+        let exe = if cfg!(windows) {
+            r"C:\t\calmrun.exe"
+        } else {
+            "C:/t/calmrun.exe"
+        };
         assert_eq!(
             v["overwrite"],
-            json!({"CommandLine": "cd web && C:/t/calmrun.exe -- npx vitest run"})
+            json!({"CommandLine": format!("cd web && {exe} -- npx vitest run")})
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_quoted_path_is_called_with_the_call_operator_on_windows() {
+        let out = handle(
+            &input("run_command", "npm test"),
+            &super::super::opts(Mode::Rewrite, r#""C:\My Tools\calmrun.exe""#),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["overwrite"]["CommandLine"],
+            r#"& "C:\My Tools\calmrun.exe" -- npm test"#
         );
     }
 
