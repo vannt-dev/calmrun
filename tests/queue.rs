@@ -391,8 +391,10 @@ fn wait_timeout_keeps_the_place_with_a_ticket() {
         .find_map(|l| l.strip_prefix("calmrun: next: "))
         .unwrap_or_else(|| panic!("no next line in: {err}"))
         .to_string();
-    assert!(next.starts_with("calmrun --ticket "), "{next}");
-    let ticket = next.split_whitespace().nth(2).unwrap().to_string();
+    // `calmrun`, or calmrun's path when it is not on PATH.
+    let words: Vec<&str> = next.split_whitespace().collect();
+    assert!(words[0].contains("calmrun") && words[1] == "--ticket", "{next}");
+    let ticket = words[2].to_string();
     let s = env.status();
     assert_eq!(s["parked"][0]["ticket"].to_string(), ticket);
     assert_eq!(s["waiting"].as_array().unwrap().len(), 0);
@@ -420,10 +422,9 @@ fn refusal_prints_the_next_command() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains("calmrun: next: calmrun -- docker compose up -d"),
-        "{err}"
-    );
+    // `calmrun`, or its path when it is not on PATH.
+    assert!(err.contains("calmrun: next: "), "{err}");
+    assert!(err.contains(" -- docker compose up -d"), "{err}");
 }
 
 #[test]

@@ -144,11 +144,15 @@ pub fn wait_timeout(
 }
 
 /// The refusal for an attached `docker compose up`, with the fixed command when possible.
-/// `hint` says how to run that command (`{command}` is replaced; default: the CLI form).
+/// `hint` says how to run that command (`{command}` is replaced; default: the CLI form,
+/// with calmrun's path when it is not on PATH).
 pub fn refused(reason: &str, fixed: Option<&[String]>, hint: Option<&str>) -> String {
     let next = match fixed {
         Some(f) => hint
-            .unwrap_or("calmrun -- {command}")
+            .map_or_else(
+                || format!("{} -- {{command}}", crate::runner::program_name()),
+                str::to_string,
+            )
             .replace("{command}", &f.join(" ")),
         None => "run it outside calmrun".to_string(),
     };

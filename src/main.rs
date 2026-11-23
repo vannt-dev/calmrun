@@ -25,7 +25,7 @@ mod sys;
 mod tasks;
 
 use clap::Parser;
-use cli::{Cli, HookTarget, Sub};
+use cli::{Cli, Sub};
 use queue::Ctx;
 
 fn main() {
@@ -50,15 +50,13 @@ fn dispatch(cli: Cli) -> i32 {
         Some(Sub::Hold(ref a)) => with_ctx(&|c| commands::hold(c, a)),
         Some(Sub::Release(ref a)) => with_ctx(&|c| commands::release(c, &a.lease)),
         Some(Sub::Doctor) => with_ctx(&commands::doctor),
-        Some(Sub::Hook {
-            target: HookTarget::Claude,
-        }) => commands::hook(),
+        Some(Sub::Hook { ref target }) => commands::hook(target),
         Some(Sub::Init { force }) => commands::init(force),
         Some(Sub::Mcp) => mcp::serve(),
         Some(Sub::Setup {
             write,
             remove,
-            hook,
+            ref hook,
             ref agents,
             ref home,
         }) => {
@@ -69,7 +67,8 @@ fn dispatch(cli: Cli) -> i32 {
             commands::setup(setup::Options {
                 write,
                 remove,
-                hook,
+                hook: hook.clone().unwrap_or_default(),
+                program: crate::hook::program_name(),
                 agents: agents.clone(),
                 home,
             })

@@ -8,6 +8,20 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Hooks for Codex (`calmrun hook codex`), Antigravity (`calmrun hook antigravity`) and OpenCode
+  (`calmrun hook opencode`, through a small plugin), with the same decision as the Claude Code
+  hook: deny with the wrapped command, or rewrite it with `CALMRUN_HOOK_MODE=rewrite`.
+- `calmrun setup --hook claude,codex,antigravity,opencode` (or `--hook all`) installs them in
+  each agent's user-level file, keeping other tools' hooks there; bare `--hook` still means
+  Claude Code.
+- Suggested commands carry a `--wait-timeout` just below the agent's shell time limit (Claude
+  Code, OpenCode), so a long wait ends with exit 75 and a kept place instead of a killed call.
+  Deny texts show the queue's load and, for long kinds, the background form; Claude Code's
+  rewrite mode runs long kinds with `run_in_background`.
+- The hooks find heavy commands inside `if`/`for`/`while` blocks, PowerShell `if ($?) { … }`
+  and `try { … }` blocks, `$( … )`, subshells, `bash -c "…"` / `pwsh -Command '…'` scripts and
+  after `timeout`. `npm --prefix web test` (and `-w`, `pnpm -C`, `--filter`) and `node --test`
+  are detected; `node --watch` is refused with its one-shot form.
 - MCP tasks outlive tool timeouts: `run_task` takes `wait_seconds` (default 25). A job that has
   not ended by then keeps its place and goes on in the server; the call answers at once with a
   `task_id`, its state (`waiting` with place and points, or `running`) and the output so far.
@@ -24,6 +38,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- The `next:` line of a refused watch mode suggests the same one-shot form as the hooks
+  (`npx vitest --watch` -> `npx vitest run`).
+- `next:` lines and the hook commands `setup` writes name calmrun's absolute path when
+  `calmrun` is not on `PATH`.
 - A job waiting only for a resource that a lease holds never stops later jobs from passing.
 - MCP results carry calmrun's notes (an expired ticket that joined the end of the line), a
   refusal names the `run_task` call to make instead of the CLI form, and the summary line drops

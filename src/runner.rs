@@ -86,6 +86,19 @@ pub fn on_path(name: &str) -> bool {
     imp::find_on_path(name).is_some()
 }
 
+/// `calmrun` when a shell can find it on PATH, else this binary's absolute path (quoted when
+/// needed), so a suggested command never fails with "command not found". The path has
+/// forward slashes: Git Bash (an agent's Bash tool on Windows) eats backslashes, and
+/// PowerShell and cmd accept both.
+pub fn program_name() -> String {
+    if on_path("calmrun") {
+        return "calmrun".to_string();
+    }
+    std::env::current_exe()
+        .map(|p| quote_for_display(&p.to_string_lossy().replace('\\', "/")))
+        .unwrap_or_else(|_| "calmrun".to_string())
+}
+
 /// Quote a word for display so it can be pasted back into this OS's usual shell.
 pub fn quote_for_display(w: &str) -> String {
     const SAFE: &str = "_@%+=:,./-\\";

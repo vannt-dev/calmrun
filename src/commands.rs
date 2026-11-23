@@ -1,6 +1,6 @@
 //! The CLI subcommands. Each returns the process exit code.
 
-use crate::cli::{Cli, Prio, ProbeArgs};
+use crate::cli::{Cli, HookTarget, Prio, ProbeArgs};
 use crate::config::{self, bytes_to_gb};
 use crate::error::Error;
 use crate::lease::{self, HoldArgs};
@@ -57,7 +57,10 @@ pub fn run_queued(mut ctx: Ctx, cli: Cli) -> i32 {
         }
     }
     let req = queue::Request {
-        rerun_hint: Some(rerun_hint(std::env::args().skip(1).collect())),
+        rerun_hint: Some(rerun_hint(
+            &runner::program_name(),
+            std::env::args().skip(1).collect(),
+        )),
         wait_timeout: cli.wait_timeout.filter(|t| *t > 0.0).map(Duration::from_secs_f64),
         ticket: cli.ticket,
         needs: cli.needs,
@@ -76,10 +79,10 @@ pub fn run_queued(mut ctx: Ctx, cli: Cli) -> i32 {
 }
 
 /// The command line that resumes this run with its ticket: the same arguments with
-/// `--ticket {ticket}` in front (an older --ticket is dropped).
-pub fn rerun_hint(args: Vec<String>) -> String {
+/// `--ticket {ticket}` in front (an older --ticket is dropped). `program` starts calmrun.
+pub fn rerun_hint(program: &str, args: Vec<String>) -> String {
     let mut out = vec![
-        "calmrun".to_string(),
+        program.to_string(),
         "--ticket".to_string(),
         "{ticket}".to_string(),
     ];
@@ -202,7 +205,8 @@ pub fn hold(mut ctx: Ctx, a: &HoldArgs) -> i32 {
             }
             Ok(None) => {
                 eprintln!(
-                    "calmrun: lease {id} is gone (released or expired); take a new one with `calmrun hold`"
+                    "calmrun: lease {id} is gone (released or expired); take a new one with `{} hold`",
+                    runner::program_name()
                 );
                 1
             }
@@ -228,8 +232,9 @@ pub fn hold(mut ctx: Ctx, a: &HoldArgs) -> i32 {
         Ok(id) => {
             println!("{id}");
             eprintln!(
-                "calmrun: holding {what} for {} (lease {id}); give it back with `calmrun release {id}{}`",
+                "calmrun: holding {what} for {} (lease {id}); give it back with `{} release {id}{}`",
                 history::human_ms(for_ms),
+                runner::program_name(),
                 queue_flag(&ctx)
             );
             0
@@ -348,7 +353,13 @@ pub fn stats(days: u32, as_json: bool) -> i32 {
 }
 
 /// `calmrun hook claude`. Fails open: any problem means no output and exit 0.
-pub fn hook() -> i32 {
+pub fn hook(target: &HookTarget) -> i32 {
+    let agent = match target {
+        HookTarget::Claude => hook::Agent::Claude,
+        HookTarget::Codex => hook::Agent::Codex,
+        HookTarget::Antigravity => hook::Agent::Antigravity,
+        HookTarget::Opencode => hook::Agent::OpenCode,
+    };
     let mut input = String::new();
     if std::io::stdin().read_to_string(&mut input).is_err() {
         return 0;
@@ -357,10 +368,30 @@ pub fn hook() -> i32 {
     let kinds = config::read_file_config(&config::config_path(&home))
         .map(|f| f.kinds)
         .unwrap_or_default();
-    if let Some(out) = hook::handle(&input, hook::Mode::from_env(), &kinds, &hook::program_name()) {
+    let program = hook::program_name();
+    let opts = hook::Opts {
+        mode: hook::Mode::from_env(),
+        kinds: &kinds,
+        program: &program,
+        load: &queue_load,
+    };
+    if let Some(out) = hook::run(agent, &input, &opts) {
         println!("{out}");
     }
     0
+}
+
+/// One line on the machine-wide queue for an agent that is told to wait in it:
+/// `Queue now: 3 of 3 points in use, 1 waiting.` `None` when the state cannot be read.
+fn queue_load() -> Option<String> {
+    let mut ctx = Ctx::load().ok()?;
+    let state = status::snapshot(&mut ctx).ok()?;
+    let budget = ctx.cfg.budget;
+    let used = scheduler::used_points(&state.jobs, budget) + scheduler::leased_points(&state.leases, budget);
+    let waiting = scheduler::waiting_in_order(&state.jobs).len();
+    Some(format!(
+        "Queue now: {used} of {budget} points in use, {waiting} waiting."
+    ))
 }
 
 /// `calmrun init [--force]`.
@@ -453,14 +484,14 @@ mod tests {
     #[test]
     fn rerun_hint_keeps_args_and_replaces_ticket() {
         assert_eq!(
-            rerun_hint(v("--wait-timeout 60 -- npx vitest run")),
+            rerun_hint("calmrun", v("--wait-timeout 60 -- npx vitest run")),
             "calmrun --ticket {ticket} --wait-timeout 60 -- npx vitest run"
         );
         assert_eq!(
-            rerun_hint(v("--ticket 4 --cost 2 -- cargo test")),
+            rerun_hint("calmrun", v("--ticket 4 --cost 2 -- cargo test")),
             "calmrun --ticket {ticket} --cost 2 -- cargo test"
         );
-        let h = rerun_hint(vec!["--".into(), "echo".into(), "a b".into()]);
+        let h = rerun_hint("calmrun", vec!["--".into(), "echo".into(), "a b".into()]);
         assert!(
             h.ends_with("-- echo \"a b\"") || h.ends_with("-- echo 'a b'"),
             "{h}"
