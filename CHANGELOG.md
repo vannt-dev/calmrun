@@ -35,6 +35,10 @@ All notable changes to this project are documented here. The format follows
 
 - Dev servers and other commands that run outside the queue keep their arguments unchanged,
   and the Claude Code hook no longer wraps them.
+- The Claude Code hook follows the runner's command rules: a watch mode gets its one-shot form
+  (`npx vitest` → `calmrun -- npx vitest run`, `docker compose up` → `… up -d`), and one
+  without such a form (`sbt shell`, `cargo watch`) is left alone instead of being sent to a
+  calmrun that refuses it.
 
 ## [0.1.0] - 2026-11-23
 

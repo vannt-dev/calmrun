@@ -441,8 +441,15 @@ cd web && npm ci && npx vitest run      →      cd web && npm ci && calmrun -- 
 Light commands (`git`, `ls`, `cat`, `npm install`, …) are never blocked, heredoc bodies (for
 example a commit message written with `<<'EOF'`) are not treated as commands, and any input the
 hook does not understand is allowed (no output, exit 0). Wrappers such as `VAR=1`, `time` or
-`nice` stay in front: `time npx vitest` becomes `time calmrun -- npx vitest`. When `calmrun` is
-not on the agent's `PATH`, the suggestion uses calmrun's absolute path.
+`nice` stay in front: `time npx vitest run` becomes `time calmrun -- npx vitest run`. When
+`calmrun` is not on the agent's `PATH`, the suggestion uses calmrun's absolute path.
+
+The hook follows the same [command rules](#command-rules) as `calmrun --`, so it never
+suggests a command calmrun would refuse. A watch mode with a one-shot form gets that form
+(`dotnet watch test` → `calmrun -- dotnet test`, `npx vitest` → `calmrun -- npx vitest run`,
+`docker compose up` → `calmrun -- docker compose up -d`). A watch mode or interactive session
+without one (`sbt shell`, `cargo watch`, `nx watch`, `docker run -it`), dev servers and app
+runs are left alone.
 
 Add it to `.claude/settings.json` in a project, or to `~/.claude/settings.json` for every
 project (or let `calmrun setup --write --hook` do it):

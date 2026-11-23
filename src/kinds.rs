@@ -991,6 +991,7 @@ pub const ENDLESS: &[EndlessRule] = &[
     },
     EndlessRule {
         sub: Some(&["run"]),
+        what: "build_runner's watch mode",
         ..endless(&["dart"], Endless::Words(&["watch", "serve"]), Fix::None)
     },
     EndlessRule {

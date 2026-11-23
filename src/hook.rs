@@ -8,7 +8,7 @@
 
 use crate::config::KindConfig;
 use crate::detect::{detect_words, disposition, parse, tool_name, Disposition};
-use crate::shell::split_segments;
+use crate::shell::{split_segments, Word};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -62,19 +62,35 @@ pub fn wrap_with(
         if already_wrapped(&words) {
             continue;
         }
-        let d = detect_words(&words, kinds);
-        let Some(kind) = d.kind else { continue };
-        // Dev servers, app runs and help output run outside the queue anyway.
-        if matches!(disposition(&words, false), Disposition::Light(_)) {
-            continue;
-        }
         let Some(p) = parse(&words) else { continue };
         // Keep leading `VAR=value` assignments in front of calmrun (they reach the child).
         let insert_at = spans.get(p.start).map_or(0, |w| w.start);
+        // The runner's own verdict, as if stdin were a terminal (the strictest case: plain
+        // vitest watches then), so the suggestion is always a command calmrun accepts.
+        let (kind, text) = match disposition(&words, true) {
+            // Dev servers, app runs and help output run outside the queue anyway.
+            Disposition::Light(_) => continue,
+            Disposition::Queue => match detect_words(&words, kinds).kind {
+                Some(k) => (k, seg[insert_at..].to_string()),
+                None => continue,
+            },
+            // A watch mode with a one-shot form: suggest that form, if it is heavy.
+            Disposition::Refuse { fixed: Some(f), .. } => {
+                let Some(f) = accepted(f) else { continue };
+                let Some(k) = detect_words(&f, kinds).kind else {
+                    continue;
+                };
+                let body = seg.trim_end();
+                let text = render(body, &spans[p.start..], &f[p.start..]);
+                (k, format!("{text}{}", &seg[body.len()..]))
+            }
+            // No one-shot form: calmrun would refuse it too, so leave it alone.
+            Disposition::Refuse { fixed: None, .. } => continue,
+        };
         out.push_str(&cmd[last..r.start + insert_at]);
         out.push_str(program);
         out.push_str(" -- ");
-        out.push_str(&cmd[r.start + insert_at..r.end]);
+        out.push_str(&text);
         last = r.end;
         if !found.contains(&kind) {
             found.push(kind);
@@ -85,6 +101,60 @@ pub fn wrap_with(
     }
     out.push_str(&cmd[last..]);
     Some((out, found))
+}
+
+/// The one-shot form, fixed again while calmrun would still refuse it (`npx vitest --watch`
+/// -> `npx vitest` -> `npx vitest run`); `None` when no accepted form is found.
+fn accepted(mut words: Vec<String>) -> Option<Vec<String>> {
+    for _ in 0..3 {
+        match disposition(&words, true) {
+            Disposition::Queue => return Some(words),
+            Disposition::Refuse { fixed: Some(f), .. } => words = f,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// `fixed` written as shell text: words it shares with the original `spans` of `seg` keep
+/// their exact text (quotes, escapes); new words are quoted when needed.
+fn render(seg: &str, spans: &[Word], fixed: &[String]) -> String {
+    // The raw text of each original word: up to the next word, without the spaces.
+    let raw: Vec<&str> = spans
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            let end = spans.get(i + 1).map_or(seg.len(), |n| n.start);
+            seg[w.start..end].trim_end()
+        })
+        .collect();
+    // Longest common subsequence of the two word lists (both are short).
+    let (n, m) = (spans.len(), fixed.len());
+    let mut lcs = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[i][j] = if spans[i].text == fixed[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    let mut out: Vec<String> = Vec::new();
+    while j < m {
+        if i < n && spans[i].text == fixed[j] {
+            out.push(raw[i].to_string());
+            i += 1;
+            j += 1;
+        } else if i < n && lcs[i + 1][j] >= lcs[i][j + 1] {
+            i += 1;
+        } else {
+            out.push(crate::runner::quote_for_display(&fixed[j]));
+            j += 1;
+        }
+    }
+    out.join(" ")
 }
 
 /// `calmrun` when the agent's shell can find it on PATH, else this binary's absolute path,
@@ -257,6 +327,107 @@ mod tests {
             "cargo build --help",
         ] {
             assert!(run("Bash", c, Mode::Deny).is_none(), "{c}");
+        }
+    }
+
+    /// Heavy commands, watch modes and servers from every ecosystem.
+    const MIXED: &[&str] = &[
+        "npx vitest",
+        "npx vitest --watch",
+        "vitest watch",
+        "npx vitest run",
+        "docker compose up",
+        "docker-compose -f a.yml up --build",
+        "podman compose up",
+        "docker compose up -d",
+        "docker run -it ubuntu",
+        "tsc -w",
+        "npx jest --watchAll",
+        "sbt",
+        "sbt shell",
+        "sbt console",
+        "sbt ~compile",
+        "sbt compile",
+        "dart run build_runner watch",
+        "dart run build_runner build",
+        "gradle build --continuous",
+        "./gradlew -t test",
+        "stack build --file-watch",
+        "stack build",
+        "nx watch --all -- echo hi",
+        "lerna watch -- tsc",
+        "parcel watch index.html",
+        "mix test.watch",
+        "cargo watch -x test",
+        "dotnet watch test",
+        "dotnet watch",
+        "turbo watch build",
+        "dune build -w",
+        "zig build --watch",
+        "ibazel build //...",
+        "webpack --watch",
+        "vite build --watch",
+        "./gradlew bootRun",
+        "turbo run dev",
+        "cargo build",
+        "go test ./...",
+        "make",
+    ];
+
+    #[test]
+    fn every_suggestion_is_a_command_calmrun_accepts() {
+        for c in MIXED {
+            let Some((w, _)) = wrap_command(c, &BTreeMap::new()) else {
+                continue;
+            };
+            let rest = w
+                .strip_prefix("calmrun -- ")
+                .unwrap_or_else(|| panic!("{c}: {w}"));
+            let words = crate::shell::tokenize(rest);
+            for tty in [true, false] {
+                assert_eq!(
+                    disposition(&words, tty),
+                    Disposition::Queue,
+                    "{c} -> {w} (stdin tty: {tty})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn watch_modes_get_their_one_shot_form_or_are_left_alone() {
+        let w = |c: &str| wrap_command(c, &BTreeMap::new()).map(|(w, _)| w);
+        for (c, want) in [
+            ("npx vitest", "calmrun -- npx vitest run"),
+            ("npx vitest --watch", "calmrun -- npx vitest run"),
+            ("dotnet watch test", "calmrun -- dotnet test"),
+            ("gradle build --continuous", "calmrun -- gradle build"),
+            ("stack build --file-watch", "calmrun -- stack build"),
+            ("turbo watch build", "calmrun -- turbo run build"),
+            ("mix test.watch", "calmrun -- mix test"),
+            ("parcel watch index.html", "calmrun -- parcel build index.html"),
+            ("docker compose up", "calmrun -- docker compose up -d"),
+            (
+                "CI=1 npx jest --watch -t \"my test\" && echo ok",
+                "CI=1 calmrun -- npx jest -t \"my test\" && echo ok",
+            ),
+        ] {
+            assert_eq!(w(c).as_deref(), Some(want), "{c}");
+        }
+        // No one-shot form: calmrun refuses them too, so the hook stays out of the way.
+        for c in [
+            "sbt",
+            "sbt shell",
+            "sbt console",
+            "sbt ~compile",
+            "dart run build_runner watch",
+            "nx watch --all -- echo hi",
+            "cargo watch -x test",
+            "dotnet watch",
+            "docker run -it ubuntu",
+            "ibazel build //...",
+        ] {
+            assert_eq!(w(c), None, "{c}");
         }
     }
 
