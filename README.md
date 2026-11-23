@@ -281,7 +281,7 @@ shows places kept by a ticket.
   `php artisan serve`, `symfony serve`, …), installs and infrastructure commands
   (`pod install`, `composer install`, `terraform plan|apply`, `pulumi up`), and commands that
   only print help, a version or project information (`--help`, `-h`, `--version`, `-V`,
-  `xcodebuild -list`). The Claude Code hook leaves them alone.
+  `xcodebuild -list`). The agent hooks leave them alone.
 - **Worker counts.** vitest started directly as separate words (`vitest …`,
   `npx|pnpx|bunx vitest …`, `pnpm|yarn exec vitest …`) gets `--maxWorkers=N` unless it already
   passes `--maxWorkers`, `--pool` or `--no-file-parallelism`; N is `vitest_workers` (default 1
@@ -329,8 +329,8 @@ calmrun bump <label-substring> [--id QUEUE]
 calmrun doctor
 calmrun init [--force]
 calmrun guide
-calmrun setup [--write] [--remove] [--hook] [--agents claude,codex,gemini,opencode] [--home DIR]
-calmrun hook claude
+calmrun setup [--write] [--remove] [--hook[=AGENTS]] [--agents claude,codex,gemini,opencode] [--home DIR]
+calmrun hook claude|codex|antigravity|opencode
 calmrun mcp
 ```
 
@@ -367,7 +367,7 @@ calmrun mcp
 | `init [--force]` | Write a commented `config.toml` with this machine's defaults and print its path; `--force` overwrites. |
 | `guide` | Short instructions for coding agents, to paste into their context. |
 | `setup` | Add or remove the calmrun block in agents' global instruction files; see [below](#calmrun-setup). |
-| `hook claude` | The Claude Code PreToolUse hook; reads the hook JSON on stdin. |
+| `hook <agent>` | The PreToolUse hook of `claude`, `codex`, `antigravity` or `opencode`; reads the hook JSON on stdin. See [Coding agents](#coding-agents). |
 | `mcp` | An MCP server on stdin/stdout with `run_task`, `queue_status` and `bump`. |
 
 `--id QUEUE` is accepted by every subcommand; it matters for running, `status` and `bump`.
@@ -410,7 +410,7 @@ patterns = ["make", "bazel build"]
 | `[resources]` | `CALMRUN_RESOURCES` | none (1 slot each) | Named resource slots, e.g. `db=1,gpu=2`; the variable adds to the table |
 | `[kinds.<name>]` | | built-in costs | `cost` and `patterns` (command's first words) |
 | | `CALMRUN_LOW_CPU` | on | `0`, `false`, `no` or `off` keeps normal priority |
-| | `CALMRUN_HOOK_MODE` | deny | `rewrite` makes the Claude Code hook wrap commands itself |
+| | `CALMRUN_HOOK_MODE` | deny | `rewrite` makes the agent hooks wrap commands themselves |
 | | `CALMRUN_HOME` | see below | State directory |
 | | `CALMRUN_CONFIG` | `<state dir>/config.toml` | Config file path |
 | | `CALMRUN_HELD` | | Set by calmrun for the command it runs (nesting); do not set it yourself |
@@ -434,33 +434,74 @@ a live job. A corrupt `state.json` is set aside; an unreadable one is an error.
 
 ## Coding agents
 
-### Claude Code hook
+calmrun has a PreToolUse hook for Claude Code, Codex, Antigravity and OpenCode. All four make
+the same decision; only the way each agent sends a tool call and reads the answer differs.
+`calmrun setup --write --hook <agents>` installs them in each agent's user-level file (see
+[`calmrun setup`](#calmrun-setup)).
 
-`calmrun hook claude` is a [PreToolUse hook](https://code.claude.com/docs/en/hooks). For the
-`Bash` and `PowerShell` tools it checks each part of the command (split on `&&`, `||`, `;`, `|`,
-`&` and new lines). If a part runs a heavy kind and is not already wrapped (`calmrun …`,
-`npx calmrun …`, `lane with …`), the hook denies the call and tells Claude the exact command to
-run instead, with each heavy part wrapped in place:
+### What the hooks do
+
+For each shell command the hook checks every part of it (split on `&&`, `||`, `;`, `|`, `&`,
+new lines, and the braces and parentheses of blocks). If a part runs a heavy kind and is not
+already wrapped (`calmrun …`, `npx calmrun …`, `lane with …`), the hook denies the call and
+tells the agent the exact command to run instead, with each heavy part wrapped in place:
 
 ```
-cd web && npm ci && npx vitest run      →      cd web && npm ci && calmrun -- npx vitest run
+cd web && npm ci && npx vitest run      →  cd web && npm ci && calmrun -- npx vitest run
+cd web; if ($?) { npx tsc --noEmit }    →  cd web; if ($?) { calmrun -- npx tsc --noEmit }
+for d in a b; do npm test; done         →  for d in a b; do calmrun -- npm test; done
+bash -c "npm test"                      →  bash -c "calmrun -- npm test"
 ```
 
 Light commands (`git`, `ls`, `cat`, `npm install`, …) are never blocked, heredoc bodies (for
 example a commit message written with `<<'EOF'`) are not treated as commands, and any input the
-hook does not understand is allowed (no output, exit 0). Wrappers such as `VAR=1`, `time` or
-`nice` stay in front: `time npx vitest run` becomes `time calmrun -- npx vitest run`. When
-`calmrun` is not on the agent's `PATH`, the suggestion uses calmrun's absolute path.
+hook does not understand is allowed (no output, exit 0). Wrappers such as `VAR=1`, `time`,
+`nice` or `timeout 600` stay in front: `time npx vitest run` becomes
+`time calmrun -- npx vitest run`. Commands inside `if`/`then`/`do` blocks, PowerShell
+`if ($?) { … }` and `try { … }` blocks, `$( … )`, subshells and `bash -c "…"` or
+`pwsh -Command '…'` scripts are wrapped where they run. When `calmrun` is not on the agent's
+`PATH`, the suggestion uses calmrun's absolute path.
 
-The hook follows the same [command rules](#command-rules) as `calmrun --`, so it never
-suggests a command calmrun would refuse. A watch mode with a one-shot form gets that form
+The hooks follow the same [command rules](#command-rules) as `calmrun --`, so they never
+suggest a command calmrun would refuse. A watch mode with a one-shot form gets that form
 (`dotnet watch test` → `calmrun -- dotnet test`, `npx vitest` → `calmrun -- npx vitest run`,
-`docker compose up` → `calmrun -- docker compose up -d`). A watch mode or interactive session
-without one (`sbt shell`, `cargo watch`, `nx watch`, `docker run -it`), dev servers and app
-runs are left alone.
+`docker compose up` → `calmrun -- docker compose up -d`); `calmrun --` prints the same form in
+its `next:` line. A watch mode or interactive session without one (`sbt shell`, `cargo watch`,
+`nx watch`, `docker run -it`), dev servers and app runs are left alone.
 
-Add it to `.claude/settings.json` in a project, or to `~/.claude/settings.json` for every
-project (or let `calmrun setup --write --hook` do it):
+**Long waits.** An agent's shell tool stops a command after its time limit (Claude Code: the
+call's `timeout`, 2 minutes by default; OpenCode the same). A heavy command waiting in a busy
+queue could be stopped there and lose its place. So for those tools the suggestion carries a
+`--wait-timeout` a little below the limit (120 s → 108 s): calmrun exits 75 before the tool
+stops it, keeps the place in line, and prints the `calmrun: next:` command that resumes it. The
+deny text says so, shows the queue's load and, for kinds that usually take minutes (tests,
+builds, containers, monorepo runs), offers the background form without the cap:
+
+```
+Heavy command (vitest) must go through the machine-wide calmrun queue so parallel agents do not freeze this computer. Run this instead:
+calmrun --wait-timeout 108 -- npx vitest run
+Queue now: 3 of 3 points in use, 1 waiting.
+Exit 75 means it is still waiting in line: run the `calmrun: next:` command it prints to keep its place.
+It may take minutes: better run it with run_in_background: true, without --wait-timeout:
+calmrun -- npx vitest run
+```
+
+**Rewrite mode.** With `CALMRUN_HOOK_MODE=rewrite` in the agent's environment the hook changes
+the command instead of denying it (all four agents support that). The default deny mode works
+everywhere and keeps the change visible to the agent.
+
+**Sandboxes.** calmrun keeps the queue in its state directory (`calmrun doctor` shows it). An
+agent whose sandbox lets commands write only inside the project stops calmrun with `cannot lock
+or update the queue state: Access is denied`. Allow that one folder (for Codex, see below)
+rather than pointing `CALMRUN_HOME` into the project, which would give each project a queue of
+its own.
+
+### Claude Code
+
+`calmrun hook claude` reads Claude Code's [PreToolUse](https://code.claude.com/docs/en/hooks)
+input for the `Bash` and `PowerShell` tools. `calmrun setup --write --hook` adds it to
+`~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`); for one project, add it to
+`.claude/settings.json`:
 
 ```json
 {
@@ -475,10 +516,82 @@ project (or let `calmrun setup --write --hook` do it):
 }
 ```
 
-With `CALMRUN_HOOK_MODE=rewrite` the hook instead returns `updatedInput` with the wrapped
-command and no permission decision, so your normal permission rules still apply to the wrapped
-command. In auto mode Claude Code may decline a changed input, in which case the original
-command runs unwrapped; the default deny mode does not have that gap.
+- Deny: `permissionDecision: "deny"` with the text above. The wait cap follows the call's
+  `timeout` (2 minutes when it has none); a call with `run_in_background: true` gets no cap.
+- Rewrite: `updatedInput` with the wrapped command and no permission decision, so your normal
+  permission rules still apply. Kinds that take minutes also get `run_in_background: true` and
+  no cap; others get the capped command. In auto mode Claude Code may decline a changed input,
+  in which case the original command runs unwrapped; the default deny mode does not have that
+  gap.
+
+### Codex
+
+`calmrun hook codex` reads [Codex CLI hook](https://developers.openai.com/codex/hooks) input:
+`tool_name` `Bash` with `tool_input.command` (a string; an argv array is accepted too).
+`apply_patch` edits and MCP tools pass untouched. `calmrun setup --write --hook codex` adds
+this to `~/.codex/hooks.json` (or `$CODEX_HOME/hooks.json`), next to any hooks already there
+(for one project: `.codex/hooks.json`):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [{ "type": "command", "command": "calmrun hook codex", "timeout": 30 }]
+      }
+    ]
+  }
+}
+```
+
+- Codex runs a new or changed hook only after you trust it: review it with `/hooks` in Codex.
+- Deny: `permissionDecision: "deny"` with the reason. Codex's shell calls carry no time limit
+  in the hook input, so no `--wait-timeout` is added.
+- Rewrite: Codex takes a changed command only with `permissionDecision: "allow"` and
+  `updatedInput`. That answer may also count as approval of the wrapped command, so use
+  rewrite mode only if that is fine for you.
+- The `workspace-write` sandbox blocks calmrun's state directory. Allow it in
+  `~/.codex/config.toml`, with the path `calmrun doctor` prints:
+
+  ```toml
+  [sandbox_workspace_write]
+  writable_roots = ["C:/Users/you/AppData/Local/calmrun"]
+  ```
+
+### Antigravity
+
+`calmrun hook antigravity` reads [Antigravity hook](https://antigravity.google/docs/hooks)
+input for the `run_command` tool (`toolCall.args.CommandLine`). `calmrun setup --write --hook
+antigravity` adds a `calmrun` entry to `~/.gemini/config/hooks.json`, next to the other named
+entries (for one project: `.agents/hooks.json`):
+
+```json
+{
+  "calmrun": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [{ "type": "command", "command": "calmrun hook antigravity", "timeout": 30 }]
+      }
+    ]
+  }
+}
+```
+
+- Deny: `{"decision": "deny", "reason": "…"}`. A command still running after
+  `WaitMsBeforeAsync` goes on in the background instead of being stopped, so no
+  `--wait-timeout` is added.
+- Rewrite: `{"decision": "allow", "overwrite": {"CommandLine": "…"}}`.
+
+### OpenCode
+
+OpenCode hooks are JavaScript plugins, so `calmrun setup --write --hook opencode` writes a small
+one, `~/.config/opencode/plugins/calmrun.js`. Before the `bash` tool runs, the plugin sends the
+call to `calmrun hook opencode`; on a deny it throws, and OpenCode shows the reason to the
+model; in rewrite mode it changes `command`. If calmrun cannot be asked, the command runs
+unchanged. The wait cap follows the call's `timeout` (2 minutes when it has none). Setup
+replaces or removes the file only when it starts with calmrun's marker line.
 
 ### MCP server
 
@@ -558,6 +671,7 @@ calmrun setup                         # show what would change (agents whose fol
 calmrun setup --write                 # apply
 calmrun setup --write --agents codex  # only some agents
 calmrun setup --write --hook          # also add the Claude Code hook to ~/.claude/settings.json
+calmrun setup --write --hook codex,opencode  # hooks of other agents (or --hook all)
 calmrun setup --write --remove --hook # take both out again
 ```
 
@@ -566,8 +680,14 @@ calmrun setup --write --remove --hook # take both out again
   and leaves the rest of the file as it was.
 - Every file setup rewrites is first copied to `<file>.calmrun.bak`; a file that cannot be read
   or is not UTF-8 text is left alone (exit 1).
-- `--hook` merges the PreToolUse entry into `settings.json`, keeps every other setting, and
-  leaves a file it cannot parse untouched.
+- `--hook` installs hooks in user-level files: `claude` (the default) in `settings.json`,
+  `codex` in `hooks.json`, `antigravity` in `~/.gemini/config/hooks.json`, `opencode` as a
+  plugin; `all` installs every one. Only calmrun's own entry is added, replaced or removed (a
+  hook running `calmrun … hook <agent>`, Antigravity's `calmrun` entry, the plugin file with
+  calmrun's marker), so hooks of other tools stay as they are. A file it cannot parse is left
+  untouched. An agent whose folder does not exist gets no hook (an error when named, a note
+  under `all`). The hook command is `calmrun`, or calmrun's absolute path when it is not on
+  `PATH`.
 - When Codex has an `AGENTS.override.md`, Codex reads that file instead; setup says so, and you
   copy the block there too.
 - `--home DIR` uses another home directory (for tests, or another user's profile).

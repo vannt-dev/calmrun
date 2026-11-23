@@ -24,8 +24,8 @@ process evaluates the same way, admits it. Only then does it run the command.
 | `runner.rs` | Spawns the command: name lookup, priority, Job Object or process group, signals, exit codes. |
 | `sys.rs` | Machine facts: RAM, cores, process liveness, disks, power, path normalisation. |
 | `mcp.rs` | The MCP server: newline-delimited JSON-RPC on stdio and the tool registry. |
-| `hook.rs` | The Claude Code PreToolUse hook (deny with a suggestion, or rewrite). |
-| `setup.rs` | Writes and removes the instruction block in agents' global files, and merges the hook. |
+| `hook.rs` | The agent hooks: one decision (wrap heavy parts, cap the wait below the tool limit) and thin adapters per agent in `hook/` (Claude Code here; Codex, Antigravity, OpenCode). |
+| `setup.rs` | Writes and removes the instruction block in agents' global files; `setup/hooks.rs` merges each agent's hook into its user-level file. |
 | `config.rs` | Defaults derived from the machine, `config.toml`, and env overrides. |
 | `history.rs` | `history.jsonl` and `stats`. |
 | `doctor.rs` | The `doctor` report. |

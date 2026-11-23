@@ -6,6 +6,30 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Hooks for Codex (`calmrun hook codex`), Antigravity (`calmrun hook antigravity`) and OpenCode
+  (`calmrun hook opencode`, through a small plugin), with the same decision as the Claude Code
+  hook: deny with the wrapped command, or rewrite it with `CALMRUN_HOOK_MODE=rewrite`.
+- `calmrun setup --hook claude,codex,antigravity,opencode` (or `--hook all`) installs them in
+  each agent's user-level file, keeping other tools' hooks there; bare `--hook` still means
+  Claude Code.
+- Suggested commands carry a `--wait-timeout` just below the agent's shell time limit (Claude
+  Code, OpenCode), so a long wait ends with exit 75 and a kept place instead of a killed call.
+  Deny texts show the queue's load and, for long kinds, the background form; Claude Code's
+  rewrite mode runs long kinds with `run_in_background`.
+- The hooks find heavy commands inside `if`/`for`/`while` blocks, PowerShell `if ($?) { … }`
+  and `try { … }` blocks, `$( … )`, subshells, `bash -c "…"` / `pwsh -Command '…'` scripts and
+  after `timeout`. `npm --prefix web test` (and `-w`, `pnpm -C`, `--filter`) and `node --test`
+  are detected; `node --watch` is refused with its one-shot form.
+
+### Changed
+
+- The `next:` line of a refused watch mode suggests the same one-shot form as the hooks
+  (`npx vitest --watch` -> `npx vitest run`).
+- `next:` lines and the hook commands `setup` writes name calmrun's absolute path when
+  `calmrun` is not on `PATH`.
+
 ## [0.2.0] - 2026-11-23
 
 ### Added
