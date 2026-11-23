@@ -488,16 +488,18 @@ calmrun: waiting — 4 of 6 points in use, 2nd in line (needs 2); running: npx v
       <section id="agents">
         <h2 data-i18n="ag.h2">Agent integration</h2>
         <p class="sub" data-i18n="ag.sub">
-          Agents don't need to remember anything: the Claude Code hook catches heavy shell commands, the MCP server gives any MCP client a
-          queued <code>run_task</code> tool, and <code>setup</code> writes the instructions into each agent's global file.
+          Agents don't need to remember anything: hooks for Claude Code, Codex and OpenCode (Antigravity: experimental) catch heavy shell
+          commands, the MCP server gives any MCP client a queued <code>run_task</code> tool, and <code>setup</code> writes the instructions
+          and hooks into each agent's global files.
         </p>
         <div class="grid2">
           <div>
-            <h3 data-i18n="ag.hook.h">Claude Code hook</h3>
+            <h3 data-i18n="ag.hook.h">Agent hooks</h3>
             <p class="note" data-i18n="ag.hook">
-              <code>calmrun hook claude</code> is a PreToolUse hook for the Bash and PowerShell tools. When a command runs a heavy tool
-              without calmrun, the hook denies it and tells Claude the exact command with each heavy part wrapped. Light commands pass.
-              Put it in <code>~/.claude/settings.json</code> or a project's <code>.claude/settings.json</code>:
+              <code>calmrun hook claude|codex|opencode|antigravity</code> is a PreToolUse hook for the agent's shell tool. When a command
+              runs a heavy tool without calmrun (also through <code>rtk</code>), the hook denies it and tells the agent the exact command
+              with each heavy part wrapped, with a <code>--wait-timeout</code> below the tool's time limit. Light commands pass.
+              <code>calmrun setup --write --hook all</code> installs them; for Claude Code by hand, in <code>~/.claude/settings.json</code>:
             </p>
             <pre>{
   "hooks": {
@@ -517,8 +519,11 @@ calmrun: waiting — 4 of 6 points in use, 2nd in line (needs 2); running: npx v
           <div>
             <h3 data-i18n="ag.mcp.h">MCP server</h3>
             <p class="note" data-i18n="ag.mcp">
-              <code>calmrun mcp</code> serves three tools over stdio: <code>run_task</code> (waits in the same queue, runs the command,
-              returns the exit code and the last 200 lines of output), <code>queue_status</code> and <code>bump</code>.
+              <code>calmrun mcp</code> serves tools over stdio: <code>run_task</code> (waits in the same queue and runs the command; a job
+              still busy after <code>wait_seconds</code> goes on in the background and returns a <code>task_id</code>),
+              <code>task_status</code>, <code>cancel_task</code>, <code>queue_status</code> and <code>bump</code>. For a device or an
+              emulator without a command: <code>calmrun hold emulator</code> prints a lease, <code>calmrun release &lt;lease&gt;</code> gives
+              it back.
             </p>
             <pre><span class="dim"># Claude Code</span>
 claude mcp add calmrun -- calmrun mcp
@@ -544,7 +549,7 @@ tool_timeout_sec = 3600
             <pre><span class="p">$</span> calmrun setup                          <span class="dim" data-i18n="ag.setup.c1"># show what would change</span>
 <span class="p">$</span> calmrun setup --write                  <span class="dim" data-i18n="ag.setup.c2"># apply</span>
 <span class="p">$</span> calmrun setup --write --agents codex   <span class="dim" data-i18n="ag.setup.c3"># only some agents</span>
-<span class="p">$</span> calmrun setup --write --hook           <span class="dim" data-i18n="ag.setup.c4"># also the Claude Code hook</span>
+<span class="p">$</span> calmrun setup --write --hook           <span class="dim" data-i18n="ag.setup.c4"># also the Claude Code hook (--hook all: every agent)</span>
 <span class="p">$</span> calmrun setup --write --remove --hook  <span class="dim" data-i18n="ag.setup.c5"># take both out again</span></pre>
           </div>
           <div>
@@ -587,8 +592,9 @@ Do not wrap light commands (git, ls, cat, package installs).</pre>
             <tr><th><code>calmrun init</code></th><td data-i18n="cmd.init">Write a commented <code>config.toml</code> with this machine's defaults (<code>--force</code> overwrites).</td></tr>
             <tr><th><code>calmrun guide</code></th><td data-i18n="cmd.guide">Short instructions for coding agents.</td></tr>
             <tr><th><code>calmrun setup</code></th><td data-i18n="cmd.setup">Write or remove the calmrun block in agents' global instruction files: <code>--write</code>, <code>--remove</code>, <code>--hook</code>, <code>--agents</code>.</td></tr>
-            <tr><th><code>calmrun hook claude</code></th><td data-i18n="cmd.hook">The Claude Code PreToolUse hook; reads the hook JSON on stdin.</td></tr>
-            <tr><th><code>calmrun mcp</code></th><td data-i18n="cmd.mcp">The MCP server on stdio: <code>run_task</code>, <code>queue_status</code>, <code>bump</code>.</td></tr>
+            <tr><th><code>calmrun hold</code> / <code>release</code></th><td data-i18n="cmd.hold">Hold a resource slot (an emulator, a database) without a command and print a lease; <code>release &lt;lease&gt;</code> gives it back, <code>release --ticket &lt;id&gt;</code> gives up a kept place.</td></tr>
+            <tr><th><code>calmrun hook &lt;agent&gt;</code></th><td data-i18n="cmd.hook">The PreToolUse hook of <code>claude</code>, <code>codex</code>, <code>opencode</code> or <code>antigravity</code> (experimental); reads the hook JSON on stdin.</td></tr>
+            <tr><th><code>calmrun mcp</code></th><td data-i18n="cmd.mcp">The MCP server on stdio: <code>run_task</code>, <code>task_status</code>, <code>cancel_task</code>, <code>queue_status</code>, <code>bump</code>.</td></tr>
           </table>
         </div>
         <h3 data-i18n="exit.h">Exit codes</h3>
@@ -616,8 +622,8 @@ Do not wrap light commands (git, ls, cat, package installs).</pre>
             <thead>
               <tr><th data-i18n="cfg.c1">Key · variable</th><th data-i18n="cfg.c2">Default and meaning</th></tr>
             </thead>
-            <tr><th><code>budget</code><br /><code>CALMRUN_BUDGET</code></th><td data-i18n="cfg.budget">Logical cores − 2, capped at floor(RAM GB / 4), at least 2. Points that may run at once.</td></tr>
-            <tr><th><code>min_free_gb</code><br /><code>CALMRUN_MIN_FREE_GB</code></th><td data-i18n="cfg.minfree">max(3, RAM / 8). Free RAM a job needs to start while others run; 0 turns it off.</td></tr>
+            <tr><th><code>budget</code><br /><code>CALMRUN_BUDGET</code></th><td data-i18n="cfg.budget">Logical cores − 2, capped at floor(RAM GB / 2.5), at least 2. Points that may run at once.</td></tr>
+            <tr><th><code>min_free_gb</code><br /><code>CALMRUN_MIN_FREE_GB</code></th><td data-i18n="cfg.minfree">max(1.5, RAM / 10). Free RAM a job needs to start while others run (in any queue); 0 turns it off.</td></tr>
             <tr><th><code>min_free_disk_gb</code><br /><code>CALMRUN_MIN_FREE_DISK_GB</code></th><td data-i18n="cfg.disk">5. Free space needed on the drive of the job's folder; 0 turns it off.</td></tr>
             <tr><th><code>pass_limit_min</code><br /><code>CALMRUN_PASS_MIN</code></th><td data-i18n="cfg.pass">10. Minutes a waiter may be passed by smaller jobs that fit; 0 means strict order.</td></tr>
             <tr><th><code>vitest_workers</code><br /><code>CALMRUN_VITEST_WORKERS</code></th><td data-i18n="cfg.vitest">1 up to 4 cores, 2 below 12, else 3. The <code>--maxWorkers</code> given to direct vitest calls.</td></tr>
@@ -795,22 +801,22 @@ patterns = ["make", "bazel build"]</pre>
           'eco.ctr': 'Container',
           'ag.h2': 'Tích hợp với agent',
           'ag.sub':
-            'Agent không cần nhớ gì cả: hook của Claude Code bắt các lệnh shell nặng, MCP server cho mọi client MCP một công cụ <code>run_task</code> có xếp hàng, còn <code>setup</code> ghi hướng dẫn vào file toàn cục của từng agent.',
-          'ag.hook.h': 'Hook cho Claude Code',
+            'Agent không cần nhớ gì cả: hook cho Claude Code, Codex và OpenCode (Antigravity: thử nghiệm) bắt các lệnh shell nặng, MCP server cho mọi client MCP một công cụ <code>run_task</code> có xếp hàng, còn <code>setup</code> ghi hướng dẫn và hook vào file toàn cục của từng agent.',
+          'ag.hook.h': 'Hook cho agent',
           'ag.hook':
-            '<code>calmrun hook claude</code> là một PreToolUse hook cho công cụ Bash và PowerShell. Khi một lệnh chạy công cụ nặng mà không qua calmrun, hook chặn lại và đưa cho Claude đúng câu lệnh với từng phần nặng đã được bọc. Lệnh nhẹ đi qua bình thường. Thêm vào <code>~/.claude/settings.json</code> hoặc <code>.claude/settings.json</code> của một project:',
+            '<code>calmrun hook claude|codex|opencode|antigravity</code> là một PreToolUse hook cho công cụ shell của agent. Khi một lệnh chạy công cụ nặng mà không qua calmrun (kể cả qua <code>rtk</code>), hook chặn lại và đưa cho agent đúng câu lệnh với từng phần nặng đã được bọc, kèm <code>--wait-timeout</code> dưới giới hạn thời gian của công cụ. Lệnh nhẹ đi qua bình thường. <code>calmrun setup --write --hook all</code> cài chúng; với Claude Code có thể tự thêm vào <code>~/.claude/settings.json</code>:',
           'ag.hook.ex':
             '<code>cd web &amp;&amp; npx vitest run</code> trở thành <code>cd web &amp;&amp; calmrun -- npx vitest run</code>. Với <code>CALMRUN_HOOK_MODE=rewrite</code>, hook tự sửa lệnh thay vì chặn.',
           'ag.mcp.h': 'MCP server',
           'ag.mcp':
-            '<code>calmrun mcp</code> cung cấp ba công cụ qua stdio: <code>run_task</code> (chờ trong cùng hàng chờ, chạy lệnh, trả về mã thoát và 200 dòng output cuối), <code>queue_status</code> và <code>bump</code>.',
+            '<code>calmrun mcp</code> cung cấp các công cụ qua stdio: <code>run_task</code> (chờ trong cùng hàng chờ và chạy lệnh; việc còn bận sau <code>wait_seconds</code> tiếp tục chạy nền và trả về <code>task_id</code>), <code>task_status</code>, <code>cancel_task</code>, <code>queue_status</code> và <code>bump</code>. Giữ một thiết bị hay emulator mà không chạy lệnh: <code>calmrun hold emulator</code> in ra một lease, <code>calmrun release &lt;lease&gt;</code> trả lại.',
           'ag.setup.h': 'calmrun setup',
           'ag.setup':
             'Thêm một đoạn ngắn về calmrun vào file hướng dẫn toàn cục của Claude Code, Codex, Gemini CLI và OpenCode. Lệnh chỉ chạy thử cho tới khi bạn thêm <code>--write</code>; file nào bị sửa đều được sao lưu trước.',
           'ag.setup.c1': '# xem sẽ thay đổi gì',
           'ag.setup.c2': '# áp dụng',
           'ag.setup.c3': '# chỉ một số agent',
-          'ag.setup.c4': '# thêm cả hook cho Claude Code',
+          'ag.setup.c4': '# thêm cả hook cho Claude Code (--hook all: mọi agent)',
           'ag.setup.c5': '# gỡ cả hai ra',
           'ag.guide.h': 'calmrun guide',
           'ag.guide': 'In ra hướng dẫn ngắn để dán vào ngữ cảnh của agent. Hoặc tự thêm đoạn này vào <code>CLAUDE.md</code> hay <code>AGENTS.md</code>:',
@@ -824,8 +830,9 @@ patterns = ["make", "bazel build"]</pre>
           'cmd.init': 'Ghi một <code>config.toml</code> có chú thích với giá trị mặc định của máy này (<code>--force</code> để ghi đè).',
           'cmd.guide': 'Hướng dẫn ngắn cho coding agent.',
           'cmd.setup': 'Ghi hoặc gỡ đoạn calmrun trong file hướng dẫn toàn cục của các agent: <code>--write</code>, <code>--remove</code>, <code>--hook</code>, <code>--agents</code>.',
-          'cmd.hook': 'PreToolUse hook cho Claude Code; đọc JSON của hook từ stdin.',
-          'cmd.mcp': 'MCP server qua stdio: <code>run_task</code>, <code>queue_status</code>, <code>bump</code>.',
+          'cmd.hold': 'Giữ một suất tài nguyên (emulator, database) mà không chạy lệnh và in ra một lease; <code>release &lt;lease&gt;</code> trả lại, <code>release --ticket &lt;id&gt;</code> bỏ chỗ đang được giữ.',
+          'cmd.hook': 'PreToolUse hook của <code>claude</code>, <code>codex</code>, <code>opencode</code> hoặc <code>antigravity</code> (thử nghiệm); đọc JSON của hook từ stdin.',
+          'cmd.mcp': 'MCP server qua stdio: <code>run_task</code>, <code>task_status</code>, <code>cancel_task</code>, <code>queue_status</code>, <code>bump</code>.',
           'exit.h': 'Mã thoát',
           'exit.cmd': 'mã của chính lệnh',
           'exit.cmd.d': 'lệnh đã chạy (trên Unix, tín hiệu <code>n</code> thành 128 + n)',
@@ -840,8 +847,8 @@ patterns = ["make", "bazel build"]</pre>
             'Mọi thiết lập đều không bắt buộc. <code>calmrun init</code> ghi một <code>config.toml</code> có chú thích trong thư mục trạng thái; biến môi trường được ưu tiên hơn file.',
           'cfg.c1': 'Khóa · biến',
           'cfg.c2': 'Mặc định và ý nghĩa',
-          'cfg.budget': 'Số lõi logic − 2, tối đa floor(RAM GB / 4), ít nhất 2. Số điểm được chạy cùng lúc.',
-          'cfg.minfree': 'max(3, RAM / 8). RAM trống cần có để một việc bắt đầu khi đang có việc khác chạy; 0 để tắt.',
+          'cfg.budget': 'Số lõi logic − 2, tối đa floor(RAM GB / 2.5), ít nhất 2. Số điểm được chạy cùng lúc.',
+          'cfg.minfree': 'max(1.5, RAM / 10). RAM trống cần có để một việc bắt đầu khi đang có việc khác chạy (ở bất kỳ hàng chờ nào); 0 để tắt.',
           'cfg.disk': '5. Dung lượng trống cần có trên ổ chứa thư mục của việc; 0 để tắt.',
           'cfg.pass': '10. Số phút một việc đang chờ có thể bị các việc nhỏ hơn vừa chỗ vượt lên; 0 là giữ đúng thứ tự.',
           'cfg.vitest': '1 khi tới 4 lõi, 2 khi dưới 12 lõi, còn lại 3. Giá trị <code>--maxWorkers</code> cho các lần gọi vitest trực tiếp.',

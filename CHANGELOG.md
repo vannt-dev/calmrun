@@ -35,6 +35,16 @@ All notable changes to this project are documented here. The format follows
   `queue_status` list them. `--wait-timeout 0` tries once.
 - A lease does not block its holder: `hold --for <dir>` lets jobs in that folder use the leased
   resources, and `CALMRUN_LEASE=<id>[,…]` does the same for a job anywhere.
+- `status`, `status --json` and MCP `queue_status` say why each waiting job waits (`why`,
+  `why_code`: budget, order, ram, disk, key, resource).
+- `calmrun release --ticket <id>` gives up a place kept by `--wait-timeout`.
+- `setup --hook codex` adds calmrun's state directory to Codex's
+  `sandbox_workspace_write.writable_roots` (adding lines only), or prints the lines to add.
+- `rtk <tool> …` is seen through like `npx`: `rtk cargo test`, `rtk vitest`, `rtk npm test`,
+  `rtk tsc` are queued and the hooks suggest `calmrun -- rtk cargo test`.
+- A calmrun killed hard leaves a history line (`killed` or `abandoned`), written by the next
+  calmrun that finds it gone; Ctrl+C while waiting records `cancelled`. `stats` shows waits that
+  gave up before starting.
 
 ### Changed
 
@@ -48,6 +58,25 @@ All notable changes to this project are documented here. The format follows
   empty fields and a status that only repeats the exit code.
 - Resource names (`--needs`, `hold`) must be plain names (letters, digits, `-`, `_`, `.`);
   others exit 2.
+- Exclusive keys and the RAM and disk gates are machine-wide: a job in an `--id` queue waits for
+  a `node_modules` or `target` used in another queue, and the RAM check applies while anything
+  runs in any queue. Budget and order stay per queue.
+- A queue decides with the budget, `min_free_gb` and pass limit of the job that joined it while
+  it was empty; a caller with other settings gets a note and `status` warns.
+- Defaults: `min_free_gb` is max(1.5, RAM / 10) (was max(3, RAM / 8)) and the budget is capped
+  at floor(RAM GB / 2.5) (was / 4), so a 16 GB machine runs jobs side by side.
+- The RAM waiting line shows free RAM as read and what is held back for jobs that just started.
+- `doctor` prints the suggested budget in its `setx`/`export` lines and warns when free RAM is
+  below `min_free_gb`.
+- `--id` may come before the subcommand (`calmrun --id q status`).
+- CLI messages are ASCII, as Windows PowerShell 5.1 garbles an em dash in pipes and files.
+- `history.jsonl` rotates to `history.1.jsonl` past 4 MB; queues left empty for 7 days are
+  removed.
+- Codex (Windows) and Antigravity (Windows) run commands in PowerShell: a quoted calmrun path is
+  called with `&`.
+- Antigravity's hook is experimental: its terminal sandbox hides other processes and blocks the
+  state folder, so `setup --hook all` leaves it out, and calmrun refuses to use the queue from
+  inside a Windows AppContainer instead of dropping jobs it cannot see.
 
 ## [0.2.0] - 2026-11-23
 

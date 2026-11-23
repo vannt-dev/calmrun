@@ -3,7 +3,7 @@
 %% npx -y @mermaid-js/mermaid-cli@12.2.0 -i docs/diagrams/overview.mmd -c docs/diagrams/mermaid.config.json -b transparent -t dark -o docs/diagrams/overview-dark.svg
 flowchart TD
   src["Several agents and terminals<br/>on one machine"]
-  hook["Claude Code hook<br/>a heavy command without calmrun:<br/>denies it with the wrapped form,<br/>or rewrites it"]
+  hook["Agent hooks (Claude Code, Codex,<br/>OpenCode; Antigravity experimental)<br/>a heavy command without calmrun:<br/>denies it with the wrapped form,<br/>or rewrites it"]
   entry["calmrun -- cmd<br/>or the MCP tool run_task"]
   check(["Command rules:<br/>endless or light?"])
   refuse["Watch mode: refused, exit 2<br/>prints the one-shot form<br/>vitest run, compose up -d"]

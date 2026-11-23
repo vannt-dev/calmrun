@@ -17,7 +17,7 @@ process evaluates the same way, admits it. Only then does it run the command.
 | `kinds.rs` | **The tool table.** Kinds with default costs and key rules, detection rules, and worker hints. |
 | `detect.rs` | Finds the program in a command line (wrappers, launchers), the label, hint application, exclusive keys and refusals. |
 | `shell.rs` | Just enough shell syntax for that: words, `&&`/`|`/`;` segments, heredocs and here-strings. |
-| `state.rs` | `state.json` under an OS file lock (`state.lock`), atomic writes, pruning of dead entries. |
+| `state.rs` | `state.json` under an OS file lock (`state.lock`), atomic writes, pruning of dead entries, `machine.lock` and the other queues' states, the sweep of idle queues. |
 | `status.rs` | Snapshot, `status --json` / MCP `queue_status`, and `bump`. |
 | `lease.rs` | `hold` / `release` arguments, lease ids, renew and release. Waiting for the slots is `queue::hold`. |
 | `messages.rs` | Every waiting, refusal and timeout line, each ending with a `next:` step where there is one. |
@@ -42,7 +42,8 @@ CLI / MCP ──Request──▶ queue::run
    prepare      refusal check, detect kind/label/cost, apply hints (argv, env), keys
    nested?      CALMRUN_HELD alive → run at once (the outer run holds the points)
    enqueue      lock → prune dead → add entry (or take back a ticket) → unlock
-   wait_turn    loop: lock → prune → publish disk_short → scheduler::schedule → unlock
+   wait_turn    loop: machine.lock → read other queues' running jobs → lock → prune
+                → publish disk_short → scheduler::schedule → unlock
                 admitted → mark running; else Notify gets the waiting line;
                 sleep with backoff (250 ms … 1.5 s), cancel checked every 100 ms;
                 --wait-timeout → park the entry (ticket) and return 75
@@ -53,6 +54,13 @@ CLI / MCP ──Request──▶ queue::run
 A `calmrun hold` takes the same path with an entry marked `hold_ttl_ms` that runs nothing: in
 the locked step that admits it, the entry becomes a `Lease` in `state.leases`, which has no
 owner process and lapses at `until_ms`. The gates count leases' slots and points as taken.
+
+Every admission takes `machine.lock` first (then the queue's `state.lock`, never the other way
+round) and passes the running jobs of the other `--id` queues to the scheduler as `foreign`:
+they hold their exclusive keys and make the machine busy for the RAM and disk gates, but take
+none of this queue's points. A queue records the settings (budget, RAM minimum, pass limit) of
+the job that joined it empty in `state.settings`, so every waiter decides alike. Entries of
+owners found dead get a history line (`killed` / `abandoned`) from whoever prunes them.
 
 The lock is held only to read, decide and write. calmrun never sleeps, spawns or waits for
 the child while holding it. Each tick reads the state file once, and writes it back only
