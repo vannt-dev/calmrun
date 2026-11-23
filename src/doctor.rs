@@ -3,13 +3,14 @@
 use crate::config::{self, bytes_to_gb, Machine};
 use std::path::Path;
 
-/// The `calmrun doctor` text.
+/// The `calmrun doctor` text. `free_now` is the free RAM at this moment.
 pub fn report(
     m: Machine,
     cfg: &config::Config,
     home: &Path,
     config_file: &Path,
     physical: Option<usize>,
+    free_now: u64,
 ) -> String {
     let mut s = String::new();
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.to_path_buf());
@@ -23,10 +24,17 @@ pub fn report(
         m.logical_cores,
         physical.map(|p| format!(", {p} physical")).unwrap_or_default()
     );
-    s += &format!("RAM:          {:.1} GB total\n", bytes_to_gb(m.total_ram));
+    s += &format!(
+        "RAM:          {:.1} GB total, {:.1} GB free now\n",
+        bytes_to_gb(m.total_ram),
+        bytes_to_gb(free_now)
+    );
     s += &format!("disk (cwd):   {}\n", crate::sys::disk_kind(&cwd));
     s += &format!("battery:      {battery}\n");
     s += &format!("state dir:    {}\n", home.display());
+    if crate::sys::in_app_container() {
+        s += "sandbox:      yes (Windows AppContainer): calmrun cannot use the queue from here\n";
+    }
     s += &format!(
         "config file:  {}{}\n",
         config_file.display(),
@@ -62,13 +70,76 @@ pub fn report(
     for line in crate::kinds::hint_summary(&workers, &cfg.kinds) {
         s += &format!("  {line}\n");
     }
+    if let Some(w) = low_free_warning(cfg.min_free_bytes, free_now) {
+        s += &format!("\n{w}\n");
+    }
+    let budget = config::default_budget(m);
     s += "\nSuggested for this machine:\n";
-    s += &format!("  budget = {}\n", config::default_budget(m));
+    s += &format!("  budget = {budget}\n");
     s += &format!("  min_free_gb = {:.1}\n", config::default_min_free_gb(m));
     s += &format!("  vitest_workers = {}\n", config::default_vitest_workers(m));
     s += "\nSet it in the config file, or with env vars:\n";
-    s += "  Windows (PowerShell, persistent):  setx CALMRUN_BUDGET 4\n";
-    s += "  macOS (zsh):  echo 'export CALMRUN_BUDGET=4' >> ~/.zshrc\n";
-    s += "  Linux (bash): echo 'export CALMRUN_BUDGET=4' >> ~/.bashrc\n";
+    s += &format!("  Windows (PowerShell, persistent):  setx CALMRUN_BUDGET {budget}\n");
+    s += &format!("  macOS (zsh):  echo 'export CALMRUN_BUDGET={budget}' >> ~/.zshrc\n");
+    s += &format!("  Linux (bash): echo 'export CALMRUN_BUDGET={budget}' >> ~/.bashrc\n");
     s
+}
+
+/// A warning when less RAM is free now than a job needs to start beside another one.
+fn low_free_warning(min_free: u64, free_now: u64) -> Option<String> {
+    (min_free > 0 && free_now < min_free).then(|| {
+        format!(
+            "warning: only {:.1} GB RAM is free now, below min_free_gb ({:.1}). While anything \
+             runs, every other job waits for RAM. If the machine is at rest, close programs or \
+             lower min_free_gb (e.g. {:.1}).",
+            bytes_to_gb(free_now),
+            bytes_to_gb(min_free),
+            (bytes_to_gb(free_now) * 0.6).max(1.0)
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GB: u64 = 1 << 30;
+
+    fn report_for(min_free_gb: &str, free_now: u64) -> String {
+        let m = Machine {
+            logical_cores: 20,
+            total_ram: 16 * GB,
+        };
+        let env = |k: &str| (k == "CALMRUN_MIN_FREE_GB").then(|| min_free_gb.to_string());
+        let cfg = config::resolve(m, config::FileConfig::default(), &env);
+        report(
+            m,
+            &cfg,
+            Path::new("/h"),
+            Path::new("/h/config.toml"),
+            None,
+            free_now,
+        )
+    }
+
+    #[test]
+    fn suggested_budget_and_env_lines_agree() {
+        let r = report_for("1.5", 8 * GB);
+        assert!(r.contains("  budget = 6\n"), "{r}");
+        assert!(r.contains("setx CALMRUN_BUDGET 6\n"), "{r}");
+        assert!(r.contains("export CALMRUN_BUDGET=6'"), "{r}");
+        assert!(!r.contains("warning:"), "{r}");
+        assert!(r.is_ascii(), "{r}");
+    }
+
+    #[test]
+    fn warns_when_free_ram_is_below_the_minimum() {
+        let r = report_for("3", 2 * GB + GB / 2);
+        assert!(
+            r.contains("warning: only 2.5 GB RAM is free now, below min_free_gb (3.0)"),
+            "{r}"
+        );
+        assert!(r.contains("(e.g. 1.5)"), "{r}");
+        assert!(!report_for("0", GB).contains("warning:"));
+    }
 }

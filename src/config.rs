@@ -73,13 +73,15 @@ pub fn parse_resources(s: &str) -> BTreeMap<String, u32> {
 
 /// Cores kept free for the editor, the agents and the OS.
 const RESERVED_CORES: usize = 2;
-/// RAM per budget point.
-const GB_PER_POINT: f64 = 4.0;
+/// RAM per budget point. The free-RAM gate is what keeps a RAM-poor machine responsive, so
+/// the RAM cap only has to stop a budget far beyond what the RAM could ever hold.
+const GB_PER_POINT: f64 = 2.5;
 /// The budget never goes below this.
 const MIN_BUDGET: u64 = 2;
-/// Free-RAM gate: a fraction of the RAM, at least this many GB.
-const MIN_FREE_RAM_FRACTION: f64 = 1.0 / 8.0;
-const MIN_FREE_FLOOR_GB: f64 = 3.0;
+/// Free-RAM gate: the RAM divided by this, at least this many GB. A fixed 3 GB was above the
+/// free RAM of a 16 GB laptop at rest, so every second job waited for the first to end.
+const MIN_FREE_RAM_DIVISOR: f64 = 10.0;
+const MIN_FREE_FLOOR_GB: f64 = 1.5;
 /// Memory ceiling for one job's tree, as a fraction of the RAM.
 const CEILING_FRACTION: f64 = 0.5;
 /// Critical free-RAM floor: a fraction of the RAM, at most this many GB.
@@ -94,16 +96,16 @@ fn ram_gb(m: Machine) -> f64 {
     m.total_ram as f64 / GB
 }
 
-/// Logical cores − 2, capped at floor(RAM GB / 4), at least 2.
+/// Logical cores - 2, capped at floor(RAM GB / 2.5), at least 2.
 pub fn default_budget(m: Machine) -> u32 {
     let by_cores = m.logical_cores.saturating_sub(RESERVED_CORES) as u64;
     let by_ram = (ram_gb(m) / GB_PER_POINT).floor() as u64;
     by_cores.min(by_ram).max(MIN_BUDGET) as u32
 }
 
-/// max(3, RAM / 8) GB.
+/// max(1.5, RAM / 10) GB.
 pub fn default_min_free_gb(m: Machine) -> f64 {
-    (ram_gb(m) * MIN_FREE_RAM_FRACTION).max(MIN_FREE_FLOOR_GB)
+    (ram_gb(m) / MIN_FREE_RAM_DIVISOR).max(MIN_FREE_FLOOR_GB)
 }
 
 /// Half of the RAM.
@@ -221,11 +223,11 @@ pub fn default_config_text(m: Machine) -> String {
 # Defaults shown are computed for this machine.
 
 # Total points that may run at once (env CALMRUN_BUDGET).
-# Default: logical cores - 2, capped at floor(RAM GB / 4), at least 2.
+# Default: logical cores - 2, capped at floor(RAM GB / 2.5), at least 2.
 # budget = {budget}
 
 # A job starts only when at least this much RAM is free (env CALMRUN_MIN_FREE_GB).
-# Skipped when nothing is running. 0 disables the check. Default: max(3, RAM / 8).
+# Skipped when nothing is running. 0 disables the check. Default: max(1.5, RAM / 10).
 # min_free_gb = {min_free:.1}
 
 # Minutes a waiter may be passed by later, smaller jobs before strict order applies
@@ -282,16 +284,25 @@ mod tests {
 
     #[test]
     fn budget_defaults() {
-        assert_eq!(default_budget(m(16, 32)), 8); // ram cap
+        assert_eq!(default_budget(m(16, 32)), 12); // ram cap
         assert_eq!(default_budget(m(8, 64)), 6); // cores - 2
         assert_eq!(default_budget(m(2, 4)), 2); // min 2
-        assert_eq!(default_budget(m(20, 16)), 4);
+        assert_eq!(default_budget(m(20, 16)), 6);
+        assert_eq!(default_budget(m(4, 8)), 2); // cores - 2
+                                                // A "16 GB" laptop reports 15.6 GB: 6, not 3 as floor(15.6 / 4) gave.
+        let laptop = Machine {
+            logical_cores: 20,
+            total_ram: (15.6 * GB) as u64,
+        };
+        assert_eq!(default_budget(laptop), 6);
+        assert!((default_min_free_gb(laptop) - 1.56).abs() < 1e-9);
     }
 
     #[test]
     fn min_free_and_workers() {
-        assert_eq!(default_min_free_gb(m(8, 16)), 3.0);
-        assert_eq!(default_min_free_gb(m(8, 64)), 8.0);
+        assert_eq!(default_min_free_gb(m(8, 8)), 1.5);
+        assert_eq!(default_min_free_gb(m(8, 16)), 1.6);
+        assert_eq!(default_min_free_gb(m(8, 64)), 6.4);
         assert_eq!(default_vitest_workers(m(4, 8)), 1);
         assert_eq!(default_vitest_workers(m(8, 8)), 2);
         assert_eq!(default_vitest_workers(m(12, 8)), 3);

@@ -5,7 +5,7 @@
 
 use crate::scheduler::{job_points, uses_lease, Block, Inputs};
 use crate::state::{Job, Lease};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// One start condition. `'a` is the lifetime of the job snapshot the scheduler works on.
 pub trait Gate<'a> {
@@ -35,20 +35,25 @@ impl<'a> Gate<'a> for Points {
     }
 }
 
-/// Exclusive keys (`node_modules`, cargo `target`): one holder at a time.
+/// Exclusive keys (`node_modules`, cargo `target`): one holder at a time, machine-wide.
 struct Keys<'a> {
-    held: HashSet<&'a str>,
+    /// Key -> the label of the job holding it.
+    held: HashMap<&'a str, &'a str>,
 }
 
 impl<'a> Gate<'a> for Keys<'a> {
     fn blocks(&self, w: &'a Job, _: bool) -> Option<Block> {
         w.keys
             .iter()
-            .any(|k| self.held.contains(k.as_str()))
-            .then_some(Block::Key)
+            .find_map(|k| self.held.get(k.as_str()))
+            .map(|holder| Block::Key {
+                holder: holder.to_string(),
+            })
     }
     fn admit(&mut self, w: &'a Job) {
-        self.held.extend(w.keys.iter().map(String::as_str));
+        for k in &w.keys {
+            self.held.entry(k.as_str()).or_insert(w.label.as_str());
+        }
     }
 }
 
@@ -93,10 +98,12 @@ impl<'a> Gate<'a> for Disk {
 }
 
 /// Free RAM, minus what recently started jobs and jobs admitted in this pass are assumed to
-/// take. Skipped when nothing runs, so an idle machine always starts a job, and for a hold
-/// that takes no points (it runs nothing).
+/// take. Skipped when nothing runs on the machine (in any queue), so an idle machine always
+/// starts a job, and for a hold that takes no points (it runs nothing).
 struct Ram {
     free: u64,
+    /// Assumed taken by jobs that just started and by jobs admitted in this pass.
+    reserved: u64,
     needs: u64,
     per_point: u64,
     budget: u32,
@@ -105,21 +112,22 @@ struct Ram {
 impl<'a> Gate<'a> for Ram {
     fn blocks(&self, w: &'a Job, active: bool) -> Option<Block> {
         let runs_something = job_points(w, self.budget) > 0;
-        (runs_something && active && self.needs > 0 && self.free < self.needs).then_some(Block::Ram {
+        let left = self.free.saturating_sub(self.reserved);
+        (runs_something && active && self.needs > 0 && left < self.needs).then_some(Block::Ram {
             free: self.free,
+            reserved: self.reserved,
             needs: self.needs,
         })
     }
     fn admit(&mut self, w: &'a Job) {
-        let take = self.per_point * job_points(w, self.budget) as u64;
-        self.free = self.free.saturating_sub(take);
+        self.reserved += self.per_point * job_points(w, self.budget) as u64;
     }
 }
 
 /// The standard gates, primed with what already runs and what leases hold, in reporting order.
 pub fn standard<'a>(jobs: &'a [Job], inputs: &Inputs<'a>) -> Vec<Box<dyn Gate<'a> + 'a>> {
     let running = || jobs.iter().filter(|j| j.running());
-    let mut keys = Keys { held: HashSet::new() };
+    let mut keys = Keys { held: HashMap::new() };
     let mut resources = Resources {
         held: HashMap::new(),
         caps: inputs.caps,
@@ -128,6 +136,10 @@ pub fn standard<'a>(jobs: &'a [Job], inputs: &Inputs<'a>) -> Vec<Box<dyn Gate<'a
     for j in running() {
         keys.admit(j);
         resources.admit(j);
+    }
+    // Other queues' jobs hold their keys too (their resources and points are their own).
+    for j in inputs.foreign {
+        keys.admit(j);
     }
     for (name, n) in crate::scheduler::leased_slots(inputs.leases) {
         *resources.held.entry(name).or_default() += n;
@@ -143,13 +155,9 @@ pub fn standard<'a>(jobs: &'a [Job], inputs: &Inputs<'a>) -> Vec<Box<dyn Gate<'a
         Box::new(resources),
         Box::new(Disk),
         Box::new(Ram {
-            free: inputs
-                .free_ram
-                .saturating_sub(crate::scheduler::recent_reservation(
-                    jobs,
-                    inputs.now_ms,
-                    &inputs.limits,
-                )),
+            free: inputs.free_ram,
+            reserved: crate::scheduler::recent_reservation(jobs, inputs.now_ms, &inputs.limits)
+                + crate::scheduler::recent_reservation(inputs.foreign, inputs.now_ms, &inputs.limits),
             needs: inputs.limits.min_free_bytes,
             per_point: inputs.limits.ram_per_point,
             budget: inputs.limits.budget,

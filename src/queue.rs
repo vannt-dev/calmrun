@@ -8,7 +8,7 @@ use crate::kinds::Workers;
 use crate::memwatch::{self, MemWatch};
 use crate::messages::{self, WaitContext};
 use crate::scheduler::{self, Inputs, Limits};
-use crate::state::{self, Job, Lease, State, Store};
+use crate::state::{self, Job, Lease, OtherQueue, Settings, State, Store};
 use crate::sys::{DiskCheck, Sys};
 use crate::{history, runner};
 use std::collections::HashMap;
@@ -34,6 +34,9 @@ const RAM_RESERVE_PER_POINT: u64 = 1 << 30;
 const RAM_RESERVE_WINDOW_MS: u64 = 20_000;
 /// Publish the tree's memory to the state every this many samples.
 const MEM_PUBLISH_EVERY: u64 = 2;
+
+/// A separate queue (`--id`) left empty and unused this long is removed.
+const IDLE_QUEUE_MS: u64 = 7 * 24 * 3_600_000;
 
 /// How long a ticket keeps its place without a re-run.
 pub const TICKET_TTL_MS: u64 = 10 * 60_000;
@@ -104,7 +107,7 @@ impl Ctx {
         Ok(self)
     }
 
-    /// The scheduler limits from the config.
+    /// The scheduler limits from this process's own config.
     pub fn limits(&self) -> Limits {
         Limits {
             budget: self.cfg.budget,
@@ -115,8 +118,23 @@ impl Ctx {
         }
     }
 
-    /// The files of the selected queue.
+    /// This process's settings, as a queue records them.
+    pub fn settings(&self) -> Settings {
+        Settings {
+            budget: self.cfg.budget,
+            min_free_bytes: self.cfg.min_free_bytes,
+            pass_limit_ms: self.cfg.pass_limit_ms,
+            pid: std::process::id(),
+            at_ms: now_ms(),
+        }
+    }
+
+    /// The files of the selected queue. Refused inside a sandbox that hides the other
+    /// processes: every owner would look dead there.
     pub fn store(&self) -> Result<Store> {
+        if crate::sys::in_app_container() {
+            return Err(Error::Sandboxed);
+        }
         let opened = match &self.queue {
             Some(id) => Store::open_queue(&self.home, id),
             None => Store::open(&self.home),
@@ -128,6 +146,19 @@ impl Ctx {
     }
 }
 
+/// `own` limits with the settings the queue recorded, if any.
+pub fn effective_limits(own: Limits, s: &State) -> Limits {
+    match s.settings {
+        Some(r) => Limits {
+            budget: r.budget.max(1),
+            min_free_bytes: r.min_free_bytes,
+            pass_limit_ms: r.pass_limit_ms,
+            ..own
+        },
+        None => own,
+    }
+}
+
 /// Which (pid, start time) pairs are alive, read *before* taking the lock so the slow
 /// process refresh never happens while other calmruns wait for it.
 pub struct Liveness(HashMap<(u32, u64), bool>);
@@ -135,35 +166,90 @@ pub struct Liveness(HashMap<(u32, u64), bool>);
 impl Liveness {
     /// Check the owners of the entries currently in `store` (an unlocked peek).
     pub fn check(store: &Store, sys: &mut Sys) -> Liveness {
-        let pairs: Vec<(u32, u64)> = store
-            .peek()
-            .jobs
+        Liveness::check_with(store, &[], sys)
+    }
+
+    /// The same, plus the owners of the jobs running in `others`.
+    pub fn check_with(store: &Store, others: &[OtherQueue], sys: &mut Sys) -> Liveness {
+        let own = store.peek().jobs;
+        let pairs: Vec<(u32, u64)> = own
             .iter()
             .filter(|j| !j.parked())
+            .chain(
+                others
+                    .iter()
+                    .flat_map(|o| o.state.jobs.iter().filter(|j| j.running())),
+            )
             .map(|j| (j.pid, j.pid_start))
             .collect();
         let alive = sys.alive_set(&pairs);
         Liveness(pairs.into_iter().zip(alive).collect())
     }
 
+    /// Whether the owner was alive at the check (an owner not checked counts as alive).
+    pub fn alive(&self, pid: u32, start: u64) -> bool {
+        self.0.get(&(pid, start)).copied().unwrap_or(true)
+    }
+
     /// Drop entries whose owner died (pid gone or reused) and expired tickets. An entry that
-    /// appeared after the check is kept until the next one.
-    pub fn prune(&self, s: &mut State) {
-        state::prune(s, now_ms(), |pid, start| {
-            self.0.get(&(pid, start)).copied().unwrap_or(true)
-        });
+    /// appeared after the check is kept until the next one. Returns the dead owners' entries.
+    pub fn prune(&self, s: &mut State) -> Vec<Job> {
+        state::prune(s, now_ms(), |pid, start| self.alive(pid, start)).dead
     }
 }
 
-/// Run `f` on the pruned state under the lock.
+/// The jobs running in other queues whose owner is alive, labelled with their queue.
+pub fn foreign_running(others: &[OtherQueue], live: &Liveness) -> Vec<Job> {
+    others
+        .iter()
+        .flat_map(|o| {
+            let queue = o.queue.as_deref().unwrap_or("default");
+            o.state
+                .jobs
+                .iter()
+                .filter(|j| j.running() && live.alive(j.pid, j.pid_start))
+                .map(move |j| Job {
+                    label: format!("{} (queue {queue})", j.label),
+                    ..j.clone()
+                })
+        })
+        .collect()
+}
+
+/// Run `f` on the pruned state under the lock. Entries of killed owners get a history line.
 pub fn locked<R>(store: &Store, sys: &mut Sys, f: impl FnOnce(&mut State) -> R) -> Result<R> {
     let live = Liveness::check(store, sys);
-    store
+    let (out, dead) = store
         .with_lock(|s| {
-            live.prune(s);
-            f(s)
+            let dead = live.prune(s);
+            (f(s), dead)
         })
-        .map_err(Error::State)
+        .map_err(Error::State)?;
+    record_dead(store, &dead);
+    Ok(out)
+}
+
+/// History lines for entries whose calmrun was killed (`taskkill /F`, `kill -9`, a closed
+/// terminal): "killed" if the command was running, "abandoned" if it was still waiting.
+/// Times run up to when the entry was found dead.
+pub fn record_dead(store: &Store, dead: &[Job]) {
+    let now = now_ms();
+    for j in dead.iter().filter(|j| !j.is_hold()) {
+        let (status, wait_ms, run_ms) = match j.started_ms {
+            Some(s) => ("killed", s.saturating_sub(j.queued_ms), now.saturating_sub(s)),
+            None => ("abandoned", now.saturating_sub(j.queued_ms), 0),
+        };
+        let out = Outcome {
+            status: status.into(),
+            label: j.label.clone(),
+            kind: j.kind.clone(),
+            cost: j.cost,
+            wait_ms,
+            run_ms,
+            ..Outcome::default()
+        };
+        record(store, store.queue(), &out);
+    }
 }
 
 /// One job to run.
@@ -333,10 +419,17 @@ pub fn run(ctx: &mut Ctx, req: Request, notify: &mut dyn Notify) -> Outcome {
     let started_ms = match wait_turn(ctx, &store, &p, &entry, notify) {
         Ok(Admitted::Started(t)) => t,
         Ok(Admitted::Leased(_)) => return p.outcome(),
-        Err(out) => return *out,
+        Err(out) => {
+            // Ctrl+C or a cancelled MCP task while waiting: the run never started.
+            if out.status == "cancelled" {
+                record(&store, ctx.queue.as_deref(), &out);
+            }
+            return *out;
+        }
     };
     let out = execute(ctx, &store, &p, &entry, started_ms, notify);
     record(&store, ctx.queue.as_deref(), &out);
+    state::sweep_idle_queues(&ctx.home, IDLE_QUEUE_MS);
     out
 }
 
@@ -518,7 +611,14 @@ fn enqueue(ctx: &mut Ctx, store: &Store, p: &Prepared, notify: &mut dyn Notify) 
         ..Job::default()
     };
     let ticket = p.req.ticket;
-    let resumed = locked(store, &mut ctx.sys, |s| {
+    let mine = ctx.settings();
+    let (resumed, recorded) = locked(store, &mut ctx.sys, |s| {
+        // An empty queue takes the settings of the job that joins it; while it is busy every
+        // waiter decides with those, whatever its own env or config says.
+        if s.jobs.is_empty() || s.settings.is_none() {
+            s.settings = Some(mine);
+        }
+        let recorded = s.settings.unwrap_or(mine);
         if let Some(j) = ticket.and_then(|t| s.jobs.iter_mut().find(|j| j.id == t && j.parked())) {
             // Resume the kept place: same id, order and queue time.
             entry.id = j.id;
@@ -526,18 +626,21 @@ fn enqueue(ctx: &mut Ctx, store: &Store, p: &Prepared, notify: &mut dyn Notify) 
             entry.queued_ms = j.queued_ms;
             entry.high |= j.high;
             *j = entry.clone();
-            return true;
+            return (true, recorded);
         }
         s.next_id += 1;
         entry.id = s.next_id;
         entry.order = s.next_order();
         s.jobs.push(entry.clone());
-        false
+        (false, recorded)
     })?;
     if let (Some(t), false) = (ticket, resumed) {
         notify.note(&format!(
             "calmrun: ticket {t} has expired or is unknown; joining the end of the line"
         ));
+    }
+    if !recorded.same_limits(&mine) {
+        notify.note(&messages::settings_mismatch(&recorded, &mine));
     }
     Ok(entry)
 }
@@ -642,15 +745,23 @@ struct TickInput<'a> {
 }
 
 /// One locked look at the queue: prune, publish our disk state, read (or reuse) the shared
-/// free-RAM sample, schedule.
+/// free-RAM sample, schedule. The machine lock is held throughout, so a job admitted here
+/// and a job admitted in another queue never take the same exclusive key.
 fn tick(ctx: &mut Ctx, t: &TickInput) -> Result<Tick> {
     let now = now_ms();
-    let limits = ctx.limits();
-    let live = Liveness::check(t.store, &mut ctx.sys);
+    // Owners in the other queues are checked before any lock (the process refresh is slow).
+    let seen = t.store.others().unwrap_or_default();
+    let live = Liveness::check_with(t.store, &seen, &mut ctx.sys);
+    let _machine = t.store.machine_lock().map_err(Error::State)?;
+    let foreign = foreign_running(&t.store.others().map_err(Error::State)?, &live);
+    let own = ctx.limits();
     let (caps, sys, entry) = (&ctx.cfg.resources, &mut ctx.sys, t.entry);
-    t.store
+    let mut dead = Vec::new();
+    let tick = t
+        .store
         .with_lock(|s| {
-            live.prune(s);
+            dead = live.prune(s);
+            let limits = effective_limits(own, s);
             match s.jobs.iter_mut().find(|j| j.id == entry.id) {
                 Some(j) => j.disk_short = t.short,
                 // Our entry vanished (state file removed by hand); put it back.
@@ -668,6 +779,7 @@ fn tick(ctx: &mut Ctx, t: &TickInput) -> Result<Tick> {
                     limits,
                     caps,
                     leases: &s.leases,
+                    foreign: &foreign,
                 },
             );
             if plan.admits(entry.id) {
@@ -689,7 +801,7 @@ fn tick(ctx: &mut Ctx, t: &TickInput) -> Result<Tick> {
                 let c = WaitContext {
                     me: entry,
                     budget: limits.budget,
-                    disk: t.disk,
+                    disk: Some(t.disk),
                     caps,
                     now_ms: now,
                 };
@@ -697,10 +809,12 @@ fn tick(ctx: &mut Ctx, t: &TickInput) -> Result<Tick> {
             });
             Tick::Waiting {
                 line,
-                fingerprint: (s.jobs.len(), running, place),
+                fingerprint: (s.jobs.len(), running + foreign.len(), place),
             }
         })
-        .map_err(Error::State)
+        .map_err(Error::State)?;
+    record_dead(t.store, &dead);
+    Ok(tick)
 }
 
 /// Turn an admitted hold entry into a lease. Returns the new lease id.
@@ -1011,7 +1125,7 @@ fn finish(p: &Prepared, result: std::io::Result<runner::Ended>, reason: Option<S
 
 /// Append the run to `history.jsonl` (best effort: history is a convenience).
 fn record(store: &Store, queue: Option<&str>, out: &Outcome) {
-    let _ = history::append(
+    let _ = history::append_rotating(
         store.history_path(),
         &history::Record {
             at: history::format_utc(now_ms()),
@@ -1023,6 +1137,7 @@ fn record(store: &Store, queue: Option<&str>, out: &Outcome) {
             status: out.status.clone(),
             queue: queue.map(str::to_string),
         },
+        history::ROTATE_BYTES,
     );
 }
 

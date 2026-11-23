@@ -115,6 +115,31 @@ pub struct State {
     /// Resource leases (`calmrun hold`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub leases: Vec<Lease>,
+    /// The settings the queue decides with, recorded by the first job that joined it while
+    /// it was empty, so every waiter uses the same budget whatever its own env says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<Settings>,
+}
+
+/// The queue-wide settings in force (see [`State::settings`]).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct Settings {
+    pub budget: u32,
+    pub min_free_bytes: u64,
+    pub pass_limit_ms: u64,
+    /// The calmrun that recorded them.
+    #[serde(default)]
+    pub pid: u32,
+    #[serde(default)]
+    pub at_ms: u64,
+}
+
+impl Settings {
+    /// Whether two recordings set the same limits (who and when do not matter).
+    pub fn same_limits(&self, other: &Settings) -> bool {
+        (self.budget, self.min_free_bytes, self.pass_limit_ms)
+            == (other.budget, other.min_free_bytes, other.pass_limit_ms)
+    }
 }
 
 /// Free RAM as read by some calmrun at a moment.
@@ -142,10 +167,26 @@ const RENAME_BACKOFF_MS: u64 = 10;
 /// Attempts to read a state file that exists but cannot be read right now.
 const READ_RETRIES: u64 = 20;
 
+/// Folder of the separate queues (`--id`) under the state directory.
+pub const QUEUES_DIR: &str = "queues";
+/// Taken around every admission in every queue, so exclusive keys and the RAM and disk
+/// checks see what runs in the other queues.
+const MACHINE_LOCK: &str = "machine.lock";
+
 /// A queue's files: `state.json`, `state.lock`, and the shared `history.jsonl`.
 pub struct Store {
     dir: PathBuf,
+    home: PathBuf,
+    queue: Option<String>,
     history: PathBuf,
+}
+
+/// Another queue's state as read for a scheduling pass.
+#[derive(Debug, Clone, Default)]
+pub struct OtherQueue {
+    /// `None` is the default queue.
+    pub queue: Option<String>,
+    pub state: State,
 }
 
 impl Store {
@@ -154,22 +195,71 @@ impl Store {
         std::fs::create_dir_all(dir)?;
         Ok(Store {
             dir: dir.to_path_buf(),
+            home: dir.to_path_buf(),
+            queue: None,
             history: dir.join("history.jsonl"),
         })
     }
 
     /// A separate queue (`--id`) with its own state, sharing the history file of `home`.
     pub fn open_queue(home: &Path, id: &str) -> io::Result<Store> {
-        let dir = home.join("queues").join(id);
+        let dir = home.join(QUEUES_DIR).join(id);
         std::fs::create_dir_all(&dir)?;
         Ok(Store {
             dir,
+            home: home.to_path_buf(),
+            queue: Some(id.to_string()),
             history: home.join("history.jsonl"),
         })
     }
 
+    /// The separate queue's id (`None`: the default queue).
+    pub fn queue(&self) -> Option<&str> {
+        self.queue.as_deref()
+    }
+
     fn state_path(&self) -> PathBuf {
         self.dir.join("state.json")
+    }
+
+    /// Take the machine-wide admission lock (released when the file is dropped). Lock order:
+    /// this one first, then a queue's `state.lock`, never the other way round.
+    pub fn machine_lock(&self) -> io::Result<File> {
+        let f = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.home.join(MACHINE_LOCK))?;
+        f.lock()?;
+        Ok(f)
+    }
+
+    /// The states of every other queue under the same state directory (the default queue
+    /// included when this is a separate one). A file that cannot be read is an error, never
+    /// an empty queue; a corrupt one is skipped (its own queue sets it aside).
+    pub fn others(&self) -> io::Result<Vec<OtherQueue>> {
+        let mut paths = Vec::new();
+        if self.queue.is_some() {
+            paths.push((None, self.home.join("state.json")));
+        }
+        if let Ok(rd) = std::fs::read_dir(self.home.join(QUEUES_DIR)) {
+            for e in rd.flatten() {
+                let id = e.file_name().to_string_lossy().to_string();
+                if self.queue.as_deref() != Some(id.as_str()) && e.path().is_dir() {
+                    paths.push((Some(id), e.path().join("state.json")));
+                }
+            }
+        }
+        paths.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut queues = Vec::new();
+        for (queue, path) in paths {
+            let bytes = read_retrying(&path)?;
+            if let Ok(state) = serde_json::from_slice::<State>(&bytes) {
+                queues.push(OtherQueue { queue, state });
+            }
+        }
+        Ok(queues)
     }
 
     /// The shared `history.jsonl`.
@@ -212,18 +302,27 @@ impl Store {
     /// holding the file on Windows) are retried; if they persist the call fails instead of
     /// treating the queue as empty.
     fn read_bytes(&self) -> io::Result<Vec<u8>> {
-        let mut attempt = 0;
-        loop {
-            match std::fs::read(self.state_path()) {
-                Ok(b) => return Ok(b),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-                Err(e) if attempt + 1 >= READ_RETRIES => return Err(e),
-                Err(_) => {
-                    attempt += 1;
-                    std::thread::sleep(Duration::from_millis(RENAME_BACKOFF_MS * attempt));
-                }
-            }
-        }
+        read_retrying(&self.state_path())
+    }
+
+    /// Run `f` with the lock held on the state file's path and its parsed contents (`None`
+    /// when there is no file); nothing is written back.
+    fn with_lock_raw<R>(&self, f: impl FnOnce(&Path, Option<State>) -> R) -> io::Result<R> {
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.dir.join("state.lock"))?;
+        lock.lock()?;
+        let bytes = self.read_bytes()?;
+        let parsed = match bytes.is_empty() {
+            true => None,
+            false => Some(serde_json::from_slice(&bytes).map_err(io::Error::other)?),
+        };
+        let out = f(&self.state_path(), parsed);
+        drop(lock);
+        Ok(out)
     }
 
     /// Parse the state. A corrupt file is moved aside (`state.json.corrupt-<ms>`) so it can
@@ -272,17 +371,92 @@ impl Store {
     }
 }
 
+/// A file's bytes (empty if it does not exist). Other read errors (a scanner holding the
+/// file on Windows) are retried; if they persist the call fails.
+fn read_retrying(path: &Path) -> io::Result<Vec<u8>> {
+    let mut attempt = 0;
+    loop {
+        match std::fs::read(path) {
+            Ok(b) => return Ok(b),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) if attempt + 1 >= READ_RETRIES => return Err(e),
+            Err(_) => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(RENAME_BACKOFF_MS * attempt));
+            }
+        }
+    }
+}
+
+/// What [`prune`] took out.
+#[derive(Debug, Default)]
+pub struct Pruned {
+    /// Entries whose owner died (killed while waiting or running): worth a history line.
+    pub dead: Vec<Job>,
+    /// Expired tickets and leases.
+    pub expired: usize,
+}
+
+#[cfg(test)]
+impl Pruned {
+    /// Everything dropped.
+    pub fn count(&self) -> usize {
+        self.dead.len() + self.expired
+    }
+}
+
 /// Drop entries whose owner is gone (pid dead or reused by a different process) and expired
-/// leases. A parked entry has no owner; it stays until its ticket expires. Returns how many
-/// entries and leases were dropped.
-pub fn prune(state: &mut State, now_ms: u64, alive: impl Fn(u32, u64) -> bool) -> usize {
-    let before = state.jobs.len() + state.leases.len();
-    state.jobs.retain(|j| match j.parked_until {
-        Some(until) => until > now_ms,
-        None => alive(j.pid, j.pid_start),
-    });
+/// leases. A parked entry has no owner; it stays until its ticket expires.
+pub fn prune(state: &mut State, now_ms: u64, alive: impl Fn(u32, u64) -> bool) -> Pruned {
+    let mut out = Pruned::default();
+    for j in std::mem::take(&mut state.jobs) {
+        match j.parked_until {
+            Some(until) if until > now_ms => state.jobs.push(j),
+            Some(_) => out.expired += 1,
+            None if alive(j.pid, j.pid_start) => state.jobs.push(j),
+            None => out.dead.push(j),
+        }
+    }
+    let leases = state.leases.len();
     state.leases.retain(|l| l.until_ms > now_ms);
-    before - state.jobs.len() - state.leases.len()
+    out.expired += leases - state.leases.len();
+    out
+}
+
+/// Remove separate queues (`queues/<id>`) that have been empty and unwritten for `idle_ms`:
+/// no jobs, no leases. Best effort; returns the ids removed.
+pub fn sweep_idle_queues(home: &Path, idle_ms: u64) -> Vec<String> {
+    let mut removed = Vec::new();
+    let Ok(rd) = std::fs::read_dir(home.join(QUEUES_DIR)) else {
+        return removed;
+    };
+    let now = std::time::SystemTime::now();
+    for e in rd.flatten() {
+        let dir = e.path();
+        let touched = std::fs::metadata(dir.join("state.json"))
+            .or_else(|_| std::fs::metadata(&dir))
+            .and_then(|m| m.modified());
+        let idle = touched
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|d| d.as_millis() >= u128::from(idle_ms));
+        let id = e.file_name().to_string_lossy().to_string();
+        if !idle || !dir.is_dir() {
+            continue;
+        }
+        let Ok(store) = Store::open_queue(home, &id) else {
+            continue;
+        };
+        // Decided under the queue's lock: only an empty (or missing) state goes.
+        let empty = store.with_lock_raw(|path, s| match s {
+            None => true,
+            Some(s) => s.jobs.is_empty() && s.leases.is_empty() && std::fs::remove_file(path).is_ok(),
+        });
+        if empty.unwrap_or(false) && std::fs::remove_dir_all(&dir).is_ok() {
+            removed.push(id);
+        }
+    }
+    removed
 }
 
 #[cfg(test)]
@@ -326,7 +500,7 @@ mod tests {
             .unwrap();
         assert_eq!(store.with_lock(|s| s.jobs.len()).unwrap(), 2);
         let removed = store.with_lock(|s| prune(s, 0, |pid, _| pid == 10)).unwrap();
-        assert_eq!(removed, 1);
+        assert_eq!(removed.dead.iter().map(|j| j.id).collect::<Vec<_>>(), vec![2]);
         store
             .with_lock(|s| {
                 let mut parked = job(3, 30);
@@ -334,8 +508,16 @@ mod tests {
                 s.jobs.push(parked);
             })
             .unwrap();
-        assert_eq!(store.with_lock(|s| prune(s, 400, |pid, _| pid == 10)).unwrap(), 0);
-        assert_eq!(store.with_lock(|s| prune(s, 600, |pid, _| pid == 10)).unwrap(), 1);
+        assert_eq!(
+            store
+                .with_lock(|s| prune(s, 400, |pid, _| pid == 10))
+                .unwrap()
+                .count(),
+            0
+        );
+        let expired = store.with_lock(|s| prune(s, 600, |pid, _| pid == 10)).unwrap();
+        // An expired ticket is not a killed job.
+        assert_eq!((expired.expired, expired.dead.len()), (1, 0));
         assert_eq!(
             store
                 .with_lock(|s| s.jobs.iter().map(|j| j.id).collect::<Vec<_>>())
@@ -355,7 +537,7 @@ mod tests {
             });
         }
         // The lease's pid is never asked about: no process owns a lease.
-        assert_eq!(prune(&mut s, 1_000, |_, _| panic!("no owner check")), 1);
+        assert_eq!(prune(&mut s, 1_000, |_, _| panic!("no owner check")).expired, 1);
         assert_eq!(s.leases.len(), 1);
         assert_eq!(s.leases[0].id, "bbbbbb");
     }
@@ -366,6 +548,29 @@ mod tests {
         let s: State = serde_json::from_str(old).unwrap();
         assert!(s.leases.is_empty());
         assert!(!serde_json::to_string(&s).unwrap().contains("leases"));
+    }
+
+    #[test]
+    fn other_queues_are_read_and_old_empty_ones_swept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let default = Store::open(tmp.path()).unwrap();
+        let a = Store::open_queue(tmp.path(), "a").unwrap();
+        let b = Store::open_queue(tmp.path(), "b").unwrap();
+        default.with_lock(|s| s.jobs.push(job(1, 10))).unwrap();
+        a.with_lock(|s| s.jobs.push(job(2, 20))).unwrap();
+        let seen = |st: &Store| -> Vec<Option<String>> {
+            st.others().unwrap().into_iter().map(|o| o.queue).collect()
+        };
+        assert_eq!(seen(&default), vec![Some("a".to_string())]);
+        assert_eq!(seen(&a), vec![None]);
+        assert_eq!(seen(&b), vec![None, Some("a".to_string())]);
+        drop((a, b));
+        // Nothing is old enough yet.
+        assert!(sweep_idle_queues(tmp.path(), 60_000).is_empty());
+        // With no idle time required, only the empty queue goes; "a" still has a job.
+        assert_eq!(sweep_idle_queues(tmp.path(), 0), vec!["b".to_string()]);
+        assert!(tmp.path().join("queues").join("a").is_dir());
+        assert!(!tmp.path().join("queues").join("b").exists());
     }
 
     #[test]

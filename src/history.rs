@@ -22,6 +22,31 @@ pub struct Record {
     pub queue: Option<String>,
 }
 
+/// Past this size `history.jsonl` becomes `history.1.jsonl` (replacing the older one), so
+/// the history keeps between 4 and 8 MB: some 20,000 to 40,000 runs.
+pub const ROTATE_BYTES: u64 = 4 << 20;
+
+/// The rotated file next to `path`.
+pub fn previous(path: &Path) -> std::path::PathBuf {
+    path.with_file_name("history.1.jsonl")
+}
+
+/// The whole history: the rotated file, then the current one.
+pub fn read_all(path: &Path) -> String {
+    let old = std::fs::read_to_string(previous(path)).unwrap_or_default();
+    old + &std::fs::read_to_string(path).unwrap_or_default()
+}
+
+/// Append one record (one write, so concurrent runs do not interleave), rotating the file
+/// once it passes `max_bytes`.
+pub fn append_rotating(path: &Path, r: &Record, max_bytes: u64) -> std::io::Result<()> {
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > max_bytes) {
+        // Best effort: another calmrun may have rotated it already, or still hold it open.
+        let _ = std::fs::rename(path, previous(path));
+    }
+    append(path, r)
+}
+
 /// Append one record (one write, so concurrent runs do not interleave).
 pub fn append(path: &Path, r: &Record) -> std::io::Result<()> {
     let mut line = serde_json::to_string(r).map_err(std::io::Error::other)?;
@@ -89,6 +114,14 @@ pub struct Row {
     pub avg_wait_ms: u64,
     pub max_wait_ms: u64,
     pub avg_run_ms: u64,
+    /// Waits that ended before the command started (killed or cancelled while waiting);
+    /// not counted in `runs`.
+    pub gave_up: u64,
+}
+
+/// Whether a record is a wait that never started its command.
+fn never_started(r: &Record) -> bool {
+    r.status == "abandoned" || (r.status == "cancelled" && r.run_ms == 0)
 }
 
 /// Group the history since `since_ms` by label and kind.
@@ -112,19 +145,23 @@ pub fn summarize(text: &str, since_ms: u64) -> Vec<Row> {
                 0,
             )
         });
+        e.0.max_wait_ms = e.0.max_wait_ms.max(r.wait_ms);
+        if never_started(&r) {
+            e.0.gave_up += 1;
+            continue;
+        }
         e.0.runs += 1;
         if r.status != "0" {
             e.0.failures += 1;
         }
-        e.0.max_wait_ms = e.0.max_wait_ms.max(r.wait_ms);
         e.1 += r.wait_ms;
         e.2 += r.run_ms;
     }
     let mut rows: Vec<Row> = acc
         .into_values()
         .map(|(mut row, wait, run)| {
-            row.avg_wait_ms = wait / row.runs;
-            row.avg_run_ms = run / row.runs;
+            row.avg_wait_ms = wait / row.runs.max(1);
+            row.avg_run_ms = run / row.runs.max(1);
             row
         })
         .collect();
@@ -186,6 +223,47 @@ mod tests {
             (r.runs, r.failures, r.avg_wait_ms, r.max_wait_ms, r.avg_run_ms),
             (2, 1, 2000, 3000, 6000)
         );
+        // A job killed while running is a failed run; one killed while waiting gave up.
+        let more = [
+            text,
+            rec("2026-11-21T11:00:00Z", "npx vitest", 1000, 3000, "killed"),
+            rec("2026-11-21T12:00:00Z", "npx vitest", 8000, 0, "abandoned"),
+            rec("2026-11-21T13:00:00Z", "npx vitest", 500, 0, "cancelled"),
+        ]
+        .join("\n");
+        let r = &summarize(&more, parse_utc("2026-11-15T00:00:00Z").unwrap())[0];
+        assert_eq!(
+            (r.runs, r.failures, r.gave_up, r.max_wait_ms, r.avg_run_ms),
+            (3, 2, 2, 8000, 5000)
+        );
+    }
+
+    #[test]
+    fn history_rotates_and_reads_both_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("history.jsonl");
+        let rec = |label: &str| Record {
+            at: "2026-11-20T10:00:00Z".into(),
+            label: label.into(),
+            kind: "test".into(),
+            cost: 1,
+            wait_ms: 0,
+            run_ms: 1,
+            status: "0".into(),
+            queue: None,
+        };
+        for i in 0..5 {
+            append_rotating(&path, &rec(&format!("r{i}")), 200).unwrap();
+        }
+        assert!(previous(&path).exists());
+        assert!(std::fs::metadata(&path).unwrap().len() <= 400);
+        let labels: Vec<String> = read_all(&path)
+            .lines()
+            .map(|l| serde_json::from_str::<Record>(l).unwrap().label)
+            .collect();
+        // The oldest lines went with an earlier rotated file; the newest are all there.
+        assert_eq!(labels.last().map(String::as_str), Some("r4"));
+        assert!(labels.windows(2).all(|w| w[0] < w[1]), "{labels:?}");
     }
 
     #[test]

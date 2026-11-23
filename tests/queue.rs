@@ -583,3 +583,257 @@ fn relative_cmd_path_runs_from_its_folder() {
     assert_eq!(got[0], "build");
     assert!(got[1].starts_with("--max-workers="), "{got:?}");
 }
+
+impl Env {
+    /// `status --json` of a queue.
+    fn status_of(&self, queue: &str) -> serde_json::Value {
+        let out = self
+            .cmd(2)
+            .args(["--id", queue, "status", "--json"])
+            .stdout(Stdio::piped())
+            .output()
+            .unwrap();
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+
+    /// Poll until `f` holds for the status of `queue` (`None`: the default queue).
+    fn wait_until(&self, queue: Option<&str>, f: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let s = match queue {
+                Some(q) => self.status_of(q),
+                None => self.status(),
+            };
+            if f(&s) {
+                return s;
+            }
+            assert!(Instant::now() < deadline, "condition never held: {s}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The lines of `history.jsonl`.
+    fn history(&self) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(self.home.path().join("history.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+}
+
+fn len(v: &serde_json::Value) -> usize {
+    v.as_array().map_or(0, Vec::len)
+}
+
+#[test]
+fn queues_share_exclusive_keys() {
+    let env = Env::new();
+    let proj = env.home.path().join("proj");
+    std::fs::create_dir_all(proj.join("node_modules")).unwrap();
+    // The same node_modules from the default queue and two separate ones: never together.
+    let kids: Vec<Child> = [None, Some("kx"), Some("ky")]
+        .iter()
+        .enumerate()
+        .map(|(i, q)| {
+            let mut flags = vec!["--kind", "vitest", "--cost", "1"];
+            if let Some(q) = q {
+                flags.extend(["--id", q]);
+            }
+            env.probe(8, &flags, &format!("n{i}"), 600, Some(&proj))
+        })
+        .collect();
+    assert!(wait_all(kids, Duration::from_secs(60)).iter().all(|&c| c == 0));
+    let iv = env.intervals();
+    assert_eq!(iv.len(), 3);
+    assert_eq!(max_overlap(&iv, |_| 1), 1, "same node_modules overlapped: {iv:?}");
+}
+
+#[test]
+fn key_holder_in_another_queue_is_named() {
+    let env = Env::new();
+    let proj = env.home.path().join("proj");
+    std::fs::create_dir_all(proj.join("node_modules")).unwrap();
+    let holder = env.probe(
+        8,
+        &["--kind", "vitest", "--label", "holder"],
+        "h",
+        4000,
+        Some(&proj),
+    );
+    env.wait_queue(1, 0);
+    let waiter = env.probe(8, &["--kind", "vitest", "--id", "kx"], "w", 100, Some(&proj));
+    let s = env.wait_until(Some("kx"), |s| len(&s["waiting"]) == 1);
+    assert_eq!(s["waiting"][0]["why_code"], "key", "{s}");
+    let why = s["waiting"][0]["why"].as_str().unwrap();
+    assert!(why.contains("\"holder (queue default)\""), "{why}");
+    assert!(wait_all(vec![holder, waiter], Duration::from_secs(60))
+        .iter()
+        .all(|&c| c == 0));
+}
+
+#[test]
+fn the_ram_check_sees_jobs_in_other_queues() {
+    let env = Env::new();
+    let holder = env.probe(2, &["--cost", "1"], "holder", 5000, None);
+    env.wait_queue(1, 0);
+    // Its own queue is empty, but the machine is busy: the RAM minimum applies.
+    let out = env
+        .cmd(2)
+        .env("CALMRUN_MIN_FREE_GB", "100000")
+        .args(["--id", "other", "--wait-timeout", "1", "--", EXE, "__probe"])
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(75), "{err}");
+    assert!(err.contains("waiting for RAM: "), "{err}");
+    assert!(err.is_ascii(), "{err}");
+    assert!(wait_all(vec![holder], Duration::from_secs(60))
+        .iter()
+        .all(|&c| c == 0));
+    // Nothing runs anywhere now: the same run starts at once.
+    let ok = env
+        .cmd(2)
+        .env("CALMRUN_MIN_FREE_GB", "100000")
+        .args(["--id", "other2", "--wait-timeout", "5", "--", EXE, "__probe"])
+        .status()
+        .unwrap();
+    assert_eq!(ok.code(), Some(0));
+}
+
+#[test]
+fn status_says_why_each_job_waits() {
+    let env = Env::new();
+    let holder = env.probe(2, &["--cost", "2", "--label", "holder"], "holder", 4000, None);
+    env.wait_queue(1, 0);
+    let waiter = env.probe(2, &["--cost", "1", "--label", "waiter"], "waiter", 100, None);
+    let s = env.wait_until(None, |s| len(&s["waiting"]) == 1);
+    assert_eq!(s["waiting"][0]["why_code"], "budget", "{s}");
+    assert_eq!(s["waiting"][0]["why"], "2 of 2 points in use (needs 1)");
+    let text = env.cmd(2).arg("status").stdout(Stdio::piped()).output().unwrap();
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text.contains("waits for: 2 of 2 points in use (needs 1)"),
+        "{text}"
+    );
+    assert!(text.is_ascii(), "{text}");
+    assert!(wait_all(vec![holder, waiter], Duration::from_secs(60))
+        .iter()
+        .all(|&c| c == 0));
+}
+
+#[test]
+fn a_busy_queue_keeps_the_budget_it_started_with() {
+    let env = Env::new();
+    let a = env.probe(2, &["--cost", "2"], "a", 3000, None);
+    env.wait_queue(1, 0);
+    // Budget 8 in this caller's env, but the queue runs with 2: B waits.
+    let b = env.probe(8, &["--cost", "2"], "b", 100, None);
+    let s = env.wait_until(None, |s| len(&s["waiting"]) == 1);
+    let out = env
+        .cmd(8)
+        .args(["status", "--json"])
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["budget"], 2, "{v}");
+    let warned = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w.as_str().unwrap().contains("budget 2"));
+    assert!(warned, "{v}");
+    assert_eq!(s["waiting"][0]["why_code"], "budget");
+    assert!(wait_all(vec![a, b], Duration::from_secs(60))
+        .iter()
+        .all(|&c| c == 0));
+    assert_eq!(max_overlap(&env.intervals(), |_| 1), 1);
+    // Once empty, the next job's settings apply.
+    let c = env.probe(8, &["--cost", "2"], "c", 1500, None);
+    env.wait_queue(1, 0);
+    let out = env
+        .cmd(8)
+        .args(["status", "--json"])
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["budget"], 8, "{v}");
+    assert!(wait_all(vec![c], Duration::from_secs(60)).iter().all(|&x| x == 0));
+}
+
+#[test]
+fn killed_jobs_leave_a_history_line() {
+    let env = Env::new();
+    let mut a = env.probe(2, &["--cost", "2", "--label", "runner"], "a", 3000, None);
+    env.wait_queue(1, 0);
+    let mut b = env.probe(2, &["--cost", "2", "--label", "waiter"], "b", 100, None);
+    env.wait_queue(1, 1);
+    b.kill().unwrap();
+    let _ = b.wait();
+    a.kill().unwrap();
+    let _ = a.wait();
+    // The next calmrun that looks at the queue finds both owners dead.
+    env.wait_queue(0, 0);
+    let h = env.history();
+    let status_of = |label: &str| {
+        h.iter()
+            .find(|r| r["label"] == label)
+            .map(|r| r["status"].as_str().unwrap().to_string())
+    };
+    assert_eq!(status_of("waiter").as_deref(), Some("abandoned"), "{h:?}");
+    assert_eq!(status_of("runner").as_deref(), Some("killed"), "{h:?}");
+    // Only once, however many calmruns looked.
+    env.wait_queue(0, 0);
+    assert_eq!(env.history().len(), 2);
+}
+
+#[test]
+fn release_ticket_gives_up_a_kept_place() {
+    let env = Env::new();
+    let holder = env.probe(2, &["--cost", "2"], "holder", 4000, None);
+    env.wait_queue(1, 0);
+    let out = env
+        .cmd(2)
+        .args(["--cost", "2", "--wait-timeout", "1", "--", EXE, "__probe"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(75));
+    let s = env.status();
+    let ticket = s["parked"][0]["ticket"].as_u64().unwrap();
+    let out = env
+        .cmd(2)
+        .args(["release", "--ticket", &ticket.to_string()])
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains(&format!("dropped ticket {ticket}")));
+    assert_eq!(len(&env.status()["parked"]), 0);
+    // Unknown now: a note, still exit 0.
+    let again = env
+        .cmd(2)
+        .args(["release", "--ticket", &ticket.to_string()])
+        .status()
+        .unwrap();
+    assert!(again.success());
+    assert!(wait_all(vec![holder], Duration::from_secs(60))
+        .iter()
+        .all(|&c| c == 0));
+}
+
+#[test]
+fn id_may_come_before_the_subcommand() {
+    let env = Env::new();
+    let out = env
+        .cmd(2)
+        .args(["--id", "alpha", "status", "--json"])
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["queue"], "alpha");
+}

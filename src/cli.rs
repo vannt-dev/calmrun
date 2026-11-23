@@ -55,6 +55,30 @@ pub struct Cli {
     pub command: Vec<String>,
 }
 
+/// Let `--id` come before a subcommand too: `calmrun --id q status` is `calmrun status --id q`.
+/// (A run's flags conflict with subcommands, so clap alone would take `status` for a command
+/// to run.) Anything else is left as it is.
+pub fn id_flag_first(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    use clap::CommandFactory;
+    let text = |i: usize| args.get(i).and_then(|a| a.to_str());
+    let mut i = 1;
+    loop {
+        match text(i) {
+            Some("--id") if args.len() > i + 1 => i += 2,
+            Some(a) if a.starts_with("--id=") => i += 1,
+            _ => break,
+        }
+    }
+    let is_sub = text(i).is_some_and(|w| Cli::command().get_subcommands().any(|s| s.get_name() == w));
+    if i == 1 || !is_sub {
+        return args;
+    }
+    let mut out = vec![args[0].clone(), args[i].clone()];
+    out.extend(args[1..i].iter().cloned());
+    out.extend(args[i + 1..].iter().cloned());
+    out
+}
+
 /// Queue priority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Prio {
@@ -177,4 +201,36 @@ pub struct ProbeArgs {
     pub spawn_daemon: Option<std::path::PathBuf>,
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub rest: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(line: &str) -> Cli {
+        let args = line.split(' ').map(std::ffi::OsString::from).collect();
+        Cli::try_parse_from(id_flag_first(args)).unwrap()
+    }
+
+    #[test]
+    fn id_works_before_and_after_a_subcommand() {
+        for line in [
+            "calmrun --id q status",
+            "calmrun status --id q",
+            "calmrun --id=q status",
+        ] {
+            let c = parse(line);
+            assert!(matches!(c.sub, Some(Sub::Status { .. })), "{line}");
+            assert_eq!(c.id.as_deref(), Some("q"), "{line}");
+        }
+        let c = parse("calmrun --id q release --ticket 4");
+        assert!(matches!(c.sub, Some(Sub::Release(_))));
+        // A run keeps its flags and command.
+        let c = parse("calmrun --id q -- status");
+        assert!(c.sub.is_none());
+        assert_eq!(c.command, vec!["status"]);
+        let c = parse("calmrun --id q --cost 2 -- npm test");
+        assert_eq!((c.id.as_deref(), c.cost), (Some("q"), Some(2)));
+        assert_eq!(c.command, vec!["npm", "test"]);
+    }
 }

@@ -575,7 +575,7 @@ fn queue_place(task: &Task, job_id: Option<u64>) -> Option<Value> {
     let id = job_id?;
     let mut ctx = Ctx::load().and_then(|c| c.with_queue(task.queue.clone())).ok()?;
     let s = status::snapshot(&mut ctx).ok()?;
-    let budget = ctx.cfg.budget;
+    let budget = crate::queue::effective_limits(ctx.limits(), &s).budget;
     let waiting = scheduler::waiting_in_order(&s.jobs);
     let me = s.jobs.iter().find(|j| j.id == id)?;
     Some(json!({

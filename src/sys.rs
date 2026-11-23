@@ -92,6 +92,40 @@ pub fn state_base_dir() -> Option<PathBuf> {
     base.or_else(|| dirs::home_dir().map(|h| h.join(".local").join("state")))
 }
 
+/// Whether this process runs inside a Windows AppContainer: a sandbox (Antigravity's terminal
+/// sandbox is one) that hides the other processes and redirects the per-user folders, so a
+/// calmrun there would take every other job's owner for dead and drop it from the queue.
+#[cfg(windows)]
+pub fn in_app_container() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenIsAppContainer, TOKEN_QUERY};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: plain Win32 calls on this process's own token, closed before returning.
+    unsafe {
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut flag: u32 = 0;
+        let mut len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenIsAppContainer,
+            (&mut flag as *mut u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+            &mut len,
+        );
+        CloseHandle(token);
+        ok != 0 && flag != 0
+    }
+}
+
+/// Whether this process runs inside a Windows AppContainer (never elsewhere).
+#[cfg(not(windows))]
+pub fn in_app_container() -> bool {
+    false
+}
+
 /// A path as a comparable string: canonical, without the Windows `\\?\` prefix, and
 /// lowercased on Windows (whose file names are case-insensitive).
 pub fn path_key(p: &Path) -> String {

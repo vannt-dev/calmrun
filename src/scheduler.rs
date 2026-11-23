@@ -48,6 +48,9 @@ pub struct Inputs<'a> {
     pub caps: &'a BTreeMap<String, u32>,
     /// Resource leases (`calmrun hold`): slots and points held without a running job.
     pub leases: &'a [Lease],
+    /// Jobs running in the other queues (`--id`): they hold their exclusive keys and make the
+    /// machine busy for the RAM and disk checks, but take none of this queue's points.
+    pub foreign: &'a [Job],
 }
 
 /// Cost as the scheduler sees it: at least 1, at most the budget.
@@ -131,12 +134,20 @@ pub enum Block {
         used: u32,
         needs: u32,
     },
+    /// Free RAM is below the minimum plus what jobs that just started are assumed to take.
     Ram {
+        /// Free RAM as read.
         free: u64,
+        /// Held back for jobs that started in the last seconds (or in this pass).
+        reserved: u64,
+        /// The minimum free RAM to start.
         needs: u64,
     },
     Disk,
-    Key,
+    /// An exclusive key (a `node_modules`, a cargo `target`) is held by this running job.
+    Key {
+        holder: String,
+    },
     /// All slots of this named resource are taken.
     Resource(String),
     /// Kept in line behind a waiter that may no longer be passed.
@@ -181,7 +192,7 @@ pub fn schedule_with<'a>(
     inputs: &Inputs,
     mut gates: Vec<Box<dyn crate::gates::Gate<'a> + 'a>>,
 ) -> Plan {
-    let mut active = jobs.iter().any(Job::running);
+    let mut active = jobs.iter().any(Job::running) || !inputs.foreign.is_empty();
     let mut plan = Plan::default();
     let mut barrier = false;
     let leased = leased_slots(inputs.leases);
@@ -252,6 +263,7 @@ pub fn plan_leased(
             limits,
             caps,
             leases,
+            foreign: &[],
         },
     );
     (p.admitted, p.blocked)
@@ -350,6 +362,7 @@ mod tests {
                 2,
                 Block::Ram {
                     free: GB,
+                    reserved: 0,
                     needs: 3 * GB
                 }
             )]
@@ -387,6 +400,45 @@ mod tests {
         // Two waiters on the same key: only the first is admitted.
         let jobs = vec![keyed(job(1, 1, false), "nm:a"), keyed(job(2, 1, false), "nm:a")];
         assert_eq!(admissible(&jobs, 2_000, 16 * GB, LIM), vec![1]);
+    }
+
+    #[test]
+    fn jobs_in_other_queues_hold_keys_and_make_the_machine_busy() {
+        let mut other = keyed(job(9, 2, true), "nm:a");
+        other.label = "npx vitest (queue kx)".into();
+        let foreign = vec![other];
+        let caps = BTreeMap::new();
+        let run = |jobs: &[Job], free: u64| {
+            schedule(
+                jobs,
+                &Inputs {
+                    now_ms: 2_000,
+                    free_ram: free,
+                    limits: LIM,
+                    caps: &caps,
+                    leases: &[],
+                    foreign: &foreign,
+                },
+            )
+        };
+        // Same key as the job in the other queue: waits, naming it; another key starts.
+        let jobs = vec![keyed(job(1, 1, false), "nm:a"), keyed(job(2, 1, false), "nm:b")];
+        let p = run(&jobs, 16 * GB);
+        assert_eq!(p.admitted, vec![2]);
+        assert_eq!(
+            p.reason(1),
+            Block::Key {
+                holder: "npx vitest (queue kx)".into()
+            }
+        );
+        // Nothing runs in this queue, but the machine is busy: the RAM check applies.
+        let jobs = vec![job(3, 1, false)];
+        let p = run(&jobs, GB);
+        assert!(p.admitted.is_empty());
+        assert!(matches!(p.reason(3), Block::Ram { .. }), "{p:?}");
+        // Points stay per queue: the other queue's cost-2 job takes none of ours.
+        let jobs = vec![job(4, 4, false)];
+        assert_eq!(run(&jobs, 16 * GB).admitted, vec![4]);
     }
 
     #[test]
@@ -444,7 +496,7 @@ mod tests {
         struct EvenOnly;
         impl<'a> crate::gates::Gate<'a> for EvenOnly {
             fn blocks(&self, w: &'a Job, _: bool) -> Option<Block> {
-                (w.id % 2 == 1).then_some(Block::Key)
+                (w.id % 2 == 1).then(|| Block::Key { holder: "odd".into() })
             }
             fn admit(&mut self, _: &'a Job) {}
         }
@@ -456,12 +508,13 @@ mod tests {
             limits: LIM,
             caps: &caps,
             leases: &[],
+            foreign: &[],
         };
         let mut gates = crate::gates::standard(&jobs, &inputs);
         gates.push(Box::new(EvenOnly));
         let plan = schedule_with(&jobs, &inputs, gates);
         assert_eq!(plan.admitted, vec![2, 4]);
-        assert_eq!(plan.reason(1), Block::Key);
+        assert_eq!(plan.reason(1), Block::Key { holder: "odd".into() });
     }
 
     #[test]

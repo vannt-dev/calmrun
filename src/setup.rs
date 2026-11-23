@@ -169,6 +169,8 @@ pub struct Options {
     pub program: String,
     pub agents: Option<Vec<String>>,
     pub home: PathBuf,
+    /// calmrun's state directory (made writable in Codex's sandbox).
+    pub state_dir: PathBuf,
 }
 
 /// Text to print and the exit code.
@@ -197,7 +199,7 @@ pub fn run(opts: &Options, env: &dyn Fn(&str) -> Option<String>) -> (String, i32
         Ok(c) => c,
         Err(msg) => return (msg, 2),
     };
-    let hook_agents = match hooks::chosen(&opts.hook) {
+    let hook_agents = match hooks::chosen(&opts.hook, opts.remove) {
         Ok(h) => h,
         Err(msg) => return (msg, 2),
     };

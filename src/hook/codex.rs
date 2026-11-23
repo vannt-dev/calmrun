@@ -10,20 +10,28 @@
 use super::{deny_reason, plan, Background, Call, Mode, Opts, Shell};
 use serde_json::{json, Value};
 
-/// The shell command of a Codex `Bash` call: a string, or an argv array (`["bash", "-lc",
-/// "npm test"]` gives the script, anything else its words joined).
-fn command_of(v: &Value) -> Option<String> {
+/// The shell command of a Codex `Bash` call and the shell that runs it: a string (run by
+/// PowerShell on Windows, as Codex does there, else by sh), or an argv array (`["bash", "-lc",
+/// "npm test"]` gives the script and its shell, anything else its words joined).
+fn command_of(v: &Value, windows: bool) -> Option<(String, Shell)> {
+    let default = if windows { Shell::PowerShell } else { Shell::Posix };
     if let Some(s) = v.as_str() {
-        return Some(s.to_string());
+        return Some((s.to_string(), default));
     }
     let words: Vec<&str> = v.as_array()?.iter().map(Value::as_str).collect::<Option<_>>()?;
-    if let [_, flag, script] = words.as_slice() {
+    if let [program, flag, script] = words.as_slice() {
         let flag = flag.to_ascii_lowercase();
         if ["-c", "-lc", "-command", "/c"].contains(&flag.as_str()) {
-            return Some(script.to_string());
+            let p = program.to_ascii_lowercase();
+            let shell = if p.contains("powershell") || p.contains("pwsh") {
+                Shell::PowerShell
+            } else {
+                Shell::Posix
+            };
+            return Some((script.to_string(), shell));
         }
     }
-    Some(words.join(" "))
+    Some((words.join(" "), default))
 }
 
 /// Process one hook input: the JSON to print, or `None` to allow the call as it is.
@@ -33,10 +41,10 @@ pub fn handle(input: &str, o: &Opts) -> Option<String> {
         return None;
     }
     let tool_input = v.get("tool_input")?.as_object()?;
-    let command = command_of(tool_input.get("command")?)?;
+    let (command, shell) = command_of(tool_input.get("command")?, cfg!(windows))?;
     let call = Call {
         command: &command,
-        shell: Shell::Posix,
+        shell,
         limit_ms: None,
         background: false,
     };
@@ -68,6 +76,26 @@ pub fn handle(input: &str, o: &Opts) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_shell_follows_the_call_and_the_os() {
+        let s = |v: Value, win: bool| command_of(&v, win).unwrap().1;
+        assert_eq!(s(json!("npm test"), true), Shell::PowerShell);
+        assert_eq!(s(json!("npm test"), false), Shell::Posix);
+        assert_eq!(s(json!(["bash", "-lc", "npm test"]), true), Shell::Posix);
+        let ps = json!(["C:\\WINDOWS\\powershell.exe", "-Command", "npm test"]);
+        assert_eq!(s(ps, false), Shell::PowerShell);
+        // A quoted path is called with `&` in PowerShell.
+        let call = Call {
+            command: "npm test",
+            shell: Shell::PowerShell,
+            limit_ms: None,
+            background: false,
+        };
+        let o = super::super::opts(Mode::Rewrite, r#""C:\My Tools\calmrun.exe""#);
+        let p = plan(&call, o.kinds, o.program).unwrap();
+        assert_eq!(p.command(), r#"& "C:\My Tools\calmrun.exe" -- npm test"#);
+    }
 
     fn run(input: Value, mode: Mode) -> Option<Value> {
         handle(&input.to_string(), &super::super::opts(mode, "calmrun"))

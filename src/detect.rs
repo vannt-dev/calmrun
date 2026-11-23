@@ -22,6 +22,9 @@ pub struct Detected {
     pub tool: String,
     /// The words after the tool (for rule lookups: cost, key, hints, needs).
     pub rest: Vec<String>,
+    /// Started through `rtk`, which parses its own arguments: only environment hints apply,
+    /// never added flags.
+    pub env_hints_only: bool,
 }
 
 impl Detected {
@@ -197,11 +200,51 @@ fn launcher_at(words: &[String], i: usize) -> Option<(Vec<String>, usize)> {
     }
 }
 
+/// rtk subcommands that run another command given after them (`rtk test cargo test`).
+const RTK_RUNNERS: &[&str] = &["test", "err", "summary", "proxy"];
+
+/// `rtk <tool> ...` (a token-saving proxy) as the words it runs: `rtk cargo test` is `cargo
+/// test`, `rtk vitest` is `vitest run`, `rtk next` is `next build`, `rtk lint` is `eslint`,
+/// `rtk test cargo test` is `cargo test`. Light subcommands (`rtk git`, `rtk ls`) stay light.
+fn rtk_inner(words: &[String]) -> Option<(Vec<String>, String)> {
+    let j = skip_flags(words, 1, &[]);
+    let sub = tool_name(words.get(j)?);
+    let rest = &words[j + 1..];
+    let bare = rest.first().is_none_or(|w| w.starts_with('-'));
+    let mut inner: Vec<String> = match sub.as_str() {
+        s if RTK_RUNNERS.contains(&s) => return Some((rest.to_vec(), sub)),
+        "lint" => vec!["eslint".to_string()],
+        "vitest" if rest.first().map(String::as_str) != Some("run") => {
+            vec!["vitest".to_string(), "run".to_string()]
+        }
+        "next" if bare => vec!["next".to_string(), "build".to_string()],
+        _ => vec![words[j].clone()],
+    };
+    inner.extend(rest.iter().cloned());
+    Some((inner, String::new()))
+}
+
 /// Find the program in a list of words.
 pub fn parse(words: &[String]) -> Option<Parsed> {
     let start = command_start(words)?;
     let first = tool_name(&words[start]);
     let next = words.get(start + 1).map(|s| s.to_ascii_lowercase());
+    if first == "rtk" {
+        if let Some((inner_words, runner)) = rtk_inner(&words[start..]) {
+            let inner = parse(&inner_words)?;
+            let mut launcher = vec![first];
+            if !runner.is_empty() {
+                launcher.push(runner);
+            }
+            launcher.extend(inner.launcher);
+            return Some(Parsed {
+                launcher,
+                tool: inner.tool,
+                rest: inner.rest,
+                start,
+            });
+        }
+    }
     if matches!(first.as_str(), "uv" | "poetry" | "pipenv" | "pdm" | "hatch")
         && next.as_deref() == Some("run")
     {
@@ -324,6 +367,7 @@ pub fn detect_words(words: &[String], kinds: &BTreeMap<String, KindConfig>) -> D
         Some(p) => Detected {
             kind: kinds::classify(&p.tool, &p.rest, kinds),
             label: label_of(&p),
+            env_hints_only: p.launcher.first().is_some_and(|l| l == "rtk"),
             tool: p.tool,
             rest: p.rest,
         },
@@ -382,6 +426,7 @@ pub fn apply_hints(
     let mut words = argv.to_vec();
     for hint in kinds::hints_for(&det.tool, &det.rest) {
         match hint {
+            Hint::Arg(_) | Hint::Replace { .. } if det.env_hints_only => {}
             Hint::Arg(a) => {
                 if let Some(changed) = arg_hint(&words, &det.tool, &a, a.count(workers(a.workers)), env_get) {
                     words = changed;
@@ -825,6 +870,43 @@ mod tests {
         );
         assert_eq!(d.kind.as_deref(), Some("vitest"));
         assert_eq!(d.label, "npx vitest run");
+    }
+
+    #[test]
+    fn rtk_runs_the_tool_after_it() {
+        // Heavy through rtk, as without it.
+        assert_eq!(kind("rtk cargo test"), kind("cargo test"));
+        assert_eq!(kind("rtk vitest"), kind("vitest run"));
+        assert_eq!(kind("rtk vitest run a.test.ts"), kind("vitest run"));
+        assert_eq!(kind("rtk tsc --noEmit"), kind("tsc --noEmit"));
+        assert_eq!(kind("rtk npm test"), kind("npm test"));
+        assert_eq!(kind("rtk pnpm test"), kind("pnpm test"));
+        assert_eq!(kind("rtk npx vitest run"), kind("npx vitest run"));
+        assert_eq!(kind("rtk playwright test"), kind("playwright test"));
+        assert_eq!(kind("rtk pytest -q"), kind("pytest -q"));
+        assert_eq!(kind("rtk go test ./..."), kind("go test ./..."));
+        assert_eq!(kind("rtk lint"), kind("eslint"));
+        assert_eq!(kind("rtk next"), kind("next build"));
+        assert_eq!(kind("rtk test cargo test"), kind("cargo test"));
+        assert_eq!(kind("rtk -v cargo build"), kind("cargo build"));
+        assert!(kind("rtk cargo test").is_some());
+        assert_eq!(label("rtk cargo test"), "rtk cargo test");
+        // Light ones stay light.
+        for light in [
+            "rtk git status",
+            "rtk ls",
+            "rtk read src/main.rs",
+            "rtk grep x",
+            "rtk gain",
+        ] {
+            assert_eq!(kind(light), None, "{light}");
+        }
+        // rtk parses its own arguments: environment hints only, never an added flag.
+        assert_eq!(hinted("rtk vitest run", 2), None);
+        let cargo = hinted_env("rtk cargo test", 3, &[]);
+        assert_eq!(cargo.argv, None);
+        assert_eq!(hinted_env("cargo test", 3, &[]).env, cargo.env);
+        assert!(!cargo.env.is_empty());
     }
 
     #[test]

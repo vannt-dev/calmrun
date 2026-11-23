@@ -20,7 +20,7 @@ process coordinates through a small state file guarded by an OS file lock.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vannt-dev/calmrun/main/docs/diagrams/overview-dark.svg">
-  <img alt="Several agents and terminals on one machine send heavy commands to calmrun, either directly as calmrun -- cmd or through the MCP tool run_task; the Claude Code hook catches a heavy command started without calmrun and denies it with the wrapped form, or rewrites it. calmrun first applies its command rules: a watch mode is refused with exit 2 and the one-shot form to run instead, and a dev server or app run starts at once outside the queue. Any other command is detected for its kind and cost, its exclusive key and a worker hint, then waits in the machine-wide queue until all gates hold: free budget points, enough free RAM and disk, its exclusive key and any named resource. With --wait-timeout it gives up with exit 75 and keeps its place as a ticket. Once admitted it runs at low CPU priority under a process-tree memory ceiling, and its exit code is passed back and recorded in the history." src="https://raw.githubusercontent.com/vannt-dev/calmrun/main/docs/diagrams/overview-light.svg">
+  <img alt="Several agents and terminals on one machine send heavy commands to calmrun, either directly as calmrun -- cmd or through the MCP tool run_task; the agent hooks (Claude Code, Codex, OpenCode, and Antigravity as experimental) catch a heavy command started without calmrun and denies it with the wrapped form, or rewrites it. calmrun first applies its command rules: a watch mode is refused with exit 2 and the one-shot form to run instead, and a dev server or app run starts at once outside the queue. Any other command is detected for its kind and cost, its exclusive key and a worker hint, then waits in the machine-wide queue until all gates hold: free budget points, enough free RAM and disk, its exclusive key and any named resource. With --wait-timeout it gives up with exit 75 and keeps its place as a ticket. Once admitted it runs at low CPU priority under a process-tree memory ceiling, and its exit code is passed back and recorded in the history." src="https://raw.githubusercontent.com/vannt-dev/calmrun/main/docs/diagrams/overview-light.svg">
 </picture>
 
 Works on Windows, macOS and Linux. Website: <https://vannt-dev.github.io/calmrun/>
@@ -113,8 +113,8 @@ calmrun: waiting for RAM: 2.1 GB free, needs 3.0 GB; running: npx playwright in 
 
 ### Budget and kinds
 
-The machine has `budget` points (default: logical cores − 2, capped at floor(RAM GB / 4), at
-least 2). Each job costs points by kind; `--cost` overrides, and a cost above the budget counts
+The machine has `budget` points (default: logical cores − 2, capped at floor(RAM GB / 2.5), at
+least 2; the RAM gate below is what keeps a RAM-poor machine responsive). Each job costs points by kind; `--cost` overrides, and a cost above the budget counts
 as the whole budget.
 
 | Kind | Detected from | Default cost |
@@ -205,9 +205,12 @@ leaves it alone.
 A job starts when **all** of these hold:
 
 - **Points.** Its cost fits in the free points of its queue.
-- **RAM.** Free RAM is at least `min_free_gb` (default max(3, RAM / 8) GB; `0` disables). The
-  check is skipped when nothing is running, so a job never waits forever on an idle machine.
-  Waiters share one RAM reading per second, and memory is reserved for jobs that just started.
+- **RAM.** Free RAM is at least `min_free_gb` (default max(1.5, RAM / 10) GB; `0` disables). The
+  check is skipped when nothing is running in any queue, so a job never waits forever on an idle
+  machine. Waiters share one RAM reading per second, and 1 GB per point is held back for jobs
+  that started in the last 20 s:
+  `calmrun: waiting for RAM: 2.0 GB free, needs 3.6 GB (1.6 GB minimum + 2.0 GB held back for jobs that just started)`.
+  `calmrun doctor` warns when less RAM is free than `min_free_gb`.
 - **Disk.** The drive of its working directory has at least `min_free_disk_gb` free (default 5;
   `0` turns it off): `calmrun: waiting for disk space: 3.2 GB free on C:\, needs 5.0 GB`. When
   nothing else runs it starts anyway, with a warning.
@@ -216,7 +219,7 @@ A job starts when **all** of these hold:
   folder (or `CARGO_TARGET_DIR`); other build tools take one for their project folder, the
   nearest folder holding the marker file in the [build tools table](#build-tools) (two Gradle
   runs in one build share `build/`, two `dotnet` runs share `obj/`). Two jobs with the same key
-  never run together.
+  never run together, whatever queue they are in.
 - **Named resources.** `--needs db` also takes one slot of the resource `db`. Configure slots
   with `[resources] db = 1` or `CALMRUN_RESOURCES="db=1,gpu=2"`; a resource that is not
   configured has one slot. Use it for things that cannot be shared: one test database, one
@@ -236,10 +239,18 @@ waiting jobs to the front.
 
 ### Separate queues
 
-`--id QUEUE` uses its own queue with its own budget, like GNU `sem --id` (for example one queue
-per project, or one for long e2e runs). `status --id QUEUE` and `bump … --id QUEUE` act on it.
-The default queue and named queues do not see each other's points; history and config are
-shared. A queue id uses letters, digits, `-`, `_` and `.` (not first).
+`--id QUEUE` uses its own queue with its own budget and order, like GNU `sem --id` (for example
+one queue per project, or one for long e2e runs). `status --id QUEUE` and `bump … --id QUEUE`
+act on it. Queues do not share points, but the machine is one: exclusive keys and the RAM and
+disk gates see the jobs running in every queue (a key held elsewhere is named:
+`same dependency folder is in use by "npx vitest (queue kx)"`). History and config are shared.
+A queue id uses letters, digits, `-`, `_` and `.` (not first); a queue left empty for 7 days is
+removed.
+
+A queue decides with the settings (budget, `min_free_gb`, `pass_limit_min`) of the job that
+joined it while it was empty, so two agents with different `CALMRUN_BUDGET` never decide
+differently. A caller with other settings gets a note; `status` shows the queue's settings and
+warns about the difference. New settings apply once the queue is empty.
 
 ### Tickets: capped waits
 
@@ -248,13 +259,13 @@ shared. A queue id uses letters, digits, `-`, `_` and `.` (not first).
 resumes that place, the same arguments with `--ticket <id>` in front:
 
 ```
-calmrun: not started within 120s (waiting — 6 of 6 points in use, 2nd in line (needs 2)); your place in line is kept for 10 min.
+calmrun: not started within 120s (waiting - 6 of 6 points in use (needs 2), 2nd in line); your place in line is kept for 10 min.
 calmrun: next: calmrun --ticket 17 --wait-timeout 120 -- npx vitest run
 ```
 
 While the owner is away, the kept place does not block anyone; when the ticket comes back it
 rejoins at its old position. An expired or unknown ticket joins the end of the line. `status`
-shows places kept by a ticket.
+shows places kept by a ticket; `calmrun release --ticket <id>` gives one up.
 
 ### Leases: holding a resource without a command
 
@@ -351,7 +362,10 @@ calmrun release "$lease"
   Gradle or Kotlin daemon, a dev server started in the background) are left alone. When the run
   ends abnormally (Ctrl+C, or calmrun itself being killed) the whole tree is ended.
 - **History.** Each run appends one JSON line to `history.jsonl`: `at`, `label`, `kind`, `cost`,
-  `wait_ms`, `run_ms`, `status` (`ceiling` or `low-memory` for memory stops). The label is
+  `wait_ms`, `run_ms`, `status` (`ceiling` or `low-memory` for memory stops, `cancelled` for
+  Ctrl+C while waiting). A calmrun killed hard (`taskkill /F`, `kill -9`) is recorded by the next
+  calmrun that finds it gone: `killed` if its command was running, `abandoned` if it was still
+  waiting. Past 4 MB the file becomes `history.1.jsonl`; `stats` reads both. The label is
   `--label` or the tool and subcommand only (`npx vitest run`, `cargo build`), never the
   arguments, which may contain secrets.
 
@@ -366,6 +380,7 @@ calmrun bump <label-substring> [--id QUEUE]
 calmrun hold <resource>[,<resource>…] [--ttl SECS] [--label TEXT] [--for DIR] [--cost N] [--wait-timeout SECS] [--id QUEUE]
 calmrun hold --renew <lease> [--ttl SECS] [--id QUEUE]
 calmrun release <lease> [--id QUEUE]
+calmrun release --ticket <id> [--id QUEUE]
 calmrun doctor
 calmrun init [--force]
 calmrun guide
@@ -400,11 +415,11 @@ calmrun mcp
 
 | Command | What it does |
 | --- | --- |
-| `status [--json]` | Running and waiting jobs with the reason each one waits, the budget, free RAM, kept tickets and leases. `--json` (with `mem_bytes` per running job) for tools. |
-| `stats [--days N] [--json]` | Runs, failures, average and maximum wait, average run time per label and kind, over the last N days (default 7). |
+| `status [--json]` | Running and waiting jobs with the reason each one waits (`waits for: RAM: ...`; in JSON `why` and `why_code`: `budget`, `order`, `ram`, `disk`, `key`, `resource`, or `starting`), the queue's budget, free RAM, kept tickets and leases. `--json` (with `mem_bytes` per running job) for tools. |
+| `stats [--days N] [--json]` | Runs, failures, average and maximum wait, average run time per label and kind, and waits that gave up before starting, over the last N days (default 7). |
 | `bump <text>` | Move waiting jobs whose label contains the text (case-insensitive) to the front. |
 | `hold <resource>[,…]` | Wait for a slot of each resource, record a lease, print its id and exit; `--ttl`, `--label`, `--for`, `--cost`, `--wait-timeout`, `--renew <id>`. See [Leases](#leases-holding-a-resource-without-a-command). |
-| `release <lease>` | Give a lease back (exit 0 also when it is already gone). |
+| `release <lease>` | Give a lease back (exit 0 also when it is already gone). `release --ticket <id>` gives up a place kept by `--wait-timeout`. |
 | `doctor` | Cores, RAM, disk type, battery, the state directory and config file, the settings in effect and the suggested ones. |
 | `init [--force]` | Write a commented `config.toml` with this machine's defaults and print its path; `--force` overwrites. |
 | `guide` | Short instructions for coding agents, to paste into their context. |
@@ -412,8 +427,8 @@ calmrun mcp
 | `hook <agent>` | The PreToolUse hook of `claude`, `codex`, `antigravity` or `opencode`; reads the hook JSON on stdin. See [Coding agents](#coding-agents). |
 | `mcp` | An MCP server on stdin/stdout with `run_task`, `task_status`, `cancel_task`, `queue_status` and `bump`. |
 
-`--id QUEUE` is accepted by every subcommand (after the subcommand's name); it matters for
-running, `status`, `bump`, `hold` and `release`.
+`--id QUEUE` is accepted by every subcommand, before or after its name; it matters for running,
+`status`, `bump`, `hold` and `release`.
 
 ## Config
 
@@ -443,8 +458,8 @@ patterns = ["make", "bazel build"]
 
 | Key | Variable | Default | Meaning |
 | --- | --- | --- | --- |
-| `budget` | `CALMRUN_BUDGET` | cores − 2, capped at floor(RAM GB / 4), at least 2 | Points that may run at once |
-| `min_free_gb` | `CALMRUN_MIN_FREE_GB` | max(3, RAM / 8) | Free RAM needed to start while something runs; `0` = off |
+| `budget` | `CALMRUN_BUDGET` | cores − 2, capped at floor(RAM GB / 2.5), at least 2 | Points that may run at once |
+| `min_free_gb` | `CALMRUN_MIN_FREE_GB` | max(1.5, RAM / 10) | Free RAM needed to start while something runs; `0` = off |
 | `min_free_disk_gb` | `CALMRUN_MIN_FREE_DISK_GB` | 5 | Free space needed on the working directory's drive; `0` = off |
 | `pass_limit_min` | `CALMRUN_PASS_MIN` | 10 | Minutes a waiter may be passed; `0` = strict order |
 | `vitest_workers` | `CALMRUN_VITEST_WORKERS` | 1 (≤ 4 cores), 2 (< 12), else 3 | `--maxWorkers` for direct vitest calls |
@@ -477,8 +492,9 @@ a live job. A corrupt `state.json` is set aside; an unreadable one is an error.
 
 ## Coding agents
 
-calmrun has a PreToolUse hook for Claude Code, Codex, Antigravity and OpenCode. All four make
-the same decision; only the way each agent sends a tool call and reads the answer differs.
+calmrun has a PreToolUse hook for Claude Code, Codex, OpenCode and (experimental) Antigravity.
+All four make the same decision; only the way each agent sends a tool call and reads the answer
+differs.
 `calmrun setup --write --hook <agents>` installs them in each agent's user-level file (see
 [`calmrun setup`](#calmrun-setup)).
 
@@ -500,7 +516,10 @@ Light commands (`git`, `ls`, `cat`, `npm install`, …) are never blocked, hered
 example a commit message written with `<<'EOF'`) are not treated as commands, and any input the
 hook does not understand is allowed (no output, exit 0). Wrappers such as `VAR=1`, `time`,
 `nice` or `timeout 600` stay in front: `time npx vitest run` becomes
-`time calmrun -- npx vitest run`. Commands inside `if`/`then`/`do` blocks, PowerShell
+`time calmrun -- npx vitest run`. Commands run through rtk (a token-saving CLI proxy)
+are seen through and keep their rtk form: `rtk cargo test` becomes `calmrun -- rtk cargo test`
+(`rtk vitest`, `rtk tsc`, `rtk npm test`, `rtk test <command>` likewise; `rtk git` and other
+light subcommands stay light). Commands inside `if`/`then`/`do` blocks, PowerShell
 `if ($?) { … }` and `try { … }` blocks, `$( … )`, subshells and `bash -c "…"` or
 `pwsh -Command '…'` scripts are wrapped where they run. When `calmrun` is not on the agent's
 `PATH`, the suggestion uses calmrun's absolute path.
@@ -594,15 +613,28 @@ this to `~/.codex/hooks.json` (or `$CODEX_HOME/hooks.json`), next to any hooks a
 - Rewrite: Codex takes a changed command only with `permissionDecision: "allow"` and
   `updatedInput`. That answer may also count as approval of the wrapped command, so use
   rewrite mode only if that is fine for you.
-- The `workspace-write` sandbox blocks calmrun's state directory. Allow it in
-  `~/.codex/config.toml`, with the path `calmrun doctor` prints:
+- The `workspace-write` sandbox blocks calmrun's state directory. `calmrun setup --hook codex`
+  adds it to `~/.codex/config.toml` (only adding lines; the dry run shows them), or prints the
+  lines to add when the file's layout is one it does not edit:
 
   ```toml
   [sandbox_workspace_write]
-  writable_roots = ["C:/Users/you/AppData/Local/calmrun"]
+  writable_roots = ['C:\Users\you\AppData\Local\calmrun']
   ```
+- On Windows Codex runs commands in PowerShell, so a quoted calmrun path is called with `&`.
 
-### Antigravity
+### Antigravity (experimental)
+
+**Experimental.** The hook's deny and rewrite work, but Antigravity runs `run_command` in a
+terminal sandbox (a Windows AppContainer; on by default) that hides every other process and
+blocks calmrun's state folder, so the wrapped command cannot join the machine-wide queue
+there: calmrun refuses with a `next:` line rather than drop other agents' jobs it cannot see.
+`setup --hook all` leaves Antigravity out; name it (`--hook antigravity`) to install it. To use
+it, let calmrun run outside the sandbox, for example with an allow rule in
+`~/.gemini/antigravity-cli/settings.json` such as
+`"permissions": {"allow": ["command(regex:.*calmrun.*)"]}` (Antigravity's
+[sandbox docs](https://antigravity.google/docs/sandbox?tab=cli) say a `command` allow rule runs
+the command inside or outside the sandbox without prompting; not yet verified with calmrun).
 
 `calmrun hook antigravity` reads [Antigravity hook](https://antigravity.google/docs/hooks)
 input for the `run_command` tool (`toolCall.args.CommandLine`). `calmrun setup --write --hook
@@ -626,6 +658,7 @@ entries (for one project: `.agents/hooks.json`):
   `WaitMsBeforeAsync` goes on in the background instead of being stopped, so no
   `--wait-timeout` is added.
 - Rewrite: `{"decision": "allow", "overwrite": {"CommandLine": "…"}}`.
+- On Windows `run_command` runs PowerShell, so a quoted calmrun path is called with `&`.
 
 ### OpenCode
 
@@ -744,7 +777,8 @@ calmrun setup --write --remove --hook # take both out again
   or is not UTF-8 text is left alone (exit 1).
 - `--hook` installs hooks in user-level files: `claude` (the default) in `settings.json`,
   `codex` in `hooks.json`, `antigravity` in `~/.gemini/config/hooks.json`, `opencode` as a
-  plugin; `all` installs every one. Only calmrun's own entry is added, replaced or removed (a
+  plugin; `all` installs every one but the experimental Antigravity hook (`--remove --hook all`
+  removes it too). With `codex` it also lets Codex's sandbox write calmrun's state directory. Only calmrun's own entry is added, replaced or removed (a
   hook running `calmrun … hook <agent>`, Antigravity's `calmrun` entry, the plugin file with
   calmrun's marker), so hooks of other tools stay as they are. A file it cannot parse is left
   untouched. An agent whose folder does not exist gets no hook (an error when named, a note

@@ -3,7 +3,7 @@
 
 use crate::config::bytes_to_gb;
 use crate::scheduler::{self, Block};
-use crate::state::{Job, State};
+use crate::state::{Job, Settings, State};
 use crate::sys::DiskCheck;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -30,35 +30,68 @@ pub fn ordinal(n: usize) -> String {
 pub struct WaitContext<'a> {
     pub me: &'a Job,
     pub budget: u32,
-    pub disk: &'a DiskCheck,
+    /// The waiter's own drive check (only its owner has it; `status` does not).
+    pub disk: Option<&'a DiskCheck>,
     pub caps: &'a BTreeMap<String, u32>,
     pub now_ms: u64,
 }
 
-/// "calmrun: waiting — 4 of 6 points in use, 2nd in line (needs 2); running: …".
+/// "calmrun: waiting - 4 of 6 points in use (needs 2), 2nd in line; running: ...".
 pub fn waiting_line(s: &State, why: &Block, c: &WaitContext) -> String {
-    let line = waiting_reason(s, why, c);
+    let place = scheduler::waiting_in_order(&s.jobs)
+        .iter()
+        .position(|j| j.id == c.me.id)
+        .map_or(1, |p| p + 1);
+    let r = reason(s, why, c);
+    let line = match why {
+        Block::Ram { .. } | Block::Disk => format!("calmrun: waiting for {r}"),
+        Block::Resource(_) => format!("calmrun: waiting for {r}, {} in line", ordinal(place)),
+        _ => format!("calmrun: waiting - {r}, {} in line", ordinal(place)),
+    };
     match running_summary(s, c.now_ms) {
         r if r.is_empty() => line,
         r => format!("{line}; running: {r}"),
     }
 }
 
-fn waiting_reason(s: &State, why: &Block, c: &WaitContext) -> String {
-    let place = scheduler::waiting_in_order(&s.jobs)
-        .iter()
-        .position(|j| j.id == c.me.id)
-        .map_or(1, |p| p + 1);
-    let running = || s.jobs.iter().filter(|j| j.running());
+/// A short code for why a job waits (`status --json`, MCP `queue_status`).
+pub fn reason_code(why: &Block) -> &'static str {
     match why {
-        Block::Ram { free, needs } => format!(
-            "calmrun: waiting for RAM: {:.1} GB free, needs {:.1} GB",
-            bytes_to_gb(*free),
-            bytes_to_gb(*needs)
-        ),
+        Block::Points { .. } => "budget",
+        Block::Order => "order",
+        Block::Ram { .. } => "ram",
+        Block::Disk => "disk",
+        Block::Key { .. } => "key",
+        Block::Resource(_) => "resource",
+    }
+}
+
+/// Why a job waits, in words: "RAM: 2.0 GB free, needs 3.8 GB (...)".
+pub fn reason(s: &State, why: &Block, c: &WaitContext) -> String {
+    match why {
+        Block::Ram {
+            free,
+            reserved,
+            needs,
+        } => {
+            let gb = |b: u64| format!("{:.1} GB", bytes_to_gb(b));
+            if *reserved == 0 {
+                format!("RAM: {} free, needs {}", gb(*free), gb(*needs))
+            } else {
+                format!(
+                    "RAM: {} free, needs {} ({} minimum + {} held back for jobs that just started)",
+                    gb(*free),
+                    gb(needs + reserved),
+                    gb(*needs),
+                    gb(*reserved)
+                )
+            }
+        }
         Block::Resource(name) => {
-            let holders: Vec<String> = running()
-                .filter(|j| j.needs.contains(name))
+            let holders: Vec<String> = s
+                .jobs
+                .iter()
+                .filter(|j| j.running() && j.needs.contains(name))
                 .map(|j| j.label.clone())
                 .chain(
                     s.leases
@@ -68,36 +101,54 @@ fn waiting_reason(s: &State, why: &Block, c: &WaitContext) -> String {
                 )
                 .collect();
             format!(
-                "calmrun: waiting for resource \"{name}\" ({} of {} slot(s) held by {}), {} in line",
+                "resource \"{name}\" ({} of {} slot(s) held by {})",
                 holders.len(),
                 scheduler::capacity(c.caps, name),
-                holders.join(", "),
-                ordinal(place)
+                holders.join(", ")
             )
         }
-        Block::Disk => format!(
-            "calmrun: waiting for disk space: {:.1} GB free on {}, needs {:.1} GB",
-            bytes_to_gb(c.disk.free),
-            c.disk.mount,
-            bytes_to_gb(c.disk.need)
-        ),
-        Block::Key => {
-            let holder = running()
-                .find(|j| j.keys.iter().any(|k| c.me.keys.contains(k)))
-                .map_or("", |j| j.label.as_str());
-            format!(
-                "calmrun: waiting — same dependency folder is in use by \"{holder}\", {} in line",
-                ordinal(place)
-            )
-        }
-        Block::Points { .. } | Block::Order => format!(
-            "calmrun: waiting — {} of {} points in use, {} in line (needs {})",
+        Block::Disk => match c.disk {
+            Some(d) => format!(
+                "disk space: {:.1} GB free on {}, needs {:.1} GB",
+                bytes_to_gb(d.free),
+                d.mount,
+                bytes_to_gb(d.need)
+            ),
+            None => "disk space: its folder's drive is short of free space".to_string(),
+        },
+        Block::Key { holder } => format!("same dependency folder is in use by \"{holder}\""),
+        Block::Points { .. } => format!(
+            "{} of {} points in use (needs {})",
             scheduler::used_points(&s.jobs, c.budget) + scheduler::leased_points(&s.leases, c.budget),
             c.budget,
-            ordinal(place),
+            scheduler::job_points(c.me, c.budget)
+        ),
+        Block::Order => format!(
+            "{} of {} points in use (needs {}); behind a job that has waited past the pass limit",
+            scheduler::used_points(&s.jobs, c.budget) + scheduler::leased_points(&s.leases, c.budget),
+            c.budget,
             scheduler::job_points(c.me, c.budget)
         ),
     }
+}
+
+/// The note when a queue decides with settings other than this process's own.
+pub fn settings_mismatch(queue: &Settings, mine: &Settings) -> String {
+    let show = |s: &Settings| {
+        format!(
+            "budget {}, min free RAM {:.1} GB, pass limit {} min",
+            s.budget,
+            bytes_to_gb(s.min_free_bytes),
+            s.pass_limit_ms / 60_000
+        )
+    };
+    format!(
+        "calmrun: note: this queue decides with {} (set by pid {} when it was empty); yours ({}) \
+         apply once the queue is empty",
+        show(queue),
+        queue.pid,
+        show(mine)
+    )
 }
 
 /// "npx vitest in web (3m10s), cargo build in api (1m02s)".
@@ -179,7 +230,7 @@ pub fn stuck_warnings(state: &State, now: u64, stuck_ms: u64) -> Vec<String> {
         .filter(|j| now.saturating_sub(j.queued_ms) > stuck_ms)
         .map(|j| {
             format!(
-                "\"{}\" (pid {}) has waited {} — is something stuck? Check the running jobs \
+                "\"{}\" (pid {}) has waited {}: is something stuck? Check the running jobs \
                  with `calmrun status`, or move it forward with `calmrun bump {}`",
                 j.label,
                 j.pid,
@@ -208,6 +259,7 @@ mod tests {
     fn running_summary_names_jobs_and_folders() {
         let s = State {
             ram_sample: None,
+            settings: None,
             leases: Vec::new(),
             next_id: 9,
             jobs: vec![
@@ -265,7 +317,7 @@ mod tests {
         let c = WaitContext {
             me: &me,
             budget: 2,
-            disk: &disk,
+            disk: Some(&disk),
             caps: &caps,
             now_ms: 1_000,
         };
@@ -298,6 +350,7 @@ mod tests {
         };
         let s = State {
             ram_sample: None,
+            settings: None,
             leases: Vec::new(),
             next_id: 2,
             jobs: vec![job(1, "npx vitest", "/w/web", 0), me.clone()],
@@ -307,7 +360,7 @@ mod tests {
         let c = WaitContext {
             me: &me,
             budget: 2,
-            disk: &disk,
+            disk: Some(&disk),
             caps: &caps,
             now_ms: 1_000,
         };
@@ -323,7 +376,84 @@ mod tests {
         };
         assert_eq!(
             waiting_line(&s0, &Block::Points { used: 2, needs: 2 }, &c),
-            "calmrun: waiting — 2 of 2 points in use, 1st in line (needs 2); running: npx vitest in web (1.0s)"
+            "calmrun: waiting - 2 of 2 points in use (needs 2), 1st in line; running: npx vitest in web (1.0s)"
         );
+    }
+
+    #[test]
+    fn ram_line_shows_free_ram_and_what_is_held_back() {
+        const GB: u64 = 1 << 30;
+        let me = Job::default();
+        let s = State::default();
+        let caps = BTreeMap::new();
+        let c = WaitContext {
+            me: &me,
+            budget: 2,
+            disk: None,
+            caps: &caps,
+            now_ms: 0,
+        };
+        let ram = |reserved| Block::Ram {
+            free: 2 * GB,
+            reserved,
+            needs: 3 * GB,
+        };
+        assert_eq!(
+            waiting_line(&s, &ram(GB * 4 / 5), &c),
+            "calmrun: waiting for RAM: 2.0 GB free, needs 3.8 GB (3.0 GB minimum + 0.8 GB held back \
+             for jobs that just started)"
+        );
+        assert_eq!(reason(&s, &ram(0), &c), "RAM: 2.0 GB free, needs 3.0 GB");
+        assert_eq!(reason_code(&ram(0)), "ram");
+        let key = Block::Key {
+            holder: "npx vitest (queue kx)".into(),
+        };
+        assert_eq!(
+            reason(&s, &key, &c),
+            "same dependency folder is in use by \"npx vitest (queue kx)\""
+        );
+    }
+
+    #[test]
+    fn messages_are_ascii() {
+        // Windows PowerShell 5.1 garbles anything else in pipes and files.
+        let me = Job::default();
+        let s = State::default();
+        let caps = BTreeMap::new();
+        let c = WaitContext {
+            me: &me,
+            budget: 2,
+            disk: None,
+            caps: &caps,
+            now_ms: 0,
+        };
+        let blocks = [
+            Block::Points { used: 2, needs: 1 },
+            Block::Order,
+            Block::Disk,
+            Block::Key { holder: "x".into() },
+            Block::Resource("db".into()),
+            Block::Ram {
+                free: 1,
+                reserved: 1,
+                needs: 1,
+            },
+        ];
+        let mut lines: Vec<String> = blocks.iter().map(|b| waiting_line(&s, b, &c)).collect();
+        lines.push(settings_mismatch(&Settings::default(), &Settings::default()));
+        lines.push(STARTS_BY_ITSELF.to_string());
+        let waiter = Job {
+            queued_ms: 0,
+            label: "x".into(),
+            ..Job::default()
+        };
+        let old = State {
+            jobs: vec![waiter],
+            ..State::default()
+        };
+        lines.extend(stuck_warnings(&old, 3_600_000, 1));
+        for l in lines {
+            assert!(l.is_ascii(), "{l}");
+        }
     }
 }
