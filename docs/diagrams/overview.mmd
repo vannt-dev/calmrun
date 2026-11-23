@@ -12,7 +12,7 @@ flowchart TD
   queue["Machine-wide queue<br/>one state file under an OS lock<br/>prio high first, then first come"]
   gates["Starts when all gates hold<br/>budget points free<br/>enough free RAM and disk<br/>its exclusive key is free<br/>a named resource slot is free"]
   ticket["--wait-timeout passed:<br/>exit 75, place kept<br/>as a ticket"]
-  run["Runs at low CPU priority<br/>process-tree memory ceiling,<br/>stopped with exit 137"]
+  run["Runs at low CPU priority<br/>process-tree memory ceiling:<br/>above it, stopped with exit 137"]
   done["Its exit code passed back<br/>history for calmrun stats"]
 
   src -- "calmrun -- cmd" --> entry

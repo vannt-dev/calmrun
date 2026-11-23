@@ -415,7 +415,7 @@ calmrun: waiting — 4 of 6 points in use, 2nd in line (needs 2); running: npx v
           <div class="card">
             <h3 data-i18n="how.5.h">No endless commands</h3>
             <p data-i18n="how.5">
-              Watch modes (<code>vitest</code>, <code>tsc -w</code>, <code>gradle -t</code>, <code>dotnet watch</code>, …) and attached
+              Watch modes (<code>vitest watch</code>, <code>tsc -w</code>, <code>gradle -t</code>, <code>dotnet watch</code>, …) and attached
               <code>docker compose up</code> would hold points forever, so calmrun refuses them and prints the one-shot command to run
               instead. Dev servers and app runs start at once, outside the queue.
             </p>
@@ -465,7 +465,7 @@ calmrun: waiting — 4 of 6 points in use, 2nd in line (needs 2); running: npx v
               <tr><th data-i18n="eco.c1">Ecosystem</th><th data-i18n="eco.c2">Tools</th><th data-i18n="eco.c3">Key</th><th data-i18n="eco.c4">Worker hint</th></tr>
             </thead>
             <tbody>
-              <tr><th>JavaScript · TypeScript</th><td><code>vitest</code>, <code>jest</code>, <code>tsc</code>, <code>eslint</code>, <code>vite build</code>, <code>webpack</code>, <code>npm test</code>, <code>deno test</code></td><td><code>node_modules</code></td><td><code>--maxWorkers</code> (vitest), <code>DENO_JOBS</code></td></tr>
+              <tr><th>JavaScript · TypeScript</th><td><code>vitest</code>, <code>jest</code>, <code>tsc</code>, <code>eslint</code>, <code>vite build</code>, <code>webpack</code>, <code>npm test</code>, <code>deno test</code></td><td><code>node_modules</code> (vitest, jest, builds)</td><td><code>--maxWorkers</code> (vitest), <code>DENO_JOBS</code></td></tr>
               <tr><th>Python</th><td><code>pytest</code>, <code>mypy</code>, <code>pyright</code>, <code>ruff</code>, <code>tox</code>, <code>nox</code></td><td><code>tox.ini</code> (tox)</td><td><code>pytest -n auto</code>, <code>tox -p auto</code> → N</td></tr>
               <tr><th>Rust</th><td><code>cargo build/check/clippy/test</code>, <code>nextest</code>, <code>maturin</code></td><td><code>target</code></td><td><code>CARGO_BUILD_JOBS</code>, <code>NEXTEST_TEST_THREADS</code></td></tr>
               <tr><th>Go</th><td><code>go build/test/vet</code>, <code>golangci-lint</code></td><td>–</td><td><code>-p N</code>, <code>--concurrency N</code></td></tr>
@@ -478,7 +478,7 @@ calmrun: waiting — 4 of 6 points in use, 2nd in line (needs 2); running: npx v
               <tr><th>PHP</th><td><code>phpunit</code>, <code>pest</code>, <code>paratest</code>, <code>composer test</code>, <code>artisan test</code>, <code>phpstan</code></td><td>–</td><td><code>--processes=N</code> (paratest)</td></tr>
               <tr><th>Elixir · Erlang</th><td><code>mix test/compile</code>, <code>rebar3</code></td><td><code>mix.exs</code>, <code>rebar.config</code></td><td><code>--max-cases N</code> (mix test)</td></tr>
               <tr><th>Haskell · OCaml · Zig</th><td><code>stack</code>, <code>cabal</code>, <code>dune</code>, <code>zig build</code></td><td><code>stack.yaml</code>, <code>cabal.project</code>, <code>dune-project</code>, <code>build.zig</code></td><td><code>-j N</code></td></tr>
-              <tr><th data-i18n="eco.mono">Monorepo runners</th><td><code>turbo</code>, <code>nx</code>, <code>lerna</code>, <code>pnpm -r</code>, <code>rush</code>, <code>moon</code></td><td><code>node_modules</code></td><td data-i18n="eco.mono.hint">their concurrency flag; turbo, nx and pnpm never above their own default</td></tr>
+              <tr><th data-i18n="eco.mono">Monorepo runners</th><td><code>turbo</code>, <code>nx</code>, <code>lerna</code>, <code>pnpm -r</code>, <code>rush</code>, <code>moon</code></td><td><code>node_modules</code></td><td data-i18n="eco.mono.hint">their concurrency flag or variable; turbo, nx and pnpm never above their own default</td></tr>
               <tr><th data-i18n="eco.ctr">Containers</th><td><code>docker</code> / <code>podman</code> <code>compose</code>, <code>build</code>; <code>buildah</code>, <code>packer</code></td><td>–</td><td>–</td></tr>
             </tbody>
           </table>
@@ -771,7 +771,7 @@ patterns = ["make", "bazel build"]</pre>
             'Lệnh chạy dưới mức ưu tiên thường (<code>nice +10</code> trên Unix), nên trình soạn thảo vẫn mượt. Việc nào có cây tiến trình dùng quá <code>ceiling_gb</code> sẽ bị dừng với mã thoát 137.',
           'how.5.h': 'Không nhận lệnh chạy mãi',
           'how.5':
-            'Chế độ watch (<code>vitest</code>, <code>tsc -w</code>, <code>gradle -t</code>, <code>dotnet watch</code>, …) và <code>docker compose up</code> không có <code>-d</code> sẽ giữ điểm mãi mãi, nên calmrun từ chối và in ra lệnh chạy một lần để dùng thay. Dev server và lệnh chạy ứng dụng thì bắt đầu ngay, không qua hàng chờ.',
+            'Chế độ watch (<code>vitest watch</code>, <code>tsc -w</code>, <code>gradle -t</code>, <code>dotnet watch</code>, …) và <code>docker compose up</code> không có <code>-d</code> sẽ giữ điểm mãi mãi, nên calmrun từ chối và in ra lệnh chạy một lần để dùng thay. Dev server và lệnh chạy ứng dụng thì bắt đầu ngay, không qua hàng chờ.',
           'how.6.h': 'Vé chờ, tài nguyên, hàng riêng',
           'how.6':
             '<code>--wait-timeout</code> thôi chờ sau một khoảng thời gian (mã thoát 75) và giữ chỗ trong hàng 10 phút dưới dạng một vé. <code>--needs db</code> giữ một tài nguyên có tên; <code>--id</code> dùng một hàng chờ riêng.',
@@ -791,7 +791,7 @@ patterns = ["make", "bazel build"]</pre>
           'eco.c3': 'Khóa',
           'eco.c4': 'Gợi ý số worker',
           'eco.mono': 'Công cụ chạy monorepo',
-          'eco.mono.hint': 'cờ song song của từng công cụ; turbo, nx và pnpm không bao giờ vượt mức mặc định của chính chúng',
+          'eco.mono.hint': 'cờ hoặc biến song song của từng công cụ; turbo, nx và pnpm không bao giờ vượt mức mặc định của chính chúng',
           'eco.ctr': 'Container',
           'ag.h2': 'Tích hợp với agent',
           'ag.sub':
