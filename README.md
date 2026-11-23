@@ -133,17 +133,21 @@ above the budget counts as the whole budget.
 | `vitest` | `vitest` | 2 |
 | `jest` | `jest` | 2 |
 | `tsc` | `tsc`, `vue-tsc`, `tsgo`, `npm run typecheck` | 2 |
-| `build` | `vite/next/ng build`, `webpack`, `rollup`, `esbuild`, `gradle(w)`, `mvn`, `cargo build/check/clippy`, `flutter build`, `dotnet build`, `go build`, `npm run build` | 2 |
+| `build` | `vite/next/ng build`, `webpack`, `rollup`, `esbuild`, `npm run build`, and the build tools in the [table below](#build-tools) | 2 (1 for one compiler call: `gcc`, `clang`, `cl`, …) |
+| `monorepo` | `turbo run`, `nx run-many/affected`, `lerna run`, `pnpm -r`, `rush build`, `moon run` | 3 |
 | `capture` | `playwright`, `puppeteer`, `cypress` | 2 |
-| `docker` | `docker compose up/build/run`, `docker-compose …`, `docker build/run` | 2 |
+| `docker` | `docker/podman compose up/build/run`, `docker-compose`, `podman-compose`, `docker/podman build/run`, `buildah build`, `packer build` | 2 |
+| `typecheck` | `mypy`, `pyright`, `deno check`, `phpstan`, `psalm` | 2 |
 | `eslint` | `eslint`, `oxlint`, `biome`, `npm run lint` | 1 |
+| `lint` | `ruff`, `pylint`, `flake8`, `go vet`, `golangci-lint run`, `rubocop` | 1 |
 | `pytest` | `pytest`, `python -m pytest` | 1 |
-| `test` | `cargo test`, `go test`, `flutter test`, `dotnet test`, `npm test` | 1 |
+| `test` | `npm test`, `mocha`, `tox`, `nox`, and the test runners in the [table below](#build-tools) | 1 |
 | `other` | anything else | 1 |
 
 Detection looks at the command position only: the program name (basename, without
 `.cmd/.bat/.exe/.ps1/.js`) after `VAR=value` prefixes and launchers such as `npx`, `pnpx`,
-`bunx`, `pnpm exec`, `yarn exec`, `npm exec`, `uv run`, `python -m`. So
+`bunx`, `pnpm exec`, `yarn exec`, `npm exec`, `uv run`, `python -m`, `bundle exec`,
+`dotnet tool run`, `xcrun`. So
 `git commit -m "fix vitest"` is not a vitest run. `--kind` overrides detection.
 
 **Starting.** A job starts when its cost fits in the free points **and** free RAM is at least
@@ -170,10 +174,69 @@ points; history and config are shared.
 fits right now and no job ahead of it has waited longer than `pass_limit_min` (default 10;
 0 = strict order). Running jobs are never stopped.
 
-**Same folder, one at a time.** vitest, jest and build jobs take an exclusive key for their
-nearest `node_modules` folder; Cargo builds and tests take one for their `target` folder (or
-`CARGO_TARGET_DIR`). Two jobs with the same key never run together. Points and keys are taken
-all-or-nothing.
+**Same folder, one at a time.** vitest, jest and JavaScript build jobs take an exclusive key
+for their nearest `node_modules` folder; Cargo builds and tests take one for their `target`
+folder (or `CARGO_TARGET_DIR`); other build tools take one for their project folder, the
+nearest folder holding the marker file in the table below (two Gradle runs in one build share
+`build/`, two `dotnet` runs share `obj/`). Two jobs with the same key never run together.
+Points and keys are taken all-or-nothing.
+
+<a id="build-tools"></a>**Build tools.** What calmrun knows per tool. *Key* is the marker file
+of the project folder; *Hint* is the worker count it passes, N being the job's share of the
+machine (logical cores × cost ÷ budget, at least 1); in brackets, what makes it leave the
+count alone because you already chose one.
+
+| Tools | Kind | Key | Hint |
+| --- | --- | --- | --- |
+| `make`, `gmake`, `mingw32-make`, `nmake` | build | `Makefile` | none (serial unless you pass `-j`) |
+| `cmake --build` | build | `CMakeCache.txt`, `CMakeLists.txt` | `--parallel N` (`-j`, `--parallel`, `CMAKE_BUILD_PARALLEL_LEVEL`) |
+| `ctest` | test | as cmake | none (serial unless you pass `-j`) |
+| `ninja` | build | `build.ninja` | `-jN` (`-j`) |
+| `meson compile` / `meson test` | build / test | `meson.build` | `-j N` / `--num-processes N` (`MESON_TESTTHREADS`) |
+| `bazel`, `bazelisk` `build` / `test`, `coverage` | build / test | `MODULE.bazel`, `WORKSPACE` | `--jobs=N` (`--jobs`, `-j`) |
+| `buck2`, `buck` `build` / `test` | build / test | `.buckconfig` | `-jN` (`-j`, `--num-threads`) |
+| `scons`, `xmake` | build | `SConstruct`, `xmake.lua` | none, `-j N` for xmake |
+| `gcc`, `g++`, `clang`, `clang++`, `cl`, `cc` | build, cost 1 | none | none |
+| `gradle`, `gradlew` | test for `test*`/`check*`/`connected*` tasks (`connected*` also takes the `emulator` resource), else build | `settings.gradle(.kts)` | `--max-workers=N` (`--max-workers`, `-Dorg.gradle.workers.max`) |
+| `mvn`, `mvnw` / `mvnd` | test for `test`/`verify`, else build | `pom.xml` | none / `-T N` for mvnd (`-T`) |
+| `sbt`, `ant` | test for `sbt test`/`testOnly`, else build | `build.sbt`, `build.xml` | none |
+| `dotnet build`, `publish`, `pack`, `msbuild`, `restore` / `dotnet test` | build / test | `*.sln`, `*.slnx`, `*.csproj`, `*.fsproj`, … | `-m:N` (`-m`, `-maxcpucount`) |
+| `msbuild` | build | as dotnet | none (serial unless you pass `-m`) |
+| `go build`, `install` / `test` / `vet` | build / test / lint | none | `-p N` after the subcommand (`-p`, `GOFLAGS=-p…`) |
+| `golangci-lint run` | lint | none | `--concurrency N` (`--concurrency`, `-j`) |
+| `cargo build`, `check`, `clippy`, `doc` / `test`, `bench`, `nextest` | build / test | `target` folder | `CARGO_BUILD_JOBS=N`, also `NEXTEST_TEST_THREADS=N` for nextest |
+| `maturin build`, `develop` | build | `target` folder | `CARGO_BUILD_JOBS=N` |
+| `swift build` / `test` | build / test | `Package.swift` | `-j N` (`-j`, `--jobs`) |
+| `xcodebuild` (also through `xcrun`) | test for test actions, else build | `*.xcworkspace`, `*.xcodeproj` | `-jobs N` (`-jobs`) |
+| `flutter build` | build | `pubspec.yaml` | none |
+| `flutter test`, `dart test` | test | `pubspec.yaml` | `--concurrency=N` (`--concurrency`, `-j`) |
+| `dart compile`, `dart run build_runner` | build | `pubspec.yaml` | none |
+| `rspec`, `cucumber`, `rake test`, `rake spec` | test | none | none |
+| `rails test` | test | none | `PARALLEL_WORKERS=N` |
+| `parallel_rspec`, `parallel_test` | test | none | `PARALLEL_TEST_PROCESSORS=N` |
+| `phpunit`, `pest`, `composer test`, `php artisan test` | test | none | none |
+| `paratest` | test | none | `--processes=N` (`-p`, `--processes`) |
+| `mix test` / `mix compile`, `release` | test / build | `mix.exs` | `--max-cases N` (`--max-cases`) / none |
+| `rebar3 eunit`, `ct` / `compile`, `release` | test / build | `rebar.config` | none |
+| `stack build`, `install`, `test` | build / test | `stack.yaml` | `-j N` (`-j`, `--jobs`) |
+| `cabal build`, `install`, `test` | build / test | `cabal.project`, `*.cabal` | `-jN` (`-j`, `--jobs`) |
+| `dune build` / `test` | build / test | `dune-project` | `-j N` (`-j`) |
+| `zig build` | build | `build.zig` | `-jN` (`-j`) |
+| `turbo run` | monorepo | `node_modules` | `--concurrency=N` (`--concurrency`) |
+| `nx run-many`, `nx affected` | monorepo | `node_modules` | `--parallel=N` (`--parallel`) |
+| `lerna run`, `exec` | monorepo | `node_modules` | `--concurrency N` (`--concurrency`) |
+| `pnpm -r` | monorepo | `node_modules` | `--workspace-concurrency=N` (`--workspace-concurrency`) |
+| `rush build`, `rebuild`, `test` | monorepo | `node_modules` | `--parallelism N` (`-p`, `--parallelism`) |
+| `moon run`, `ci`, `check` | monorepo | `node_modules` | `MOON_CONCURRENCY=N` |
+| `pytest -n auto`, `tox -p auto` | pytest / test | none, `tox.ini` | `auto` becomes N |
+| `deno test`, `bench` | test | none | `DENO_JOBS=N` |
+| `docker`, `podman`, `buildah`, `packer` builds | docker | none | none |
+
+A variable in the Hint column is set only when it is not set already. `calmrun doctor`
+prints the numbers for this machine. Skipped on purpose: tools that run one job at a time
+unless asked (make, ctest, scons, plain Maven, msbuild without `-m`), because turning
+parallelism on can break a build that was never written for it; pass the flag yourself
+(`make -j8`) and calmrun leaves it alone.
 
 **Command rules.**
 
@@ -183,20 +246,33 @@ all-or-nothing.
   - `tsc --watch` / `-w`, `jest --watch` / `--watchAll` → without the flag;
   - `vitest watch` / `vitest dev`, and plain `vitest` when stdin is a terminal (it watches
     then) → `vitest run`;
-  - `docker run -it` / `-i` / `-t` (interactive containers) → run it outside calmrun.
-- Dev servers (`vite`, `next dev`, `ng serve`, `npm run dev|start|serve|preview`, …) and
-  commands that only print help or a version (`--help`, `-h`, `--version`, `-V`) run at once,
-  outside the queue.
+  - `gradle --continuous` / `-t`, `webpack|rollup|esbuild|mocha --watch`, `vite build --watch`,
+    `deno|bun --watch`, `stack --file-watch`, `dune -w`, `zig build --watch` → without the flag;
+  - `dotnet watch <cmd>` → `dotnet <cmd>`; `turbo watch` → `turbo run`; `mix test.watch` →
+    `mix test`; `parcel watch` → `parcel build`;
+  - `docker run -it` / `-i` / `-t` (interactive containers), bare `sbt` and `sbt shell|console`,
+    `sbt ~task`, `cargo watch`, `nx watch`, `lerna watch`, `dart run build_runner watch|serve`,
+    and watchers (`ibazel`, `nodemon`, `watchexec`, `ptw`, `bacon`, `air`, `guard`) → run it
+    outside calmrun.
+- Dev servers and app runs (`vite`, `next dev`, `ng serve`, `npm run dev|start|serve|preview`,
+  `parcel <entry>`, `turbo run dev`, `nx serve`, `make dev|run|serve|start|watch`, `cargo run`,
+  `go run`, `dotnet run`, `flutter run`, `swift run`, `zig build run`, `bazel run`, `sbt run`,
+  `gradle bootRun`, `mvn spring-boot:run`, `rails server`, `mix phx.server`,
+  `php artisan serve`, `symfony serve`, …), installs and infrastructure commands
+  (`pod install`, `composer install`, `terraform plan|apply`, `pulumi up`) and commands that
+  only print help, a version or project information (`--help`, `-h`, `--version`, `-V`,
+  `xcodebuild -list`) run at once, outside the queue, with their arguments unchanged. The
+  Claude Code hook leaves them alone.
 - vitest started directly as separate words (`vitest …`, `npx|pnpx|bunx vitest …`,
   `pnpm|yarn exec vitest …`) gets `--maxWorkers=N` appended unless it already passes
   `--maxWorkers`, `--pool` or `--no-file-parallelism`. N is `vitest_workers` (default 1 for
   up to 4 cores, 2 below 12, else 3). `npm run …` scripts and shell strings are never changed.
-- gradle / gradlew started directly as words gets `--max-workers=N` unless it already sets
-  `--max-workers` or `-Dorg.gradle.workers.max`.
+- Other build tools get the worker hint in the [build tools table](#build-tools). An argument
+  is added only when the tool is started directly as words (also after `VAR=value`, `npx`,
+  `bundle exec`, `xcrun`, …), never to `npm run` scripts or shell strings.
 - Cargo commands get `CARGO_BUILD_JOBS=N` unless it is already set. If a cargo config
   (`.cargo/config.toml` up from the working directory, then `$CARGO_HOME/config.toml`) sets a
   lower `build.jobs`, that lower number is used.
-- For both, N is the job's share of the machine: logical cores × cost ÷ budget (at least 1).
 
 **Nesting.** calmrun sets `CALMRUN_HELD=<pid>` for the command. A calmrun started inside it
 (for example a script that calls calmrun again) runs at once instead of queuing behind its own
@@ -418,7 +494,7 @@ agent's instruction file:
 
 This machine is shared by several agents. Run heavy commands through the calmrun queue:
 `calmrun -- <command>` (tests, type checks, linters, builds, Playwright, docker compose,
-pytest, cargo/gradle builds). Example: `calmrun -- npx vitest run`.
+pytest, cargo/gradle/make/dotnet/go builds). Example: `calmrun -- npx vitest run`.
 Run anything that may take more than a minute or two in the background and check on it later.
 Use `calmrun status` to see what is running or waiting. Do not wrap light commands
 (git, ls, cat, package installs).

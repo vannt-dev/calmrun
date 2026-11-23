@@ -47,6 +47,21 @@ pub fn report(
         bytes_to_gb(cfg.critical_free_bytes)
     );
     s += &format!("  low cpu         = {}\n", if cfg.low_cpu { "on" } else { "off" });
+    s += &format!(
+        "\nWorkers calmrun passes to each tool (unless you set them; at the tool's default cost, budget {}):\n",
+        cfg.budget
+    );
+    let workers = |w: crate::kinds::Workers, cost: u32| match w {
+        crate::kinds::Workers::Vitest => cfg.vitest_workers,
+        crate::kinds::Workers::CoreShare => crate::queue::tool_workers(
+            m.logical_cores,
+            crate::scheduler::effective_cost(cost, cfg.budget),
+            cfg.budget,
+        ),
+    };
+    for line in crate::kinds::hint_summary(&workers, &cfg.kinds) {
+        s += &format!("  {line}\n");
+    }
     s += "\nSuggested for this machine:\n";
     s += &format!("  budget = {}\n", config::default_budget(m));
     s += &format!("  min_free_gb = {:.1}\n", config::default_min_free_gb(m));

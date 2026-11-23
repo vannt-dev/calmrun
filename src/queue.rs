@@ -349,8 +349,10 @@ fn prepare(ctx: &Ctx, mut req: Request) -> std::result::Result<Prepared, Box<Out
     }
     let det = detect::detect(&req.argv, &cfg.kinds);
     let kind = req.kind.clone().unwrap_or_else(|| det.kind_name().to_string());
+    let rule = crate::kinds::find_rule(&det.tool, &det.rest);
     let cost = scheduler::effective_cost(
-        req.cost.unwrap_or_else(|| crate::kinds::cost(&kind, &cfg.kinds)),
+        req.cost
+            .unwrap_or_else(|| crate::kinds::job_cost(&kind, rule, &cfg.kinds)),
         cfg.budget,
     );
     let label = match req.label.as_deref().map(str::trim) {
@@ -367,13 +369,17 @@ fn prepare(ctx: &Ctx, mut req: Request) -> std::result::Result<Prepared, Box<Out
         .clone()
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
-    let hints = detect::apply_hints(&req.argv, &det.tool, &cwd, &workers, &|v| {
-        std::env::var_os(v).is_some()
-    });
-    if let Some(a) = hints.argv {
+    let hints = detect::apply_hints(&req.argv, &det, &cwd, &workers, &|v| std::env::var(v).ok());
+    // A dev server or app run keeps its arguments (`turbo run dev` refuses a concurrency
+    // below its number of persistent tasks); environment hints still apply.
+    if let Some(a) = hints.argv.filter(|_| light.is_none()) {
         req.argv = a;
     }
     req.env.extend(hints.env);
+    // Resources the tool itself needs (an Android device test needs the emulator).
+    if let Some(r) = rule.filter(|r| r.kind == kind) {
+        req.needs.extend(r.needs.iter().map(|n| n.to_string()));
+    }
     req.needs = normalized(&req.needs);
     Ok(Prepared {
         req,
@@ -468,7 +474,7 @@ fn enqueue(ctx: &mut Ctx, store: &Store, p: &Prepared, notify: &mut dyn Notify) 
         label: p.label.clone(),
         kind: p.kind.clone(),
         cost: p.cost,
-        keys: detect::exclusive_keys(&p.kind, &p.det.tool, &p.cwd),
+        keys: detect::exclusive_keys(&p.kind, &p.det.tool, &p.det.rest, &p.cwd),
         cwd: p.cwd.to_string_lossy().to_string(),
         high: p.req.high,
         queued_ms: now_ms(),

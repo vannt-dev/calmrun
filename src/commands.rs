@@ -14,7 +14,7 @@ pub const GUIDE: &str = "\
 calmrun: a machine-wide queue for heavy commands. Several agents share this computer.
 
 Wrap heavy commands (tests, type checks, linters, builds, Playwright, docker compose,
-pytest, cargo/gradle builds):
+pytest, cargo/gradle/make/dotnet/go builds):
     calmrun -- npx vitest run
     calmrun -- cargo test
     calmrun \"npm ci && npm test\"     (one quoted string runs in the shell)

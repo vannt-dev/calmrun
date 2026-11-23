@@ -66,9 +66,13 @@ rule(&["bazel"], When::Sub(&["build", "test"]), "build"),
 scripts, and "no subcommand or one of these". A command that never ends belongs in `ENDLESS`
 (refused, with a `Fix` to its one-shot form); a dev server belongs in `LIGHT` (runs at once,
 outside the queue). A brand-new kind also needs one entry in `KINDS` (name, default cost, exclusive-key
-rule). The test `every_rule_names_a_known_kind` checks this. To size the tool's workers,
-set `hint`. A `Hint::Arg` appends a flag when the tool is started directly as words; a
-`Hint::Env` sets a variable. Nothing outside `kinds.rs` matches on tool names.
+rule). The test `every_rule_names_a_known_kind` checks this. A rule can also set `key` (the
+folder it must not share, e.g. `KeyRule::Project` with marker files), `cost` and `needs`. To
+size the tool's workers, set `hints`: a `Hint::Arg` adds a flag when the tool is started
+directly as words, a `Hint::Env` sets a variable, a `Hint::Replace` turns `-n auto` into a
+number; each names what makes it stand back (`opt_out`, `opt_out_env`). Give a hint only to a
+tool that already uses every core: turning parallelism on can break a build. Nothing outside
+`kinds.rs` matches on tool names.
 
 ### Add a gate (a new start condition)
 

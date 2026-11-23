@@ -7,7 +7,7 @@
 //! `updatedInput` replaces the whole tool input. Printing nothing leaves the call alone.
 
 use crate::config::KindConfig;
-use crate::detect::{detect_words, parse, tool_name};
+use crate::detect::{detect_words, disposition, parse, tool_name, Disposition};
 use crate::shell::split_segments;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -64,6 +64,10 @@ pub fn wrap_with(
         }
         let d = detect_words(&words, kinds);
         let Some(kind) = d.kind else { continue };
+        // Dev servers, app runs and help output run outside the queue anyway.
+        if matches!(disposition(&words, false), Disposition::Light(_)) {
+            continue;
+        }
         let Some(p) = parse(&words) else { continue };
         // Keep leading `VAR=value` assignments in front of calmrun (they reach the child).
         let insert_at = spans.get(p.start).map_or(0, |w| w.start);
@@ -203,6 +207,55 @@ mod tests {
         let (w, _) = wrap_command("nice -n 5 cargo build", &BTreeMap::new()).unwrap();
         assert_eq!(w, "nice -n 5 calmrun -- cargo build");
         assert!(wrap_command("time calmrun -- npx vitest", &BTreeMap::new()).is_none());
+    }
+
+    #[test]
+    fn every_ecosystem_uses_the_same_table() {
+        for c in [
+            "./gradlew assembleDebug",
+            "cmake --build build",
+            "go test ./...",
+            "make -j8",
+            "dotnet test",
+            "bundle exec rspec",
+            "mvn -q package",
+            "xcodebuild -scheme App test",
+            "turbo run build",
+            "buck2 build //...",
+            "bazel test //...",
+            "meson test -C build",
+            "swift test",
+            "flutter test",
+            "dart run build_runner build",
+            "mix test",
+            "stack build",
+            "cabal test",
+            "composer test",
+            "php artisan test",
+            "nx run-many -t build",
+            "moon run :build",
+            "podman build .",
+        ] {
+            assert!(run("Bash", c, Mode::Deny).is_some(), "{c}");
+        }
+        for c in [
+            "terraform plan",
+            "pod install",
+            "cargo run",
+            "go mod tidy",
+            "composer install",
+            // Dev servers and app runs go outside the queue, so the hook leaves them alone.
+            "./gradlew bootRun",
+            "mvn spring-boot:run",
+            "turbo run dev",
+            "pnpm -r dev",
+            "make dev",
+            "sbt run",
+            "xcodebuild -list",
+            "cargo build --help",
+        ] {
+            assert!(run("Bash", c, Mode::Deny).is_none(), "{c}");
+        }
     }
 
     #[test]
