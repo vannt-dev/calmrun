@@ -17,7 +17,7 @@ pub const BLOCK_BODY: &str = "## Heavy commands (calmrun)
 
 This computer is shared by several agents. Run heavy commands through the calmrun queue so
 they take turns instead of freezing the machine: tests, type checks, linters, builds,
-Playwright, docker compose, pytest, cargo/gradle builds.
+Playwright, docker compose, pytest, cargo/gradle/make/dotnet/go builds.
 
 - Wrap them: `calmrun -- npx vitest run`, `calmrun -- cargo test`.
 - Run anything that may take more than a minute or two in the background and check back.

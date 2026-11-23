@@ -32,7 +32,7 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 
 const INSTRUCTIONS: &str = "Use run_task for heavy commands (tests, type checks, linters, builds, \
-Playwright, docker compose, pytest, cargo/gradle builds) so they wait their turn in the \
+Playwright, docker compose, pytest, cargo/gradle/make/dotnet/go builds) so they wait their turn in the \
 machine-wide queue instead of overloading the computer. Use queue_status to see what is running.";
 
 type Out = Arc<Mutex<io::Stdout>>;
@@ -114,7 +114,7 @@ fn run_task_schema() -> Value {
         "name": "run_task",
         "title": "Run a heavy command through the calmrun queue",
         "description": "Run a heavy command (tests, type checks, linters, builds, Playwright, docker \
-            compose, pytest, cargo/gradle builds) through the machine-wide calmrun queue, so parallel \
+            compose, pytest, cargo/gradle/make/dotnet/go builds) through the machine-wide calmrun queue, so parallel \
             agents do not overload this computer. Waits for its turn, runs the command at low \
             priority, and returns the exit code, wait and run time, the last 200 lines of output and \
             the path of the full log. The command runs in the platform shell (sh on macOS/Linux, cmd \

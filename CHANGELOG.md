@@ -4,6 +4,42 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Detection for builds and tests across ecosystems: C/C++ (make, cmake --build, ctest, ninja,
+  meson, bazel, buck2, scons, xmake, compilers), JVM (gradle, maven, mvnd, sbt, ant), .NET
+  (dotnet, msbuild), Go, Swift and xcodebuild, Flutter/Dart (incl. build_runner), Ruby,
+  PHP (incl. composer test, artisan test), Elixir/Erlang, Haskell, OCaml, Zig, monorepo
+  runners (turbo, nx, lerna, pnpm -r, rush, moon) and containers (podman, buildah).
+- New kinds `monorepo` (cost 3), `typecheck` and `lint`; a single compiler call costs 1.
+- Exclusive keys per project folder for these tools (Gradle settings root, `pom.xml`, `*.sln`,
+  `Package.swift`, `pubspec.yaml`, …), so two builds of one project never share its output.
+- Worker hints sized to the job's share of the cores for tools that use every core by default:
+  `cmake --build --parallel`, `ninja -j`, `meson`, `bazel --jobs`, `buck2 -j`, `dotnet -m`,
+  `go -p`, `golangci-lint --concurrency`, `swift -j`, `xcodebuild -jobs`, `flutter/dart test
+  --concurrency`, `paratest --processes`, `mix test --max-cases`, `stack`/`cabal`/`dune`/`zig
+  -j`, `mvnd -T`, monorepo runner concurrency, `PARALLEL_WORKERS`, `PARALLEL_TEST_PROCESSORS`,
+  `MOON_CONCURRENCY`, `DENO_JOBS`, `NEXTEST_TEST_THREADS`, and `pytest -n auto` / `tox -p auto`
+  turned into a number. nx, turbo and pnpm are never raised above their own defaults. A flag
+  or variable you set yourself always wins. `calmrun doctor` lists them.
+- Gradle `connected*` tasks also take the `emulator` resource.
+- More watch modes refused with their one-shot form (`gradle --continuous`, `dotnet watch`,
+  `turbo watch`, `mix test.watch`, `parcel watch`, `sbt ~`, `cargo watch`, …), and more dev
+  servers and app runs started outside the queue (`turbo run dev`, `nx serve`, `make dev`,
+  `bootRun`, `spring-boot:run`, `rails server`, `zig build run`, …).
+- Launchers `bundle exec`, `dotnet tool run` and `xcrun` are seen through.
+
+### Changed
+
+- Dev servers and other commands that run outside the queue keep their arguments unchanged,
+  and the Claude Code hook no longer wraps them.
+- The Claude Code hook follows the runner's command rules: a watch mode gets its one-shot form
+  (`npx vitest` → `calmrun -- npx vitest run`, `docker compose up` → `… up -d`), and one
+  without such a form (`sbt shell`, `cargo watch`) is left alone instead of being sent to a
+  calmrun that refuses it.
+
 ## [0.1.0] - 2026-11-23
 
 ### Added
