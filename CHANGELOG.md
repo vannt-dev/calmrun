@@ -22,8 +22,8 @@ All notable changes to this project are documented here. The format follows
   --concurrency`, `paratest --processes`, `mix test --max-cases`, `stack`/`cabal`/`dune`/`zig
   -j`, `mvnd -T`, monorepo runner concurrency, `PARALLEL_WORKERS`, `PARALLEL_TEST_PROCESSORS`,
   `MOON_CONCURRENCY`, `DENO_JOBS`, `NEXTEST_TEST_THREADS`, and `pytest -n auto` / `tox -p auto`
-  turned into a number. A flag or variable you set yourself always wins. `calmrun doctor`
-  lists them.
+  turned into a number. nx, turbo and pnpm are never raised above their own defaults. A flag
+  or variable you set yourself always wins. `calmrun doctor` lists them.
 - Gradle `connected*` tasks also take the `emulator` resource.
 - More watch modes refused with their one-shot form (`gradle --continuous`, `dotnet watch`,
   `turbo watch`, `mix test.watch`, `parcel watch`, `sbt ~`, `cargo watch`, …), and more dev

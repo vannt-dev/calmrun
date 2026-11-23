@@ -174,10 +174,10 @@ makes it leave the count alone because you already chose one.
 | `cabal build`, `install`, `test` | build / test | `cabal.project`, `*.cabal` | `-jN` (`-j`, `--jobs`) |
 | `dune build` / `test` | build / test | `dune-project` | `-j N` (`-j`) |
 | `zig build` | build | `build.zig` | `-jN` (`-j`) |
-| `turbo run` | monorepo | `node_modules` | `--concurrency=N` (`--concurrency`) |
-| `nx run-many`, `nx affected` | monorepo | `node_modules` | `--parallel=N` (`--parallel`) |
+| `turbo run` | monorepo | `node_modules` | `--concurrency=N`, at most 10, turbo's default (`--concurrency`) |
+| `nx run-many`, `nx affected` | monorepo | `node_modules` | `--parallel=N`, at most 3, nx's default (`--parallel`) |
 | `lerna run`, `exec` | monorepo | `node_modules` | `--concurrency N` (`--concurrency`) |
-| `pnpm -r` | monorepo | `node_modules` | `--workspace-concurrency=N` (`--workspace-concurrency`) |
+| `pnpm -r` (not `install`, `add`, `update`, …) | monorepo | `node_modules` | `--workspace-concurrency=N`, at most 4, pnpm's default (`--workspace-concurrency`) |
 | `rush build`, `rebuild`, `test` | monorepo | `node_modules` | `--parallelism N` (`-p`, `--parallelism`) |
 | `moon run`, `ci`, `check` | monorepo | `node_modules` | `MOON_CONCURRENCY=N` |
 | `pytest -n auto`, `tox -p auto` | pytest / test | none, `tox.ini` | `auto` becomes N |

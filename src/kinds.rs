@@ -106,6 +106,16 @@ pub struct ArgHint {
     pub min_args: usize,
     pub at: Position,
     pub workers: Workers,
+    /// Never more than this: the tool's own default when it is a small fixed number
+    /// (`nx --parallel` is 3), so the hint caps and never raises it.
+    pub max: Option<u32>,
+}
+
+impl ArgHint {
+    /// The count to pass for a share of `n` workers.
+    pub fn count(&self, n: u32) -> u32 {
+        self.max.map_or(n, |m| n.min(m))
+    }
 }
 
 /// A change calmrun makes so a tool does not take the whole machine. An explicit choice by
@@ -184,6 +194,21 @@ const fn arg(flag: &'static str, style: Style, opt_out: &'static [&'static str])
         min_args: 0,
         at: Position::End,
         workers: Workers::CoreShare,
+        max: None,
+    })
+}
+
+/// A `--flag=N` hint capped at the tool's own default.
+const fn capped(flag: &'static str, opt_out: &'static [&'static str], max: u32) -> Hint {
+    Hint::Arg(ArgHint {
+        flag,
+        style: Style::Joined,
+        opt_out,
+        opt_out_env: &[],
+        min_args: 0,
+        at: Position::End,
+        workers: Workers::CoreShare,
+        max: Some(max),
     })
 }
 
@@ -275,6 +300,7 @@ const VITEST_HINT: Hint = Hint::Arg(ArgHint {
     min_args: 0,
     at: Position::End,
     workers: Workers::Vitest,
+    max: None,
 });
 const GRADLE_HINT: Hint = Hint::Arg(ArgHint {
     flag: "--max-workers=",
@@ -284,6 +310,7 @@ const GRADLE_HINT: Hint = Hint::Arg(ArgHint {
     min_args: 1,
     at: Position::End,
     workers: Workers::CoreShare,
+    max: None,
 });
 const CARGO_HINT: Hint = Hint::Env {
     var: "CARGO_BUILD_JOBS",
@@ -304,6 +331,7 @@ const CMAKE_HINT: Hint = Hint::Arg(ArgHint {
     min_args: 0,
     at: Position::End,
     workers: Workers::CoreShare,
+    max: None,
 });
 const MESON_HINT: Hint = arg("-j", Style::Split, &["-j", "--jobs"]);
 const MESON_TEST_HINT: Hint = Hint::Arg(ArgHint {
@@ -314,6 +342,7 @@ const MESON_TEST_HINT: Hint = Hint::Arg(ArgHint {
     min_args: 0,
     at: Position::End,
     workers: Workers::CoreShare,
+    max: None,
 });
 const MSBUILD_HINT: Hint = arg(
     "-m:",
@@ -333,6 +362,7 @@ const GO_HINT: Hint = Hint::Arg(ArgHint {
     min_args: 0,
     at: Position::AfterSub,
     workers: Workers::CoreShare,
+    max: None,
 });
 const GOLANGCI_HINT: Hint = arg("--concurrency", Style::Split, &["--concurrency", "-j"]);
 const SWIFT_HINT: Hint = arg("-j", Style::Split, &["-j", "--jobs"]);
@@ -360,8 +390,8 @@ const DENO_HINT: Hint = Hint::Env {
     workers: Workers::CoreShare,
     user_limit: None,
 };
-const TURBO_HINT: Hint = arg("--concurrency=", Style::Joined, &["--concurrency"]);
-const NX_HINT: Hint = arg("--parallel=", Style::Joined, &["--parallel"]);
+const TURBO_HINT: Hint = capped("--concurrency=", &["--concurrency"], 10);
+const NX_HINT: Hint = capped("--parallel=", &["--parallel"], 3);
 const MOON_HINT: Hint = Hint::Env {
     var: "MOON_CONCURRENCY",
     workers: Workers::CoreShare,
@@ -376,6 +406,8 @@ const PNPM_RECURSIVE_HINT: Hint = Hint::Arg(ArgHint {
     min_args: 0,
     at: Position::AfterTool,
     workers: Workers::CoreShare,
+    // pnpm's own default.
+    max: Some(4),
 });
 const RUSH_HINT: Hint = arg("--parallelism", Style::Split, &["-p", "--parallelism"]);
 const PYTEST_XDIST_HINT: Hint = Hint::Replace {
@@ -1054,6 +1086,31 @@ pub const LIGHT: &[Rule] = &[
     rule(&["uvicorn", "gunicorn", "hypercorn"], When::Always, "dev server"),
     rule(&["flask"], When::Sub(&["run"]), "dev server"),
     rule(&["pod"], When::Sub(&["install", "update"]), "install"),
+    // `pnpm -r install` and friends: package management, not a build.
+    rule(
+        &["pnpm"],
+        When::Sub(&[
+            "install",
+            "i",
+            "add",
+            "update",
+            "up",
+            "remove",
+            "rm",
+            "uninstall",
+            "list",
+            "ls",
+            "outdated",
+            "publish",
+            "why",
+            "link",
+            "unlink",
+            "prune",
+            "dedupe",
+            "audit",
+        ]),
+        "install",
+    ),
     rule(
         &["composer"],
         When::Sub(&["install", "update", "require"]),
@@ -1349,8 +1406,8 @@ pub fn hint_summary(
             .iter()
             .map(|h| match h {
                 Hint::Arg(a) => match a.style {
-                    Style::Joined => format!("{}{}", a.flag, workers(a.workers, n_cost)),
-                    Style::Split => format!("{} {}", a.flag, workers(a.workers, n_cost)),
+                    Style::Joined => format!("{}{}", a.flag, a.count(workers(a.workers, n_cost))),
+                    Style::Split => format!("{} {}", a.flag, a.count(workers(a.workers, n_cost))),
                 },
                 Hint::Env { var, workers: w, .. } => format!("{var}={}", workers(*w, n_cost)),
                 Hint::Replace {
@@ -1611,6 +1668,9 @@ mod tests {
         ("mix", "phx.server"),
         ("pod", "install"),
         ("composer", "install"),
+        ("pnpm", "-r install"),
+        ("pnpm", "install -r"),
+        ("pnpm", "--recursive update"),
         ("terraform", "apply"),
         ("pulumi", "up"),
         ("python", "manage.py runserver"),
@@ -1756,6 +1816,12 @@ mod tests {
         assert!(
             lines.iter().any(|l| l.contains("--concurrency=9")),
             "monorepo cost 3: {lines:?}"
+        );
+        // Tools with a small default are capped at it, never raised.
+        assert!(lines.iter().any(|l| l.contains("--parallel=3")), "nx: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("--workspace-concurrency=4")),
+            "pnpm: {lines:?}"
         );
     }
 }

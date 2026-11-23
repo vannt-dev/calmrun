@@ -246,6 +246,8 @@ mod tests {
             "composer install",
             // Dev servers and app runs go outside the queue, so the hook leaves them alone.
             "./gradlew bootRun",
+            "pnpm -r install",
+            "pnpm install --recursive",
             "mvn spring-boot:run",
             "turbo run dev",
             "pnpm -r dev",

@@ -368,7 +368,7 @@ pub fn apply_hints(
     for hint in kinds::hints_for(&det.tool, &det.rest) {
         match hint {
             Hint::Arg(a) => {
-                if let Some(changed) = arg_hint(&words, &det.tool, &a, workers(a.workers), env_get) {
+                if let Some(changed) = arg_hint(&words, &det.tool, &a, a.count(workers(a.workers)), env_get) {
                     words = changed;
                     out.argv = Some(words.clone());
                 }
@@ -892,7 +892,7 @@ mod tests {
         ("zig build", "zig build -j4"),
         ("turbo run build", "turbo run build --concurrency=4"),
         ("npx turbo run test", "npx turbo run test --concurrency=4"),
-        ("nx run-many -t test", "nx run-many -t test --parallel=4"),
+        ("nx run-many -t test", "nx run-many -t test --parallel=3"),
         ("lerna run test", "lerna run test --concurrency 4"),
         ("pnpm -r run build", "pnpm --workspace-concurrency=4 -r run build"),
         ("rush build", "rush build --parallelism 4"),
