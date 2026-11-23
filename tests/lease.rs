@@ -130,9 +130,9 @@ fn a_lease_is_held_listed_renewed_and_released() {
 fn an_expired_lease_frees_its_slot() {
     let home = tempfile::tempdir().unwrap();
     let h = home.path();
-    hold(h, &["emulator", "--ttl", "1"]);
+    hold(h, &["emulator", "--ttl", "3"]);
     assert_eq!(leases(h, None).len(), 1);
-    std::thread::sleep(Duration::from_millis(1_300));
+    std::thread::sleep(Duration::from_millis(3_300));
     // Any calmrun that reads the state drops it.
     assert!(leases(h, None).is_empty());
     let t0 = Instant::now();
@@ -175,7 +175,7 @@ fn a_hold_waits_for_a_running_job_that_has_the_resource() {
     let home = tempfile::tempdir().unwrap();
     let h = home.path();
     let mut runner = calmrun(h)
-        .args(["--needs", "emulator", "--", EXE, "__probe", "--sleep-ms", "1500"])
+        .args(["--needs", "emulator", "--", EXE, "__probe", "--sleep-ms", "4000"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -188,7 +188,7 @@ fn a_hold_waits_for_a_running_job_that_has_the_resource() {
     let t0 = Instant::now();
     hold(h, &["emulator"]);
     assert!(
-        t0.elapsed() >= Duration::from_millis(500),
+        t0.elapsed() >= Duration::from_millis(1_000),
         "granted while the job held it"
     );
     assert!(runner.wait().unwrap().success());
@@ -237,4 +237,74 @@ fn resource_names_must_be_plain_names() {
     assert_eq!(job(h, &["--needs", "bad name!"], 10), 2);
     assert_eq!(job(h, &["--needs", "db.main,gpu-1"], 10), 0);
     assert!(leases(h, None).is_empty());
+}
+
+/// A queued probe job run in `dir` with extra environment; returns its exit code.
+fn job_in(home: &Path, flags: &[&str], dir: &Path, env: &[(&str, &str)]) -> i32 {
+    let mut c = calmrun(home);
+    c.args(flags)
+        .args(["--", EXE, "__probe", "--sleep-ms", "10"])
+        .current_dir(dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    c.status().unwrap().code().unwrap_or(-1)
+}
+
+#[test]
+fn a_lease_never_blocks_its_own_folder_or_named_jobs() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    let slot = h.join("app-2");
+    let sub = slot.join("android");
+    let other = h.join("app-20");
+    for d in [&sub, &other] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let slot_arg = slot.to_string_lossy().to_string();
+    let id = hold(h, &["emulator", "--label", "app-2:claim", "--for", &slot_arg]);
+    let l = &leases(h, None)[0];
+    assert!(l["for"].as_str().unwrap().ends_with("app-2"), "{l}");
+    let text = stdout(&run(h, &["status"]));
+    assert!(text.contains(&slot_arg) || text.contains("app-2"), "{text}");
+
+    let needs = ["--needs", "emulator", "--wait-timeout", "2"];
+    // Inside the owning folder (or below it): runs at once, without a second slot.
+    assert_eq!(job_in(h, &needs, &slot, &[]), 0);
+    assert_eq!(job_in(h, &needs, &sub, &[]), 0);
+    // A sibling folder with the same prefix, and any other folder, still wait.
+    assert_eq!(job_in(h, &needs, &other, &[]), 75);
+    // CALMRUN_LEASE names the lease from anywhere; another id does not.
+    assert_eq!(job_in(h, &needs, &other, &[("CALMRUN_LEASE", &id)]), 0);
+    assert_eq!(job_in(h, &needs, &other, &[("CALMRUN_LEASE", "000000")]), 75);
+    // A second hold in the folder is not covered: it takes a slot of its own.
+    let o = calmrun(h)
+        .args(["hold", "emulator", "--wait-timeout", "0"])
+        .current_dir(&slot)
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(75), "{}", stderr(&o));
+    // --for must be a folder.
+    assert_eq!(
+        run(h, &["hold", "db", "--for", "no/such/dir"]).status.code(),
+        Some(2)
+    );
+}
+
+#[test]
+fn hold_with_wait_timeout_zero_tries_once() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    // Free: granted at once.
+    let id = hold(h, &["emulator", "--wait-timeout", "0"]);
+    // Taken: 75 at once, nothing left in the line.
+    let t0 = Instant::now();
+    let o = run(h, &["hold", "emulator", "--wait-timeout", "0"]);
+    assert_eq!(o.status.code(), Some(75), "{}", stderr(&o));
+    assert!(stdout(&o).is_empty());
+    assert!(t0.elapsed() < Duration::from_secs(5));
+    assert!(status(h, None)["waiting"].as_array().unwrap().is_empty());
+    run(h, &["release", &id]);
 }

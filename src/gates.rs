@@ -3,8 +3,8 @@
 //! reasons users see. Adding a gate = one type implementing [`Gate`] plus one line in
 //! [`standard`]; the scheduler loop does not change.
 
-use crate::scheduler::{job_points, Block, Inputs};
-use crate::state::Job;
+use crate::scheduler::{job_points, uses_lease, Block, Inputs};
+use crate::state::{Job, Lease};
 use std::collections::{HashMap, HashSet};
 
 /// One start condition. `'a` is the lifetime of the job snapshot the scheduler works on.
@@ -52,23 +52,31 @@ impl<'a> Gate<'a> for Keys<'a> {
     }
 }
 
-/// Named resources (`--needs db`) with a number of slots each.
+/// Named resources (`--needs db`) with a number of slots each. A job may use a lease's slot
+/// instead (its folder owns the lease, or it names it): such a need neither waits nor takes one.
 struct Resources<'a> {
     held: HashMap<&'a str, u32>,
     caps: &'a std::collections::BTreeMap<String, u32>,
+    leases: &'a [Lease],
+}
+
+impl<'a> Resources<'a> {
+    fn own_needs(&self, w: &'a Job) -> impl Iterator<Item = &'a String> + '_ {
+        w.needs.iter().filter(move |n| !uses_lease(w, n, self.leases))
+    }
 }
 
 impl<'a> Gate<'a> for Resources<'a> {
     fn blocks(&self, w: &'a Job, _: bool) -> Option<Block> {
-        w.needs
-            .iter()
+        self.own_needs(w)
             .find(|n| {
                 self.held.get(n.as_str()).copied().unwrap_or(0) >= crate::scheduler::capacity(self.caps, n)
             })
             .map(|n| Block::Resource(n.clone()))
     }
     fn admit(&mut self, w: &'a Job) {
-        for n in &w.needs {
+        let own: Vec<&'a String> = self.own_needs(w).collect();
+        for n in own {
             *self.held.entry(n.as_str()).or_default() += 1;
         }
     }
@@ -115,6 +123,7 @@ pub fn standard<'a>(jobs: &'a [Job], inputs: &Inputs<'a>) -> Vec<Box<dyn Gate<'a
     let mut resources = Resources {
         held: HashMap::new(),
         caps: inputs.caps,
+        leases: inputs.leases,
     };
     for j in running() {
         keys.admit(j);

@@ -18,7 +18,9 @@ All notable changes to this project are documented here. The format follows
   device or emulator claims): it waits like `--needs`, prints a lease id and exits. Leases
   lapse after `--ttl` (default 4 h), take no points unless `--cost` is given, and are extended
   with `hold --renew <id>`. `calmrun release <id>` gives them back. `status` and MCP
-  `queue_status` list them.
+  `queue_status` list them. `--wait-timeout 0` tries once.
+- A lease does not block its holder: `hold --for <dir>` lets jobs in that folder use the leased
+  resources, and `CALMRUN_LEASE=<id>[,…]` does the same for a job anywhere.
 
 ### Changed
 

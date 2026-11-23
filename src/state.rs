@@ -47,6 +47,12 @@ pub struct Job {
     /// once admitted it turns into a [`Lease`] in the same locked step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_ttl_ms: Option<u64>,
+    /// The job's folder as a path key, matched against a lease's owning folder.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cwd_key: String,
+    /// Leases whose resources this job may use (`CALMRUN_LEASE`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub use_leases: Vec<String>,
 }
 
 impl Job {
@@ -87,6 +93,13 @@ pub struct Lease {
     pub until_ms: u64,
     /// The time to live it was granted with (the default for `--renew`).
     pub ttl_ms: u64,
+    /// The folder that owns the lease (`hold --for`), as given: jobs inside it use the
+    /// leased resources instead of waiting for them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_dir: Option<String>,
+    /// That folder as a path key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_key: Option<String>,
 }
 
 /// The contents of `state.json`.
@@ -296,6 +309,8 @@ mod tests {
             disk_short: false,
             needs: Vec::new(),
             hold_ttl_ms: None,
+            cwd_key: String::new(),
+            use_leases: Vec::new(),
         }
     }
 

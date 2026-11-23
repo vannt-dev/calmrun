@@ -70,6 +70,30 @@ pub fn leased_points(leases: &[Lease], budget: u32) -> u32 {
     leases.iter().map(|l| l.cost.min(budget.max(1))).sum()
 }
 
+/// Whether the path key `key` is the folder `dir` or inside it.
+pub fn inside(key: &str, dir: &str) -> bool {
+    if key.is_empty() || dir.is_empty() {
+        return false;
+    }
+    match key.strip_prefix(dir) {
+        Some("") => true,
+        Some(rest) => dir.ends_with(['/', '\\']) || rest.starts_with(['/', '\\']),
+        None => false,
+    }
+}
+
+/// Whether job `w` may use a lease's slot of resource `n` instead of waiting for one: it runs
+/// in the lease's folder (`hold --for`) or names the lease in `CALMRUN_LEASE`. A hold never
+/// does: it always takes slots of its own.
+pub fn uses_lease(w: &Job, n: &str, leases: &[Lease]) -> bool {
+    !w.is_hold()
+        && leases.iter().any(|l| {
+            l.resources.iter().any(|r| r == n)
+                && (w.use_leases.contains(&l.id)
+                    || l.for_key.as_deref().is_some_and(|d| inside(&w.cwd_key, d)))
+        })
+}
+
 /// Slots of each named resource held by leases.
 pub fn leased_slots(leases: &[Lease]) -> HashMap<&str, u32> {
     let mut held = HashMap::new();
@@ -145,8 +169,8 @@ impl Plan {
 
 /// Walk the waiters in order; admit each that passes every gate, taking its share of each.
 /// A later waiter may pass a blocked one only while no blocked waiter ahead of it has waited
-/// longer than the pass limit. A waiter blocked only because leases hold every slot of a
-/// resource never stops others from passing: a lease may last hours.
+/// longer than the pass limit. A waiter that needs a resource whose every slot is leased
+/// never stops others from passing: a lease may last hours.
 pub fn schedule(jobs: &[Job], inputs: &Inputs) -> Plan {
     schedule_with(jobs, inputs, crate::gates::standard(jobs, inputs))
 }
@@ -161,9 +185,13 @@ pub fn schedule_with<'a>(
     let mut plan = Plan::default();
     let mut barrier = false;
     let leased = leased_slots(inputs.leases);
-    let held_by_leases = |r: &Block| match r {
-        Block::Resource(n) => leased.get(n.as_str()).copied().unwrap_or(0) >= capacity(inputs.caps, n),
-        _ => false,
+    // A waiter that needs a resource whose every slot is leased may wait hours, whatever
+    // gate reports first; it never holds the others back.
+    let leased_out = |w: &Job| {
+        w.needs.iter().any(|n| {
+            !uses_lease(w, n, inputs.leases)
+                && leased.get(n.as_str()).copied().unwrap_or(0) >= capacity(inputs.caps, n)
+        })
     };
     for w in waiting_in_order(jobs) {
         let reason = if barrier {
@@ -180,7 +208,7 @@ pub fn schedule_with<'a>(
             Some(r) => {
                 let waited = inputs.now_ms.saturating_sub(w.queued_ms);
                 let limit = inputs.limits.pass_limit_ms;
-                barrier |= !held_by_leases(&r) && (limit == 0 || waited > limit);
+                barrier |= !leased_out(w) && (limit == 0 || waited > limit);
                 plan.blocked.push((w.id, r));
             }
         }
@@ -268,6 +296,8 @@ mod tests {
             disk_short: false,
             needs: Vec::new(),
             hold_ttl_ms: None,
+            cwd_key: String::new(),
+            use_leases: Vec::new(),
         }
     }
     fn keyed(mut j: Job, k: &str) -> Job {
@@ -521,6 +551,11 @@ mod tests {
             };
             assert_eq!(plan_leased(&jobs, now, 16 * GB, lim, &caps, &leases).0, vec![2]);
         }
+        // Short of points as well (reported first): still no barrier.
+        let mut a = needing(job(1, 2, false), "emulator");
+        a.queued_ms = 0;
+        let jobs = vec![job(9, 3, true), a, job(2, 1, false)];
+        assert_eq!(plan_leased(&jobs, now, 16 * GB, LIM, &caps, &leases).0, vec![2]);
         // A running job holding the slot still keeps strict order.
         let jobs = vec![
             needing(job(1, 1, true), "db"),
@@ -528,6 +563,45 @@ mod tests {
             job(3, 1, false),
         ];
         assert!(plan_leased(&jobs, now, 16 * GB, LIM, &caps, &leases).0.is_empty());
+    }
+
+    #[test]
+    fn a_lease_lets_its_own_jobs_use_its_resources() {
+        let caps = BTreeMap::new();
+        let mut owned = lease("abc123", &["emulator"], 0);
+        owned.for_key = Some("/w/app-2".into());
+        let leases = [owned];
+        let at = |id: u64, key: &str| {
+            let mut j = needing(job(id, 1, false), "emulator");
+            j.cwd_key = key.into();
+            j
+        };
+        // In the folder (or below it): no wait, and no second slot taken, so two such jobs
+        // start together. Elsewhere, or a sibling folder with the same prefix: it waits.
+        let jobs = vec![
+            at(1, "/w/app-2"),
+            at(2, "/w/app-2/sub"),
+            at(3, "/w/app-20"),
+            at(4, "/w"),
+        ];
+        assert_eq!(
+            plan_leased(&jobs, 2_000, 16 * GB, LIM, &caps, &leases).0,
+            vec![1, 2]
+        );
+        // Named in CALMRUN_LEASE: from anywhere.
+        let mut named = at(5, "/elsewhere");
+        named.use_leases = vec!["abc123".into()];
+        assert_eq!(
+            plan_leased(&[named], 2_000, 16 * GB, LIM, &caps, &leases).0,
+            vec![5]
+        );
+        // A hold in the folder takes a slot of its own.
+        let mut h = at(6, "/w/app-2");
+        h.hold_ttl_ms = Some(1);
+        assert!(plan_leased(&[h], 2_000, 16 * GB, LIM, &caps, &leases)
+            .0
+            .is_empty());
+        assert!(inside("c:\\w\\a", "c:\\w") && inside("/x", "/") && !inside("", "/"));
     }
 
     #[test]

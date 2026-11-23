@@ -160,18 +160,19 @@ fn print_jobs(state: &State, now: u64) {
     if !state.leases.is_empty() {
         println!("leases ({}):", state.leases.len());
         println!(
-            "  {:<6}  {:<16} {:<24} {:>7}  {:>10}",
+            "  {:<6}  {:<16} {:<24} {:>7}  {:>10}  for",
             "lease", "resources", "label", "age", "expires in"
         );
     }
     for l in &state.leases {
         println!(
-            "  {:<6}  {:<16} {:<24} {:>7}  {:>10}",
+            "  {:<6}  {:<16} {:<24} {:>7}  {:>10}  {}",
             l.id,
             l.resources.join(","),
             l.label,
             history::human_ms(now.saturating_sub(l.granted_ms)),
-            history::human_ms(l.until_ms.saturating_sub(now))
+            history::human_ms(l.until_ms.saturating_sub(now)),
+            l.for_dir.as_deref().unwrap_or("-")
         );
     }
     let kept: Vec<&Job> = state.jobs.iter().filter(|j| j.parked()).collect();
@@ -208,13 +209,19 @@ pub fn hold(mut ctx: Ctx, a: &HoldArgs) -> i32 {
             Err(e) => fail(&e),
         };
     }
+    if let Some(d) = a.for_dir.as_ref().filter(|d| !d.is_dir()) {
+        eprintln!("calmrun: --for {}: not a folder", d.display());
+        return 2;
+    }
     runner::install_signal_handler();
     let req = queue::HoldRequest {
         resources: a.resources.clone(),
         ttl: ttl.unwrap_or(lease::DEFAULT_TTL),
         label: a.label.clone(),
         cost: a.cost,
-        wait_timeout: a.wait_timeout.filter(|t| *t > 0.0).map(Duration::from_secs_f64),
+        // 0 (or less) tries once.
+        wait_timeout: a.wait_timeout.map(|t| Duration::from_secs_f64(t.clamp(0.0, 1e9))),
+        for_dir: a.for_dir.clone(),
     };
     let (what, for_ms) = (req.resources.join(","), req.ttl.as_millis() as u64);
     match queue::hold(&mut ctx, req, &mut queue::StderrNotify::default()) {

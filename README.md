@@ -263,8 +263,8 @@ short commands against it. `calmrun hold` takes slots of named resources without
 anything, and gives them back with `calmrun release`:
 
 ```sh
-lease=$(calmrun hold emulator --label "lane web-2")   # waits like --needs, prints the id
-# … use the emulator …
+lease=$(calmrun hold emulator --label "web-2" --for ~/work/web-2)   # waits like --needs, prints the id
+calmrun -- ./gradlew connectedAndroidTest   # in ~/work/web-2: uses the leased emulator
 calmrun release "$lease"
 ```
 
@@ -276,13 +276,19 @@ calmrun release "$lease"
   drops expired leases. `calmrun hold --renew <id> [--ttl SECS]` extends it from now (default:
   its own ttl), and exits 1 if it is gone.
 - `--wait-timeout SECS` gives up waiting: exit 75, and unlike a job the place is not kept.
+  `--wait-timeout 0` tries once and exits 75 at once when a slot is not free.
+- A lease does not block its own holder. With `--for DIR`, jobs whose folder is `DIR` or inside
+  it use the leased resources: they neither wait for them nor take another slot (a Gradle
+  `connected*` task there, which needs the emulator by itself, just runs). A job started with
+  `CALMRUN_LEASE=<id>[,<id>…]` may use those leases' resources from any folder. Another
+  `hold` always takes slots of its own.
 - `release` exits 0 when the lease is released and also when it is already gone (a note on
   stderr). An id of the wrong shape exits 2.
 - Jobs with `--needs emulator` wait while a lease holds the emulator's only slot. Such a job
   never holds back the jobs behind it, however long it waits: a lease may last hours, so the
   pass limit does not apply to a wait that only a lease causes.
 - Leases belong to a queue: `hold … --id QUEUE` and `release … --id QUEUE`. `status` lists
-  them apart from jobs (resource, label, age, expiry); `status --json` and MCP `queue_status`
+  them apart from jobs (resource, label, age, expiry, owning folder); `status --json` and MCP `queue_status`
   have them under `leases`.
 
 ### Command rules
@@ -357,7 +363,7 @@ calmrun [--kind K] [--cost N] [--prio normal|high] [--label L] [--needs NAME,…
 calmrun status [--json] [--id QUEUE]
 calmrun stats [--days N] [--json]
 calmrun bump <label-substring> [--id QUEUE]
-calmrun hold <resource>[,<resource>…] [--ttl SECS] [--label TEXT] [--cost N] [--wait-timeout SECS] [--id QUEUE]
+calmrun hold <resource>[,<resource>…] [--ttl SECS] [--label TEXT] [--for DIR] [--cost N] [--wait-timeout SECS] [--id QUEUE]
 calmrun hold --renew <lease> [--ttl SECS] [--id QUEUE]
 calmrun release <lease> [--id QUEUE]
 calmrun doctor
@@ -397,7 +403,7 @@ calmrun mcp
 | `status [--json]` | Running and waiting jobs with the reason each one waits, the budget, free RAM, kept tickets and leases. `--json` (with `mem_bytes` per running job) for tools. |
 | `stats [--days N] [--json]` | Runs, failures, average and maximum wait, average run time per label and kind, over the last N days (default 7). |
 | `bump <text>` | Move waiting jobs whose label contains the text (case-insensitive) to the front. |
-| `hold <resource>[,…]` | Wait for a slot of each resource, record a lease, print its id and exit; `--ttl`, `--label`, `--cost`, `--wait-timeout`, `--renew <id>`. See [Leases](#leases-holding-a-resource-without-a-command). |
+| `hold <resource>[,…]` | Wait for a slot of each resource, record a lease, print its id and exit; `--ttl`, `--label`, `--for`, `--cost`, `--wait-timeout`, `--renew <id>`. See [Leases](#leases-holding-a-resource-without-a-command). |
 | `release <lease>` | Give a lease back (exit 0 also when it is already gone). |
 | `doctor` | Cores, RAM, disk type, battery, the state directory and config file, the settings in effect and the suggested ones. |
 | `init [--force]` | Write a commented `config.toml` with this machine's defaults and print its path; `--force` overwrites. |

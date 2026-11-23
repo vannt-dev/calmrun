@@ -646,7 +646,9 @@ fn cancel_task(c: &Call) -> Value {
     };
     let mut v = task_answer(&task, 0, Some(note));
     // The cancel worked: not a tool error, even though the job's exit code is 130.
-    v["isError"] = json!(false);
+    if v["structuredContent"]["status"] == "cancelled" {
+        v["isError"] = json!(false);
+    }
     v
 }
 

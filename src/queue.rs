@@ -282,6 +282,8 @@ struct Prepared {
     cwd: PathBuf,
     /// A `calmrun hold`: no command; admitted means a lease with this time to live.
     hold_ttl: Option<Duration>,
+    /// The folder owning that lease (`hold --for`): as given, and as a path key.
+    hold_for: Option<(String, String)>,
 }
 
 impl Prepared {
@@ -402,6 +404,7 @@ fn prepare(ctx: &Ctx, mut req: Request) -> std::result::Result<Prepared, Box<Out
         label,
         cwd,
         hold_ttl: None,
+        hold_for: None,
     })
 }
 
@@ -504,6 +507,12 @@ fn enqueue(ctx: &mut Ctx, store: &Store, p: &Prepared, notify: &mut dyn Notify) 
         queued_ms: now_ms(),
         needs: p.req.needs.clone(),
         hold_ttl_ms: p.hold_ttl.map(|t| t.as_millis() as u64),
+        cwd_key: crate::sys::path_key(&p.cwd),
+        use_leases: std::env::var("CALMRUN_LEASE")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(crate::lease::parse_id)
+            .collect(),
         ..Job::default()
     };
     let ticket = p.req.ticket;
@@ -587,6 +596,7 @@ fn wait_turn(
             disk: &disk,
             short,
             want_line,
+            hold_for: p.hold_for.as_ref(),
         };
         let tick = tick(ctx, &input).map_err(|e| Box::new(p.outcome().error(&e)))?;
         match tick {
@@ -626,6 +636,7 @@ struct TickInput<'a> {
     disk: &'a DiskCheck,
     short: bool,
     want_line: bool,
+    hold_for: Option<&'a (String, String)>,
 }
 
 /// One locked look at the queue: prune, publish our disk state, read (or reuse) the shared
@@ -660,7 +671,8 @@ fn tick(ctx: &mut Ctx, t: &TickInput) -> Result<Tick> {
             if plan.admits(entry.id) {
                 if let Some(ttl) = entry.hold_ttl_ms {
                     // Granted in the same locked step, so the slots are never free between.
-                    return Tick::Admitted(Admitted::Leased(grant(s, entry, ttl, now)));
+                    let lease = grant(s, entry, ttl, now, t.hold_for);
+                    return Tick::Admitted(Admitted::Leased(lease));
                 }
                 if let Some(j) = s.jobs.iter_mut().find(|j| j.id == entry.id) {
                     j.started_ms = Some(now);
@@ -690,7 +702,7 @@ fn tick(ctx: &mut Ctx, t: &TickInput) -> Result<Tick> {
 }
 
 /// Turn an admitted hold entry into a lease. Returns the new lease id.
-fn grant(s: &mut State, entry: &Job, ttl_ms: u64, now: u64) -> String {
+fn grant(s: &mut State, entry: &Job, ttl_ms: u64, now: u64, owner: Option<&(String, String)>) -> String {
     let id = crate::lease::new_id(|id| s.leases.iter().any(|l| l.id == id));
     s.jobs.retain(|j| j.id != entry.id);
     s.leases.push(Lease {
@@ -703,6 +715,8 @@ fn grant(s: &mut State, entry: &Job, ttl_ms: u64, now: u64) -> String {
         granted_ms: now,
         until_ms: now.saturating_add(ttl_ms),
         ttl_ms,
+        for_dir: owner.map(|o| o.0.clone()),
+        for_key: owner.map(|o| o.1.clone()),
     });
     id
 }
@@ -775,8 +789,10 @@ pub struct HoldRequest {
     pub label: Option<String>,
     /// Budget points to hold as well (default 0).
     pub cost: Option<u32>,
-    /// Give up waiting after this long (exit 75, the place is not kept).
+    /// Give up waiting after this long (exit 75, the place is not kept); zero tries once.
     pub wait_timeout: Option<Duration>,
+    /// A folder that owns the lease: jobs inside it use its resources.
+    pub for_dir: Option<PathBuf>,
 }
 
 /// Wait in the queue like a job with `--needs`, then record a lease instead of running
@@ -812,6 +828,10 @@ pub fn hold(
         label,
         cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         hold_ttl: Some(h.ttl),
+        hold_for: h.for_dir.as_deref().map(|d| {
+            let shown = std::path::absolute(d).unwrap_or_else(|_| d.to_path_buf());
+            (shown.to_string_lossy().to_string(), crate::sys::path_key(d))
+        }),
     };
     let store = ctx.store().map_err(|e| Box::new(p.outcome().error(&e)))?;
     let entry = enqueue(ctx, &store, &p, notify).map_err(|e| Box::new(p.outcome().error(&e)))?;

@@ -34,9 +34,14 @@ pub struct HoldArgs {
     /// Budget points to hold as well (default 0: a lease runs nothing).
     #[arg(long, value_name = "N", conflicts_with = "renew")]
     pub cost: Option<u32>,
-    /// Give up waiting after this many seconds: exit 75 (the place is not kept).
+    /// Give up waiting after this many seconds: exit 75 (the place is not kept); 0 tries
+    /// once.
     #[arg(long, value_name = "SECS", conflicts_with = "renew")]
     pub wait_timeout: Option<f64>,
+    /// The folder that owns the lease: jobs whose folder is inside it use the leased
+    /// resources instead of waiting for them (so do jobs started with CALMRUN_LEASE=<id>).
+    #[arg(long = "for", value_name = "DIR", conflicts_with = "renew")]
+    pub for_dir: Option<std::path::PathBuf>,
     /// Extend this lease by --ttl from now instead of taking a new one.
     #[arg(long, value_name = "LEASE")]
     pub renew: Option<String>,
@@ -94,15 +99,19 @@ pub fn renew(ctx: &mut Ctx, id: &str, ttl: Option<Duration>) -> Result<Option<Le
     })
 }
 
-/// `emulator,db "label" (lease abc123, held 5m00s, expires in 3h55m)`.
+/// `emulator,db "label" (lease abc123, held 5m00s, expires in 3h55m, for /w/app-2)`.
 pub fn line(l: &Lease, now: u64) -> String {
     format!(
-        "{}  \"{}\"  (lease {}, held {}, expires in {})",
+        "{}  \"{}\"  (lease {}, held {}, expires in {}{})",
         l.resources.join(","),
         l.label,
         l.id,
         crate::history::human_ms(now.saturating_sub(l.granted_ms)),
-        crate::history::human_ms(l.until_ms.saturating_sub(now))
+        crate::history::human_ms(l.until_ms.saturating_sub(now)),
+        l.for_dir
+            .as_ref()
+            .map(|d| format!(", for {d}"))
+            .unwrap_or_default()
     )
 }
 

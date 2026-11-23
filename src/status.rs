@@ -57,6 +57,7 @@ fn lease_json(l: &Lease, now: u64) -> Value {
         "since_ms": l.granted_ms,
         "age_ms": now.saturating_sub(l.granted_ms),
         "expires_in_ms": l.until_ms.saturating_sub(now),
+        "for": l.for_dir,
         "text": crate::lease::line(l, now),
     })
 }
