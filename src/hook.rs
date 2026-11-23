@@ -526,6 +526,22 @@ mod tests {
     }
 
     #[test]
+    fn rtk_commands_are_wrapped_in_their_rtk_form() {
+        for (cmd, wrapped) in [
+            ("rtk cargo test", "calmrun -- rtk cargo test"),
+            ("rtk vitest", "calmrun -- rtk vitest"),
+            ("rtk tsc", "calmrun -- rtk tsc"),
+            ("cd web && rtk npm test", "cd web && calmrun -- rtk npm test"),
+        ] {
+            let v = run("Bash", cmd, Mode::Deny).unwrap_or_else(|| panic!("{cmd} was allowed"));
+            let capped = wrapped.replace("calmrun --", "calmrun --wait-timeout 108 --");
+            assert!(reason(&v).contains(&capped), "{cmd}: {}", reason(&v));
+        }
+        assert!(run("Bash", "rtk git status", Mode::Deny).is_none());
+        assert!(run("Bash", "calmrun -- rtk cargo test", Mode::Deny).is_none());
+    }
+
+    #[test]
     fn denies_heavy_with_suggestion() {
         let v = run("Bash", "npx vitest run", Mode::Deny).unwrap();
         assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
