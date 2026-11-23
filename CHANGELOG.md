@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-23
+
 ### Added
 
 - Detection for builds and tests across ecosystems: C/C++ (make, cmake --build, ctest, ninja,
@@ -33,6 +35,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- Releases publish the npm package from CI through npm trusted publishing (with provenance).
 - Dev servers and other commands that run outside the queue keep their arguments unchanged,
   and the Claude Code hook no longer wraps them.
 - The Claude Code hook follows the runner's command rules: a watch mode gets its one-shot form
