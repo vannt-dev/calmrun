@@ -333,7 +333,8 @@ pub fn bump(mut ctx: Ctx, needle: &str) -> i32 {
 }
 
 /// `calmrun doctor`.
-pub fn doctor(ctx: Ctx) -> i32 {
+pub fn doctor(mut ctx: Ctx) -> i32 {
+    let free_now = ctx.sys.free_ram();
     print!(
         "{}",
         doctor::report(
@@ -341,7 +342,8 @@ pub fn doctor(ctx: Ctx) -> i32 {
             &ctx.cfg,
             &ctx.home,
             &ctx.config_path,
-            sys::physical_cores()
+            sys::physical_cores(),
+            free_now
         )
     );
     0
