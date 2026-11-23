@@ -22,6 +22,19 @@ All notable changes to this project are documented here. The format follows
   and `try { … }` blocks, `$( … )`, subshells, `bash -c "…"` / `pwsh -Command '…'` scripts and
   after `timeout`. `npm --prefix web test` (and `-w`, `pnpm -C`, `--filter`) and `node --test`
   are detected; `node --watch` is refused with its one-shot form.
+- MCP tasks outlive tool timeouts: `run_task` takes `wait_seconds` (default 25). A job that has
+  not ended by then keeps its place and goes on in the server; the call answers at once with a
+  `task_id`, its state (`waiting` with place and points, or `running`) and the output so far.
+- MCP tools `task_status` (state, exit code when done, wait and run time, new output since
+  `output_offset`, at most 32 KB, optional `wait_seconds`) and `cancel_task` (leaves the queue
+  or stops the whole process tree).
+- `calmrun hold <resource>[,…]` takes resource slots without running a command (for long
+  device or emulator claims): it waits like `--needs`, prints a lease id and exits. Leases
+  lapse after `--ttl` (default 4 h), take no points unless `--cost` is given, and are extended
+  with `hold --renew <id>`. `calmrun release <id>` gives them back. `status` and MCP
+  `queue_status` list them. `--wait-timeout 0` tries once.
+- A lease does not block its holder: `hold --for <dir>` lets jobs in that folder use the leased
+  resources, and `CALMRUN_LEASE=<id>[,…]` does the same for a job anywhere.
 
 ### Changed
 
@@ -29,6 +42,12 @@ All notable changes to this project are documented here. The format follows
   (`npx vitest --watch` -> `npx vitest run`).
 - `next:` lines and the hook commands `setup` writes name calmrun's absolute path when
   `calmrun` is not on `PATH`.
+- A job waiting only for a resource that a lease holds never stops later jobs from passing.
+- MCP results carry calmrun's notes (an expired ticket that joined the end of the line), a
+  refusal names the `run_task` call to make instead of the CLI form, and the summary line drops
+  empty fields and a status that only repeats the exit code.
+- Resource names (`--needs`, `hold`) must be plain names (letters, digits, `-`, `_`, `.`);
+  others exit 2.
 
 ## [0.2.0] - 2026-11-23
 

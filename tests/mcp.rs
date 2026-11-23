@@ -26,7 +26,7 @@ fn calmrun(home: &Path) -> Command {
 
 struct Client {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     rx: Receiver<Value>,
     /// Messages read while looking for something else.
     seen: Vec<Value>,
@@ -56,15 +56,16 @@ impl Client {
         });
         Client {
             child,
-            stdin,
+            stdin: Some(stdin),
             rx,
             seen: Vec::new(),
         }
     }
 
     fn send(&mut self, v: Value) {
-        writeln!(self.stdin, "{v}").unwrap();
-        self.stdin.flush().unwrap();
+        let stdin = self.stdin.as_mut().unwrap();
+        writeln!(stdin, "{v}").unwrap();
+        stdin.flush().unwrap();
     }
 
     /// Wait for the response with this id; other messages are kept in `seen`.
@@ -127,7 +128,10 @@ fn lists_tools_and_runs_a_task() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, vec!["run_task", "queue_status", "bump"]);
+    assert_eq!(
+        names,
+        vec!["run_task", "task_status", "cancel_task", "queue_status", "bump"]
+    );
 
     let r = c.call(
         3,
@@ -147,6 +151,9 @@ fn lists_tools_and_runs_a_task() {
     // The output also travels in structuredContent, for clients that show only that.
     let tail = s["output_tail"].as_str().unwrap();
     assert!(tail.contains("[\"hello\",\"world\"]"), "{tail}");
+    // Finished within wait_seconds: the result itself, with the task id for reference.
+    assert_eq!(s["state"], "done");
+    assert!(s["task_id"].as_str().unwrap().starts_with('t'));
 
     let r = c.call(4, "queue_status", json!({}), None);
     assert_eq!(r["result"]["structuredContent"]["budget"], 2);
@@ -353,4 +360,293 @@ fn sigterm_stops_the_server_and_its_tasks() {
         assert!(Instant::now() < deadline, "the task outlived the server");
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn alive(pid: u32) -> bool {
+    let mut sys = sysinfo::System::new().unwrap();
+    let p = sysinfo::Pid::from_u32(pid);
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[p]), true);
+    sys.process(p).is_some_and(|pr| {
+        !matches!(
+            pr.status(),
+            sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead
+        )
+    })
+}
+
+fn wait_gone(pid: u32, limit: Duration, what: &str) {
+    let deadline = Instant::now() + limit;
+    while alive(pid) {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn queue_json(home: &Path) -> Value {
+    let out = calmrun(home).args(["status", "--json"]).output().unwrap();
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+/// The child pid of the only running job, once it runs.
+fn running_child(home: &Path) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(p) = queue_json(home)["running"][0]["child_pid"].as_u64() {
+            return p as u32;
+        }
+        assert!(Instant::now() < deadline, "the task never started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn structured(r: &Value) -> &Value {
+    &r["result"]["structuredContent"]
+}
+
+#[test]
+fn a_long_task_returns_a_handle_and_is_followed_with_offsets() {
+    let home = tempfile::tempdir().unwrap();
+    let mut c = Client::start(home.path());
+    init(&mut c);
+    let r = c.call(
+        2,
+        "run_task",
+        json!({"command": probe_cmd("--sleep-ms 2500 --print-args first-line"), "wait_seconds": 0.5}),
+        None,
+    );
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let s = structured(&r);
+    let id = s["task_id"].as_str().unwrap().to_string();
+    assert!(
+        ["waiting", "running"].contains(&s["state"].as_str().unwrap()),
+        "{s}"
+    );
+    let text = r["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("task_status"), "{text}");
+
+    // The output so far, then nothing new from next_offset on.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let next = loop {
+        let r = c.call(3, "task_status", json!({"task_id": id}), None);
+        let s = structured(&r);
+        if s["output"].as_str().unwrap_or("").contains("first-line") {
+            assert_eq!(s["state"], "running", "{s}");
+            assert!(s["run_ms"].as_u64().is_some());
+            break s["next_offset"].as_u64().unwrap();
+        }
+        assert!(Instant::now() < deadline, "no output: {s}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(next > 0);
+    let r = c.call(
+        4,
+        "task_status",
+        json!({"task_id": id, "output_offset": next}),
+        None,
+    );
+    assert_eq!(structured(&r)["output"], "", "{r}");
+    assert_eq!(structured(&r)["next_offset"], next);
+
+    // Waiting for the end inside task_status.
+    let r = c.call(5, "task_status", json!({"task_id": id, "wait_seconds": 20}), None);
+    let s = structured(&r);
+    assert_eq!(s["state"], "done", "{s}");
+    assert_eq!(s["exit_code"], 0);
+    assert!(s["run_ms"].as_u64().unwrap() >= 2_000, "{s}");
+    // Finished tasks stay queryable; cancelling one changes nothing.
+    let r = c.call(6, "cancel_task", json!({"task_id": id}), None);
+    assert_eq!(structured(&r)["state"], "done");
+    assert_eq!(structured(&r)["exit_code"], 0);
+    let r = c.call(7, "task_status", json!({"task_id": "t000000"}), None);
+    assert_eq!(r["result"]["isError"], true);
+}
+
+#[test]
+fn cancel_task_frees_a_waiting_place() {
+    let home = tempfile::tempdir().unwrap();
+    // A CLI job holds the whole budget.
+    let mut holder = calmrun(home.path())
+        .args(["--cost", "2", "--", EXE, "__probe", "--sleep-ms", "30000"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    running_child(home.path());
+    let mut c = Client::start(home.path());
+    init(&mut c);
+    let r = c.call(
+        2,
+        "run_task",
+        json!({"command": probe_cmd("--sleep-ms 10"), "cost": 2, "label": "behind", "wait_seconds": 1}),
+        None,
+    );
+    let s = structured(&r);
+    assert_eq!(s["state"], "waiting", "{s}");
+    assert_eq!(s["place"], 1, "{s}");
+    assert_eq!(
+        (s["used"].as_u64(), s["budget"].as_u64()),
+        (Some(2), Some(2)),
+        "{s}"
+    );
+    assert!(s["waiting_line"].as_str().unwrap().contains("points"), "{s}");
+    let id = s["task_id"].as_str().unwrap().to_string();
+    assert_eq!(queue_json(home.path())["waiting"].as_array().unwrap().len(), 1);
+
+    let r = c.call(3, "cancel_task", json!({"task_id": id}), None);
+    let s = structured(&r);
+    assert_eq!(s["state"], "done", "{s}");
+    assert_eq!(s["status"], "cancelled", "{s}");
+    assert!(s["note"].as_str().unwrap().contains("left the queue"), "{s}");
+    assert!(queue_json(home.path())["waiting"].as_array().unwrap().is_empty());
+    let _ = holder.kill();
+    let _ = holder.wait();
+}
+
+#[test]
+fn cancel_task_stops_the_whole_tree() {
+    let home = tempfile::tempdir().unwrap();
+    let pidfile = home.path().join("daemon.pid");
+    let mut c = Client::start(home.path());
+    init(&mut c);
+    let cmd = probe_cmd(&format!(
+        "--sleep-ms 60000 --spawn-daemon \"{}\"",
+        pidfile.display()
+    ));
+    let r = c.call(2, "run_task", json!({"command": cmd, "wait_seconds": 0}), None);
+    let id = structured(&r)["task_id"].as_str().unwrap().to_string();
+    let child = running_child(home.path());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let daemon: u32 = loop {
+        if let Some(p) = std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+        {
+            break p;
+        }
+        assert!(Instant::now() < deadline, "daemon pid never written");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let r = c.call(3, "cancel_task", json!({"task_id": id}), None);
+    let s = structured(&r);
+    assert_eq!(s["status"], "cancelled", "{s}");
+    assert_eq!(
+        r["result"]["isError"], false,
+        "a cancel that worked is no tool error"
+    );
+    assert!(s["note"].as_str().unwrap().contains("process tree"), "{s}");
+    wait_gone(child, Duration::from_secs(5), "the command outlived cancel_task");
+    // The daemon would end by itself after 6 s; it must go sooner.
+    wait_gone(
+        daemon,
+        Duration::from_secs(3),
+        "the command's child outlived cancel_task",
+    );
+    assert!(queue_json(home.path())["running"].as_array().unwrap().is_empty());
+    let hist = std::fs::read_to_string(home.path().join("history.jsonl")).unwrap();
+    assert!(hist.contains("\"status\":\"cancelled\""), "{hist}");
+}
+
+#[test]
+fn closing_the_server_stops_its_background_tasks() {
+    let home = tempfile::tempdir().unwrap();
+    let mut c = Client::start(home.path());
+    init(&mut c);
+    let r = c.call(
+        2,
+        "run_task",
+        json!({"command": probe_cmd("--sleep-ms 60000"), "wait_seconds": 0}),
+        None,
+    );
+    assert!(structured(&r)["task_id"].is_string());
+    let child = running_child(home.path());
+    // The client goes away: stdin closes.
+    c.stdin = None;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while c.child.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the server did not exit after stdin closed"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    wait_gone(child, Duration::from_secs(10), "the task outlived its server");
+    let q = queue_json(home.path());
+    assert!(q["running"].as_array().unwrap().is_empty(), "{q}");
+    let hist = std::fs::read_to_string(home.path().join("history.jsonl")).unwrap();
+    assert!(hist.contains("\"status\":\"cancelled\""), "{hist}");
+}
+
+#[test]
+fn a_killed_server_leaves_no_task_or_queue_entry_behind() {
+    let home = tempfile::tempdir().unwrap();
+    let mut c = Client::start(home.path());
+    init(&mut c);
+    // One running task and one waiting behind it (budget 2).
+    c.call(
+        2,
+        "run_task",
+        json!({"command": probe_cmd("--sleep-ms 60000"), "cost": 2, "wait_seconds": 0}),
+        None,
+    );
+    let child = running_child(home.path());
+    let r = c.call(
+        3,
+        "run_task",
+        json!({"command": probe_cmd("--sleep-ms 10"), "cost": 2, "wait_seconds": 0.5}),
+        None,
+    );
+    assert_eq!(structured(&r)["state"], "waiting", "{r}");
+    c.child.kill().unwrap();
+    let _ = c.child.wait();
+    wait_gone(
+        child,
+        Duration::from_secs(10),
+        "the task outlived a killed server",
+    );
+    // The dead server's entries are dropped by the next calmrun that looks.
+    let q = queue_json(home.path());
+    assert!(q["running"].as_array().unwrap().is_empty(), "{q}");
+    assert!(q["waiting"].as_array().unwrap().is_empty(), "{q}");
+}
+
+#[test]
+fn refusals_and_lost_tickets_speak_to_the_agent() {
+    let home = tempfile::tempdir().unwrap();
+    let mut c = Client::start(home.path());
+    init(&mut c);
+    // A refusal names the next run_task call, not the CLI form, and has no empty fields.
+    let r = c.call(2, "run_task", json!({"command": "docker compose up"}), None);
+    let text = r["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.starts_with("exit code 2 (refused)\n"), "{text}");
+    assert!(
+        text.contains("next: call run_task with \"command\" set to: docker compose up -d"),
+        "{text}"
+    );
+    assert!(!text.contains("calmrun -- "), "{text}");
+    // A ticket that is unknown: the agent learns it lost its place.
+    let r = c.call(
+        3,
+        "run_task",
+        json!({"command": probe_cmd("--sleep-ms 10"), "ticket": 999}),
+        None,
+    );
+    let s = structured(&r);
+    assert_eq!(s["exit_code"], 0, "{r}");
+    let notes = s["notes"].as_array().unwrap();
+    assert!(notes[0].as_str().unwrap().contains("ticket 999"), "{s}");
+    let text = r["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("joining the end of the line"), "{text}");
+    // A plain success shows no status word that only repeats the code.
+    assert!(text.contains("exit code 0 · "), "{text}");
+    assert!(!text.contains("exit code 0 (0)"), "{text}");
+    // Resource names are plain names.
+    let r = c.call(
+        4,
+        "run_task",
+        json!({"command": probe_cmd("--sleep-ms 10"), "needs": ["bad name!"]}),
+        None,
+    );
+    assert_eq!(structured(&r)["exit_code"], 2, "{r}");
+    let text = r["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("invalid resource name"), "{text}");
 }

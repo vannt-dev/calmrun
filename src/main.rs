@@ -10,6 +10,7 @@ mod gates;
 mod history;
 mod hook;
 mod kinds;
+mod lease;
 mod mcp;
 mod memwatch;
 mod messages;
@@ -21,6 +22,7 @@ mod shell;
 mod state;
 mod status;
 mod sys;
+mod tasks;
 
 use clap::Parser;
 use cli::{Cli, Sub};
@@ -45,6 +47,8 @@ fn dispatch(cli: Cli) -> i32 {
         Some(Sub::Status { json }) => with_ctx(&|c| commands::status(c, json)),
         Some(Sub::Stats { days, json }) => commands::stats(days, json),
         Some(Sub::Bump { ref label }) => with_ctx(&|c| commands::bump(c, label)),
+        Some(Sub::Hold(ref a)) => with_ctx(&|c| commands::hold(c, a)),
+        Some(Sub::Release(ref a)) => with_ctx(&|c| commands::release(c, &a.lease)),
         Some(Sub::Doctor) => with_ctx(&commands::doctor),
         Some(Sub::Hook { ref target }) => commands::hook(target),
         Some(Sub::Init { force }) => commands::init(force),

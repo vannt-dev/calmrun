@@ -3,8 +3,8 @@
 //! reasons users see. Adding a gate = one type implementing [`Gate`] plus one line in
 //! [`standard`]; the scheduler loop does not change.
 
-use crate::scheduler::{effective_cost, Block, Inputs};
-use crate::state::Job;
+use crate::scheduler::{job_points, uses_lease, Block, Inputs};
+use crate::state::{Job, Lease};
 use std::collections::{HashMap, HashSet};
 
 /// One start condition. `'a` is the lifetime of the job snapshot the scheduler works on.
@@ -24,14 +24,14 @@ struct Points {
 
 impl<'a> Gate<'a> for Points {
     fn blocks(&self, w: &'a Job, _: bool) -> Option<Block> {
-        let needs = effective_cost(w.cost, self.budget);
+        let needs = job_points(w, self.budget);
         (self.used + needs > self.budget).then_some(Block::Points {
             used: self.used,
             needs,
         })
     }
     fn admit(&mut self, w: &'a Job) {
-        self.used += effective_cost(w.cost, self.budget);
+        self.used += job_points(w, self.budget);
     }
 }
 
@@ -52,23 +52,31 @@ impl<'a> Gate<'a> for Keys<'a> {
     }
 }
 
-/// Named resources (`--needs db`) with a number of slots each.
+/// Named resources (`--needs db`) with a number of slots each. A job may use a lease's slot
+/// instead (its folder owns the lease, or it names it): such a need neither waits nor takes one.
 struct Resources<'a> {
     held: HashMap<&'a str, u32>,
     caps: &'a std::collections::BTreeMap<String, u32>,
+    leases: &'a [Lease],
+}
+
+impl<'a> Resources<'a> {
+    fn own_needs(&self, w: &'a Job) -> impl Iterator<Item = &'a String> + '_ {
+        w.needs.iter().filter(move |n| !uses_lease(w, n, self.leases))
+    }
 }
 
 impl<'a> Gate<'a> for Resources<'a> {
     fn blocks(&self, w: &'a Job, _: bool) -> Option<Block> {
-        w.needs
-            .iter()
+        self.own_needs(w)
             .find(|n| {
                 self.held.get(n.as_str()).copied().unwrap_or(0) >= crate::scheduler::capacity(self.caps, n)
             })
             .map(|n| Block::Resource(n.clone()))
     }
     fn admit(&mut self, w: &'a Job) {
-        for n in &w.needs {
+        let own: Vec<&'a String> = self.own_needs(w).collect();
+        for n in own {
             *self.held.entry(n.as_str()).or_default() += 1;
         }
     }
@@ -85,7 +93,8 @@ impl<'a> Gate<'a> for Disk {
 }
 
 /// Free RAM, minus what recently started jobs and jobs admitted in this pass are assumed to
-/// take. Skipped when nothing runs, so an idle machine always starts a job.
+/// take. Skipped when nothing runs, so an idle machine always starts a job, and for a hold
+/// that takes no points (it runs nothing).
 struct Ram {
     free: u64,
     needs: u64,
@@ -94,34 +103,41 @@ struct Ram {
 }
 
 impl<'a> Gate<'a> for Ram {
-    fn blocks(&self, _: &'a Job, active: bool) -> Option<Block> {
-        (active && self.needs > 0 && self.free < self.needs).then_some(Block::Ram {
+    fn blocks(&self, w: &'a Job, active: bool) -> Option<Block> {
+        let runs_something = job_points(w, self.budget) > 0;
+        (runs_something && active && self.needs > 0 && self.free < self.needs).then_some(Block::Ram {
             free: self.free,
             needs: self.needs,
         })
     }
     fn admit(&mut self, w: &'a Job) {
-        let take = self.per_point * effective_cost(w.cost, self.budget) as u64;
+        let take = self.per_point * job_points(w, self.budget) as u64;
         self.free = self.free.saturating_sub(take);
     }
 }
 
-/// The standard gates, primed with what already runs, in reporting order.
+/// The standard gates, primed with what already runs and what leases hold, in reporting order.
 pub fn standard<'a>(jobs: &'a [Job], inputs: &Inputs<'a>) -> Vec<Box<dyn Gate<'a> + 'a>> {
     let running = || jobs.iter().filter(|j| j.running());
     let mut keys = Keys { held: HashSet::new() };
     let mut resources = Resources {
         held: HashMap::new(),
         caps: inputs.caps,
+        leases: inputs.leases,
     };
     for j in running() {
         keys.admit(j);
         resources.admit(j);
     }
+    for (name, n) in crate::scheduler::leased_slots(inputs.leases) {
+        *resources.held.entry(name).or_default() += n;
+    }
+    let budget = inputs.limits.budget;
     vec![
         Box::new(Points {
-            used: crate::scheduler::used_points(jobs, inputs.limits.budget),
-            budget: inputs.limits.budget,
+            used: crate::scheduler::used_points(jobs, budget)
+                + crate::scheduler::leased_points(inputs.leases, budget),
+            budget,
         }),
         Box::new(keys),
         Box::new(resources),

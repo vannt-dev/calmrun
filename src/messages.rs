@@ -57,9 +57,15 @@ fn waiting_reason(s: &State, why: &Block, c: &WaitContext) -> String {
             bytes_to_gb(*needs)
         ),
         Block::Resource(name) => {
-            let holders: Vec<&str> = running()
+            let holders: Vec<String> = running()
                 .filter(|j| j.needs.contains(name))
-                .map(|j| j.label.as_str())
+                .map(|j| j.label.clone())
+                .chain(
+                    s.leases
+                        .iter()
+                        .filter(|l| l.resources.contains(name))
+                        .map(|l| format!("{} (lease {})", l.label, l.id)),
+                )
                 .collect();
             format!(
                 "calmrun: waiting for resource \"{name}\" ({} of {} slot(s) held by {}), {} in line",
@@ -86,10 +92,10 @@ fn waiting_reason(s: &State, why: &Block, c: &WaitContext) -> String {
         }
         Block::Points { .. } | Block::Order => format!(
             "calmrun: waiting — {} of {} points in use, {} in line (needs {})",
-            scheduler::used_points(&s.jobs, c.budget),
+            scheduler::used_points(&s.jobs, c.budget) + scheduler::leased_points(&s.leases, c.budget),
             c.budget,
             ordinal(place),
-            scheduler::effective_cost(c.me.cost, c.budget)
+            scheduler::job_points(c.me, c.budget)
         ),
     }
 }
@@ -138,10 +144,16 @@ pub fn wait_timeout(
 }
 
 /// The refusal for an attached `docker compose up`, with the fixed command when possible.
-/// `program` starts calmrun (`calmrun`, or its path when it is not on PATH).
-pub fn refused(reason: &str, fixed: Option<&[String]>, program: &str) -> String {
+/// `hint` says how to run that command (`{command}` is replaced; default: the CLI form,
+/// with calmrun's path when it is not on PATH).
+pub fn refused(reason: &str, fixed: Option<&[String]>, hint: Option<&str>) -> String {
     let next = match fixed {
-        Some(f) => format!("{program} -- {}", f.join(" ")),
+        Some(f) => hint
+            .map_or_else(
+                || format!("{} -- {{command}}", crate::runner::program_name()),
+                str::to_string,
+            )
+            .replace("{command}", &f.join(" ")),
         None => "run it outside calmrun".to_string(),
     };
     format!("calmrun: refused: {reason}.\ncalmrun: next: {next}")
@@ -196,6 +208,7 @@ mod tests {
     fn running_summary_names_jobs_and_folders() {
         let s = State {
             ram_sample: None,
+            leases: Vec::new(),
             next_id: 9,
             jobs: vec![
                 job(1, "npx vitest", "/src/web", 10_000),
@@ -229,6 +242,41 @@ mod tests {
     }
 
     #[test]
+    fn resource_line_names_leases_as_holders() {
+        let me = Job {
+            id: 2,
+            order: 2,
+            needs: vec!["emulator".into()],
+            ..Default::default()
+        };
+        let s = State {
+            jobs: vec![me.clone()],
+            leases: vec![crate::state::Lease {
+                id: "abc123".into(),
+                resources: vec!["emulator".into()],
+                label: "lane calmrun-4".into(),
+                until_ms: u64::MAX,
+                ..Default::default()
+            }],
+            ..State::default()
+        };
+        let disk = DiskCheck::new(Path::new("."), 0);
+        let caps = BTreeMap::new();
+        let c = WaitContext {
+            me: &me,
+            budget: 2,
+            disk: &disk,
+            caps: &caps,
+            now_ms: 1_000,
+        };
+        assert_eq!(
+            waiting_line(&s, &Block::Resource("emulator".into()), &c),
+            "calmrun: waiting for resource \"emulator\" (1 of 1 slot(s) held by lane calmrun-4 \
+             (lease abc123)), 1st in line"
+        );
+    }
+
+    #[test]
     fn ordinals() {
         let got: Vec<String> = [1, 2, 3, 4, 11, 12, 13, 21, 22, 101]
             .iter()
@@ -250,6 +298,7 @@ mod tests {
         };
         let s = State {
             ram_sample: None,
+            leases: Vec::new(),
             next_id: 2,
             jobs: vec![job(1, "npx vitest", "/w/web", 0), me.clone()],
         };

@@ -80,6 +80,11 @@ pub enum Sub {
         #[arg(long)]
         json: bool,
     },
+    /// Hold slots of named resources (a device, a database) without running a command:
+    /// waits like --needs, then prints a lease id and exits.
+    Hold(crate::lease::HoldArgs),
+    /// Give back a lease taken with `calmrun hold`.
+    Release(crate::lease::ReleaseArgs),
     /// Move waiting jobs whose label contains the text to the front of the queue.
     Bump {
         /// Part of the label to match (case-insensitive).

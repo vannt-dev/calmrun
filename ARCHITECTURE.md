@@ -19,11 +19,13 @@ process evaluates the same way, admits it. Only then does it run the command.
 | `shell.rs` | Just enough shell syntax for that: words, `&&`/`|`/`;` segments, heredocs and here-strings. |
 | `state.rs` | `state.json` under an OS file lock (`state.lock`), atomic writes, pruning of dead entries. |
 | `status.rs` | Snapshot, `status --json` / MCP `queue_status`, and `bump`. |
+| `lease.rs` | `hold` / `release` arguments, lease ids, renew and release. Waiting for the slots is `queue::hold`. |
 | `messages.rs` | Every waiting, refusal and timeout line, each ending with a `next:` step where there is one. |
 | `memwatch.rs` | Process-tree memory and the critical free-RAM floor while a job runs. |
 | `runner.rs` | Spawns the command: name lookup, priority, Job Object or process group, signals, exit codes. |
 | `sys.rs` | Machine facts: RAM, cores, process liveness, disks, power, path normalisation. |
 | `mcp.rs` | The MCP server: newline-delimited JSON-RPC on stdio and the tool registry. |
+| `tasks.rs` | The MCP server's background tasks: a worker thread per `run_task` job, waited on with a timeout, followed by `task_status` / `cancel_task`. |
 | `hook.rs` | The agent hooks: one decision (wrap heavy parts, cap the wait below the tool limit) and thin adapters per agent in `hook/` (Claude Code here; Codex, Antigravity, OpenCode). |
 | `setup.rs` | Writes and removes the instruction block in agents' global files; `setup/hooks.rs` merges each agent's hook into its user-level file. |
 | `config.rs` | Defaults derived from the machine, `config.toml`, and env overrides. |
@@ -47,6 +49,10 @@ CLI / MCP ──Request──▶ queue::run
    execute      runner::run with a Watcher (cancel, timeout, memory) → leave the queue
    record       append to history.jsonl
 ```
+
+A `calmrun hold` takes the same path with an entry marked `hold_ttl_ms` that runs nothing: in
+the locked step that admits it, the entry becomes a `Lease` in `state.leases`, which has no
+owner process and lapses at `until_ms`. The gates count leases' slots and points as taken.
 
 The lock is held only to read, decide and write. calmrun never sleeps, spawns or waits for
 the child while holding it. Each tick reads the state file once, and writes it back only
@@ -98,7 +104,7 @@ first (see `disk_short`).
 
 Add a `Tool` to `TOOLS` in `src/mcp.rs`: a name, a schema function and a handler
 `fn(&Call) -> Value`. Set `background: true` for anything that may wait. It then runs on its
-own thread and can be cancelled. Use `ctx_for(args)` to honour the `queue` argument. The
+own thread and can be cancelled. A job that may outlive its call goes through `Tasks::start`. Use `ctx_for(args)` to honour the `queue` argument. The
 test `every_tool_has_a_matching_schema` checks the schemas.
 
 ### Add an agent to `setup`
@@ -116,7 +122,8 @@ pure. Integration tests in `tests/` drive the real binary against a temporary
 - `queue.rs`: budget, keys, order, prio, bump, tickets, disk, resources, queues, Windows argument escaping.
 - `signals.rs`: Ctrl+C and process-tree cleanup.
 - `memory.rs`: the memory ceiling.
-- `mcp.rs`: the JSON-RPC protocol.
+- `mcp.rs`: the JSON-RPC protocol, and tasks: handles, offsets, cancel, server exit.
+- `lease.rs`: `hold` / `release`: lifecycle, expiry, contention with `--needs`, queues.
 - `setup.rs`: setup against a temporary home.
 - `review.rs`: regression tests for review findings (watch refusal, setup backups, tickets in
   `status`, the hook's absolute path, `npm.cmd` shadowing, a hard-killed calmrun).
