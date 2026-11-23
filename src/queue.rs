@@ -8,7 +8,7 @@ use crate::kinds::Workers;
 use crate::memwatch::{self, MemWatch};
 use crate::messages::{self, WaitContext};
 use crate::scheduler::{self, Inputs, Limits};
-use crate::state::{self, Job, State, Store};
+use crate::state::{self, Job, Lease, State, Store};
 use crate::sys::{DiskCheck, Sys};
 use crate::{history, runner};
 use std::collections::HashMap;
@@ -193,6 +193,9 @@ pub struct Request {
     pub env: Vec<(String, String)>,
     /// Named resources to hold one slot of each (`--needs db`).
     pub needs: Vec<String>,
+    /// How to show the fixed command after a refusal; `{command}` is replaced by it
+    /// (default: `calmrun -- {command}`).
+    pub refused_hint: Option<String>,
 }
 
 /// What happened.
@@ -234,6 +237,8 @@ pub trait Notify {
     }
     /// The current waiting line.
     fn waiting(&mut self, line: &str);
+    /// Called once the job has its entry (and id) in the queue.
+    fn queued(&mut self, _id: u64) {}
     /// Called once when the command starts.
     fn started(&mut self, _wait_ms: u64) {}
     /// A one-off note for the user.
@@ -275,6 +280,10 @@ struct Prepared {
     cost: u32,
     label: String,
     cwd: PathBuf,
+    /// A `calmrun hold`: no command; admitted means a lease with this time to live.
+    hold_ttl: Option<Duration>,
+    /// The folder owning that lease (`hold --for`): as given, and as a path key.
+    hold_for: Option<(String, String)>,
 }
 
 impl Prepared {
@@ -320,8 +329,10 @@ pub fn run(ctx: &mut Ctx, req: Request, notify: &mut dyn Notify) -> Outcome {
         Ok(e) => e,
         Err(e) => return p.outcome().error(&e),
     };
+    notify.queued(entry.id);
     let started_ms = match wait_turn(ctx, &store, &p, &entry, notify) {
-        Ok(t) => t,
+        Ok(Admitted::Started(t)) => t,
+        Ok(Admitted::Leased(_)) => return p.outcome(),
         Err(out) => return *out,
     };
     let out = execute(ctx, &store, &p, &entry, started_ms, notify);
@@ -339,7 +350,7 @@ fn prepare(ctx: &Ctx, mut req: Request) -> std::result::Result<Prepared, Box<Out
         detect::Disposition::Queue => {}
         detect::Disposition::Light(what) => light = Some(what),
         detect::Disposition::Refuse { reason, fixed } => {
-            let msg = messages::refused(&reason, fixed.as_deref());
+            let msg = messages::refused(&reason, fixed.as_deref(), req.refused_hint.as_deref());
             return Err(Box::new(Outcome::default().ended(
                 EXIT_REFUSED,
                 "refused",
@@ -381,6 +392,9 @@ fn prepare(ctx: &Ctx, mut req: Request) -> std::result::Result<Prepared, Box<Out
         req.needs.extend(r.needs.iter().map(|n| n.to_string()));
     }
     req.needs = normalized(&req.needs);
+    if let Some(bad) = invalid_resource(&req.needs) {
+        return Err(Box::new(Outcome::default().error(&bad)));
+    }
     Ok(Prepared {
         req,
         light,
@@ -389,7 +403,17 @@ fn prepare(ctx: &Ctx, mut req: Request) -> std::result::Result<Prepared, Box<Out
         cost,
         label,
         cwd,
+        hold_ttl: None,
+        hold_for: None,
     })
+}
+
+/// The first resource name that is not a plain name (same rule as queue ids).
+fn invalid_resource(needs: &[String]) -> Option<Error> {
+    needs
+        .iter()
+        .find(|n| !valid_queue_id(n))
+        .map(|n| Error::InvalidResource(n.clone()))
 }
 
 fn normalized(needs: &[String]) -> Vec<String> {
@@ -474,11 +498,21 @@ fn enqueue(ctx: &mut Ctx, store: &Store, p: &Prepared, notify: &mut dyn Notify) 
         label: p.label.clone(),
         kind: p.kind.clone(),
         cost: p.cost,
-        keys: detect::exclusive_keys(&p.kind, &p.det.tool, &p.det.rest, &p.cwd),
+        keys: match p.hold_ttl {
+            Some(_) => Vec::new(),
+            None => detect::exclusive_keys(&p.kind, &p.det.tool, &p.det.rest, &p.cwd),
+        },
         cwd: p.cwd.to_string_lossy().to_string(),
         high: p.req.high,
         queued_ms: now_ms(),
         needs: p.req.needs.clone(),
+        hold_ttl_ms: p.hold_ttl.map(|t| t.as_millis() as u64),
+        cwd_key: crate::sys::path_key(&p.cwd),
+        use_leases: std::env::var("CALMRUN_LEASE")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(crate::lease::parse_id)
+            .collect(),
         ..Job::default()
     };
     let ticket = p.req.ticket;
@@ -506,26 +540,40 @@ fn enqueue(ctx: &mut Ctx, store: &Store, p: &Prepared, notify: &mut dyn Notify) 
     Ok(entry)
 }
 
+/// How a wait ended well.
+enum Admitted {
+    /// The command may start; the start time.
+    Started(u64),
+    /// A hold was granted: the lease id.
+    Leased(String),
+}
+
 /// What one poll found.
 enum Tick {
-    Started(u64),
+    Admitted(Admitted),
     Waiting {
         line: Option<String>,
         fingerprint: (usize, usize, usize),
     },
 }
 
-/// Poll until the scheduler admits us. Returns the start time, or the outcome when the wait
-/// ends otherwise (cancelled, wait timeout, state error).
+/// Poll until the scheduler admits us. Returns the start time (or a hold's lease), or the
+/// outcome when the wait ends otherwise (cancelled, wait timeout, state error).
 fn wait_turn(
     ctx: &mut Ctx,
     store: &Store,
     p: &Prepared,
     entry: &Job,
     notify: &mut dyn Notify,
-) -> std::result::Result<u64, Box<Outcome>> {
+) -> std::result::Result<Admitted, Box<Outcome>> {
     let wait_started = Instant::now();
-    let mut disk = DiskCheck::new(&p.cwd, ctx.cfg.min_free_disk_bytes);
+    // A hold writes nothing, so it never waits for disk space.
+    let disk_need = if p.hold_ttl.is_some() {
+        0
+    } else {
+        ctx.cfg.min_free_disk_bytes
+    };
+    let mut disk = DiskCheck::new(&p.cwd, disk_need);
     let mut last_line = String::from("waiting");
     let mut poll = POLL_MIN;
     let mut last_fp = None;
@@ -548,19 +596,23 @@ fn wait_turn(
             disk: &disk,
             short,
             want_line,
+            hold_for: p.hold_for.as_ref(),
         };
         let tick = tick(ctx, &input).map_err(|e| Box::new(p.outcome().error(&e)))?;
         match tick {
-            Tick::Started(t) => {
+            Tick::Admitted(a) => {
                 if short {
                     notify.note(&disk_warning(&disk));
                 }
-                return Ok(t);
+                return Ok(a);
             }
             Tick::Waiting { line, fingerprint } => {
                 if let Some(l) = line {
                     notify.waiting(&l);
                     last_line = l;
+                }
+                if timed_out && p.hold_ttl.is_some() {
+                    return Err(Box::new(give_up_hold(store, p, entry, &last_line)));
                 }
                 if timed_out {
                     return Err(Box::new(park(store, p, entry, &last_line)));
@@ -584,6 +636,7 @@ struct TickInput<'a> {
     disk: &'a DiskCheck,
     short: bool,
     want_line: bool,
+    hold_for: Option<&'a (String, String)>,
 }
 
 /// One locked look at the queue: prune, publish our disk state, read (or reuse) the shared
@@ -612,14 +665,20 @@ fn tick(ctx: &mut Ctx, t: &TickInput) -> Result<Tick> {
                     free_ram,
                     limits,
                     caps,
+                    leases: &s.leases,
                 },
             );
             if plan.admits(entry.id) {
+                if let Some(ttl) = entry.hold_ttl_ms {
+                    // Granted in the same locked step, so the slots are never free between.
+                    let lease = grant(s, entry, ttl, now, t.hold_for);
+                    return Tick::Admitted(Admitted::Leased(lease));
+                }
                 if let Some(j) = s.jobs.iter_mut().find(|j| j.id == entry.id) {
                     j.started_ms = Some(now);
                     j.disk_short = false;
                 }
-                return Tick::Started(now);
+                return Tick::Admitted(Admitted::Started(now));
             }
             let waiting = scheduler::waiting_in_order(&s.jobs);
             let place = waiting.iter().position(|j| j.id == entry.id).unwrap_or(0);
@@ -640,6 +699,26 @@ fn tick(ctx: &mut Ctx, t: &TickInput) -> Result<Tick> {
             }
         })
         .map_err(Error::State)
+}
+
+/// Turn an admitted hold entry into a lease. Returns the new lease id.
+fn grant(s: &mut State, entry: &Job, ttl_ms: u64, now: u64, owner: Option<&(String, String)>) -> String {
+    let id = crate::lease::new_id(|id| s.leases.iter().any(|l| l.id == id));
+    s.jobs.retain(|j| j.id != entry.id);
+    s.leases.push(Lease {
+        id: id.clone(),
+        resources: entry.needs.clone(),
+        label: entry.label.clone(),
+        cost: entry.cost,
+        cwd: entry.cwd.clone(),
+        pid: entry.pid,
+        granted_ms: now,
+        until_ms: now.saturating_add(ttl_ms),
+        ttl_ms,
+        for_dir: owner.map(|o| o.0.clone()),
+        for_key: owner.map(|o| o.1.clone()),
+    });
+    id
 }
 
 /// The free-RAM reading every waiter uses: refreshed (under the lock) when older than a
@@ -688,6 +767,87 @@ fn park(store: &Store, p: &Prepared, entry: &Job, last_line: &str) -> Outcome {
     let mut out = waited(p, entry).ended(EXIT_WAIT_TIMEOUT, "wait-timeout", Some(msg));
     out.ticket = Some(entry.id);
     out
+}
+
+/// A hold not granted within `--wait-timeout`: leave the line (a hold has no ticket).
+fn give_up_hold(store: &Store, p: &Prepared, entry: &Job, last_line: &str) -> Outcome {
+    let _ = store.with_lock(|s| s.jobs.retain(|j| j.id != entry.id));
+    let secs = p.req.wait_timeout.map_or(0, |t| t.as_secs());
+    let msg = format!(
+        "calmrun: not granted within {secs}s ({}); left the line.",
+        last_line.trim_start_matches("calmrun: ")
+    );
+    waited(p, entry).ended(EXIT_WAIT_TIMEOUT, "wait-timeout", Some(msg))
+}
+
+/// What `calmrun hold` asks for.
+#[derive(Debug, Clone, Default)]
+pub struct HoldRequest {
+    /// Named resources to hold one slot of each.
+    pub resources: Vec<String>,
+    pub ttl: Duration,
+    pub label: Option<String>,
+    /// Budget points to hold as well (default 0).
+    pub cost: Option<u32>,
+    /// Give up waiting after this long (exit 75, the place is not kept); zero tries once.
+    pub wait_timeout: Option<Duration>,
+    /// A folder that owns the lease: jobs inside it use its resources.
+    pub for_dir: Option<PathBuf>,
+}
+
+/// Wait in the queue like a job with `--needs`, then record a lease instead of running
+/// anything. Returns the lease id, or the outcome when it was not granted.
+pub fn hold(
+    ctx: &mut Ctx,
+    h: HoldRequest,
+    notify: &mut dyn Notify,
+) -> std::result::Result<String, Box<Outcome>> {
+    let needs = normalized(&h.resources);
+    let bad = match needs.is_empty() {
+        true => Some(Error::InvalidResource(h.resources.join(","))),
+        false => invalid_resource(&needs),
+    };
+    if let Some(e) = bad {
+        return Err(Box::new(Outcome::default().error(&e)));
+    }
+    let label = match h.label.as_deref().map(str::trim) {
+        Some(l) if !l.is_empty() => l.to_string(),
+        _ => format!("hold {}", needs.join(",")),
+    };
+    let cost = h.cost.unwrap_or(0).min(ctx.cfg.budget.max(1));
+    let p = Prepared {
+        req: Request {
+            needs,
+            wait_timeout: h.wait_timeout,
+            ..Request::default()
+        },
+        light: None,
+        det: Detected::default(),
+        kind: "hold".into(),
+        cost,
+        label,
+        cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        hold_ttl: Some(h.ttl),
+        hold_for: h.for_dir.as_deref().map(|d| {
+            let shown = std::path::absolute(d).unwrap_or_else(|_| d.to_path_buf());
+            (shown.to_string_lossy().to_string(), crate::sys::path_key(d))
+        }),
+    };
+    let store = ctx.store().map_err(|e| Box::new(p.outcome().error(&e)))?;
+    let entry = enqueue(ctx, &store, &p, notify).map_err(|e| Box::new(p.outcome().error(&e)))?;
+    notify.queued(entry.id);
+    match wait_turn(ctx, &store, &p, &entry, notify)? {
+        Admitted::Leased(id) => Ok(id),
+        // Not reachable for a hold entry; leave the line rather than hold nothing.
+        Admitted::Started(_) => {
+            let _ = store.with_lock(|s| s.jobs.retain(|j| j.id != entry.id));
+            Err(Box::new(p.outcome().ended(
+                1,
+                "error",
+                Some("calmrun: hold was not granted".into()),
+            )))
+        }
+    }
 }
 
 fn disk_warning(disk: &DiskCheck) -> String {
@@ -927,6 +1087,10 @@ mod tests {
     fn needs_are_trimmed_sorted_unique() {
         let n = normalized(&[" db".into(), "gpu".into(), "db".into(), "".into()]);
         assert_eq!(n, vec!["db".to_string(), "gpu".to_string()]);
+        assert!(invalid_resource(&n).is_none());
+        let bad = invalid_resource(&["db".into(), "bad name!".into()]).unwrap();
+        assert_eq!(bad.exit_code(), 2);
+        assert!(bad.to_string().contains("\"bad name!\""), "{bad}");
     }
 
     #[test]

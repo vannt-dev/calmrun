@@ -3,7 +3,7 @@
 use crate::error::Result;
 use crate::queue::{locked, now_ms, Ctx};
 use crate::scheduler;
-use crate::state::{Job, State};
+use crate::state::{Job, Lease, State};
 use serde_json::{json, Value};
 
 /// A waiter older than this gets a "stuck?" warning.
@@ -46,6 +46,22 @@ fn parked_json(j: &Job, now: u64) -> Value {
     })
 }
 
+fn lease_json(l: &Lease, now: u64) -> Value {
+    json!({
+        "lease": l.id,
+        "resources": l.resources,
+        "label": l.label,
+        "cost": l.cost,
+        "pid": l.pid,
+        "cwd": l.cwd,
+        "since_ms": l.granted_ms,
+        "age_ms": now.saturating_sub(l.granted_ms),
+        "expires_in_ms": l.until_ms.saturating_sub(now),
+        "for": l.for_dir,
+        "text": crate::lease::line(l, now),
+    })
+}
+
 /// The data behind `status --json` and the MCP `queue_status` tool.
 pub fn status_json(ctx: &mut Ctx, state: &State) -> Value {
     let now = now_ms();
@@ -67,15 +83,17 @@ pub fn status_json(ctx: &mut Ctx, state: &State) -> Value {
         .filter(|j| j.parked())
         .map(|j| parked_json(j, now))
         .collect();
+    let leases: Vec<Value> = state.leases.iter().map(|l| lease_json(l, now)).collect();
     json!({
         "queue": ctx.queue,
         "budget": budget,
-        "used": scheduler::used_points(&state.jobs, budget),
+        "used": scheduler::used_points(&state.jobs, budget) + scheduler::leased_points(&state.leases, budget),
         "free_ram_bytes": ctx.sys.free_ram(),
         "min_free_bytes": ctx.cfg.min_free_bytes,
         "running": running,
         "waiting": waiting,
         "parked": parked,
+        "leases": leases,
         "warnings": crate::messages::stuck_warnings(state, now, STUCK_MS),
     })
 }

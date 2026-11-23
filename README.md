@@ -222,6 +222,8 @@ A job starts when **all** of these hold:
   configured has one slot. Use it for things that cannot be shared: one test database, one
   emulator, one GPU. Waiters say who holds it:
   `calmrun: waiting for resource "db" (1 of 1 slot(s) held by npm test), 2nd in line`.
+  A resource name uses letters, digits, `-`, `_` and `.` (not first); anything else exits 2.
+  A [lease](#leases-holding-a-resource-without-a-command) also holds a slot.
 
 Points, keys and resource slots are taken all-or-nothing.
 
@@ -253,6 +255,41 @@ calmrun: next: calmrun --ticket 17 --wait-timeout 120 -- npx vitest run
 While the owner is away, the kept place does not block anyone; when the ticket comes back it
 rejoins at its old position. An expired or unknown ticket joins the end of the line. `status`
 shows places kept by a ticket.
+
+### Leases: holding a resource without a command
+
+Some claims outlive one command: an agent that works with the emulator for an hour runs many
+short commands against it. `calmrun hold` takes slots of named resources without running
+anything, and gives them back with `calmrun release`:
+
+```sh
+lease=$(calmrun hold emulator --label "web-2" --for ~/work/web-2)   # waits like --needs, prints the id
+calmrun -- ./gradlew connectedAndroidTest   # in ~/work/web-2: uses the leased emulator
+calmrun release "$lease"
+```
+
+- `hold` waits in the normal queue until every named resource has a free slot (the same rule
+  as `--needs`), records a lease, prints its id (six hex digits) as the only line on stdout and
+  exits 0. No process stays behind.
+- A lease takes no budget points unless `--cost N` is given, so it never waits for points or
+  RAM by itself. It lapses after `--ttl SECS` (default 4 h): any calmrun that reads the queue
+  drops expired leases. `calmrun hold --renew <id> [--ttl SECS]` extends it from now (default:
+  its own ttl), and exits 1 if it is gone.
+- `--wait-timeout SECS` gives up waiting: exit 75, and unlike a job the place is not kept.
+  `--wait-timeout 0` tries once and exits 75 at once when a slot is not free.
+- A lease does not block its own holder. With `--for DIR`, jobs whose folder is `DIR` or inside
+  it use the leased resources: they neither wait for them nor take another slot (a Gradle
+  `connected*` task there, which needs the emulator by itself, just runs). A job started with
+  `CALMRUN_LEASE=<id>[,<id>…]` may use those leases' resources from any folder. Another
+  `hold` always takes slots of its own.
+- `release` exits 0 when the lease is released and also when it is already gone (a note on
+  stderr). An id of the wrong shape exits 2.
+- Jobs with `--needs emulator` wait while a lease holds the emulator's only slot. Such a job
+  never holds back the jobs behind it, however long it waits: a lease may last hours, so the
+  pass limit does not apply to a wait that only a lease causes.
+- Leases belong to a queue: `hold … --id QUEUE` and `release … --id QUEUE`. `status` lists
+  them apart from jobs (resource, label, age, expiry, owning folder); `status --json` and MCP `queue_status`
+  have them under `leases`.
 
 ### Command rules
 
@@ -326,6 +363,9 @@ calmrun [--kind K] [--cost N] [--prio normal|high] [--label L] [--needs NAME,…
 calmrun status [--json] [--id QUEUE]
 calmrun stats [--days N] [--json]
 calmrun bump <label-substring> [--id QUEUE]
+calmrun hold <resource>[,<resource>…] [--ttl SECS] [--label TEXT] [--for DIR] [--cost N] [--wait-timeout SECS] [--id QUEUE]
+calmrun hold --renew <lease> [--ttl SECS] [--id QUEUE]
+calmrun release <lease> [--id QUEUE]
 calmrun doctor
 calmrun init [--force]
 calmrun guide
@@ -360,17 +400,20 @@ calmrun mcp
 
 | Command | What it does |
 | --- | --- |
-| `status [--json]` | Running and waiting jobs with the reason each one waits, the budget, free RAM and kept tickets. `--json` (with `mem_bytes` per running job) for tools. |
+| `status [--json]` | Running and waiting jobs with the reason each one waits, the budget, free RAM, kept tickets and leases. `--json` (with `mem_bytes` per running job) for tools. |
 | `stats [--days N] [--json]` | Runs, failures, average and maximum wait, average run time per label and kind, over the last N days (default 7). |
 | `bump <text>` | Move waiting jobs whose label contains the text (case-insensitive) to the front. |
+| `hold <resource>[,…]` | Wait for a slot of each resource, record a lease, print its id and exit; `--ttl`, `--label`, `--for`, `--cost`, `--wait-timeout`, `--renew <id>`. See [Leases](#leases-holding-a-resource-without-a-command). |
+| `release <lease>` | Give a lease back (exit 0 also when it is already gone). |
 | `doctor` | Cores, RAM, disk type, battery, the state directory and config file, the settings in effect and the suggested ones. |
 | `init [--force]` | Write a commented `config.toml` with this machine's defaults and print its path; `--force` overwrites. |
 | `guide` | Short instructions for coding agents, to paste into their context. |
 | `setup` | Add or remove the calmrun block in agents' global instruction files; see [below](#calmrun-setup). |
 | `hook claude` | The Claude Code PreToolUse hook; reads the hook JSON on stdin. |
-| `mcp` | An MCP server on stdin/stdout with `run_task`, `queue_status` and `bump`. |
+| `mcp` | An MCP server on stdin/stdout with `run_task`, `task_status`, `cancel_task`, `queue_status` and `bump`. |
 
-`--id QUEUE` is accepted by every subcommand; it matters for running, `status` and `bump`.
+`--id QUEUE` is accepted by every subcommand (after the subcommand's name); it matters for
+running, `status`, `bump`, `hold` and `release`.
 
 ## Config
 
@@ -483,27 +526,46 @@ command runs unwrapped; the default deny mode does not have that gap.
 ### MCP server
 
 `calmrun mcp` is an [MCP](https://modelcontextprotocol.io) server over stdio. Agents that speak
-MCP can queue work without a shell wrapper. It offers three tools:
+MCP can queue work without a shell wrapper. It offers five tools:
 
 | Tool | Arguments | What it does |
 | --- | --- | --- |
-| `run_task` | `command`, and optionally `cwd`, `kind`, `cost`, `label`, `timeout_s`, `prio`, `wait_timeout_s`, `ticket`, `needs`, `queue` | Waits in the same queue as the CLI, runs the command at low priority and returns the exit code, wait and run time, the last 200 lines of output and the path of the full log. |
-| `queue_status` | `queue` | The same data as `calmrun status --json`. |
+| `run_task` | `command`, and optionally `cwd`, `kind`, `cost`, `label`, `timeout_s`, `prio`, `wait_timeout_s`, `ticket`, `needs`, `wait_seconds`, `queue` | Waits in the same queue as the CLI, runs the command at low priority and returns the exit code, wait and run time, the last 200 lines of output and the path of the full log. When the job has not ended within `wait_seconds` (default 25), it answers at once with a `task_id` instead (see below). |
+| `task_status` | `task_id`, optionally `output_offset`, `wait_seconds` | Where the task is: `waiting` (place in line, waiting count, points in use and budget, the waiting line), `running`, or `done` (exit code and status as `run_task` gives them); wait and run time; the output written since `output_offset` (at most the newest 32 KB) and `next_offset` for the next call. With `wait_seconds` it first waits up to that long for the end. |
+| `cancel_task` | `task_id` | A waiting task leaves the queue; a running one is stopped with its whole process tree. Answers with how it ended. A finished task is left alone. |
+| `queue_status` | `queue` | The same data as `calmrun status --json`, leases included. |
 | `bump` | `label`, `queue` | Move matching waiting jobs to the front. |
+
+**Long jobs and tool timeouts.** Agents give an MCP call a few minutes at most; a job that waits
+behind others or runs long would be cut off with its place lost. So `run_task` returns within
+`wait_seconds`: with the result when the job ended by then (as before), else with
+`{task_id, state: "waiting"|"running", place, used, budget, waiting_line, output_tail,
+next_offset, …}` while the job keeps its place and goes on inside the server. Follow it with
+`task_status` until `state` is `done`, or stop it with `cancel_task`. Short jobs still answer
+in one call. A client that has no tool timeout and wants the old blocking call passes a large
+`wait_seconds` (e.g. `86400`); `0` always returns a task id at once. Tasks live as long as the
+server process; the last 100 finished ones stay queryable.
 
 - While a task waits, the server sends progress notifications if the client passed a
   `progressToken`.
 - `timeout_s` stops the command (exit 124). `wait_timeout_s` gives up waiting (exit 75) and
   returns a `ticket`; pass it back as `ticket` to resume the same place in line.
-- Cancelling the request (`notifications/cancelled`) leaves the queue or stops the command, and,
-  as the MCP spec asks, the cancelled request gets no response.
+- Cancelling a `run_task` request (`notifications/cancelled`) while it still waits for its
+  answer leaves the queue or stops the command, and, as the MCP spec asks, the cancelled
+  request gets no response. Once it has answered with a task id, use `cancel_task`.
+- Notes for the agent travel in the result (`notes`, and first in the text): for example a
+  `ticket` that has expired, so the job joined the end of the line. A refused command names
+  the `run_task` call to make instead.
 - Full logs are kept under `logs/` in the state directory; the newest 200 are kept.
 - A `command` made of plain words runs the program directly (and gets the worker rules);
   leading `VAR=value` words become the command's environment, so `CI=1 npm test` works on
   Windows too. One that uses shell syntax (`&&`, pipes, redirects, `$VAR`, …) runs in `sh -c`
   on macOS/Linux and `cmd /d /s /c` on Windows. The output tail is in the text content and, for
   clients that show structured results, in `output_tail`.
-- `calmrun mcp` stops its running tasks on Ctrl+C / SIGTERM and when its client closes stdin.
+- `calmrun mcp` stops its tasks (waiting and running, including those that already answered
+  with a task id) on Ctrl+C / SIGTERM and when its client closes stdin. If it is killed outright,
+  the command's process tree ends with it (a Job Object on Windows, the parent-death signal on
+  Linux, a watchdog on macOS) and the next calmrun that reads the queue drops its entries.
 
 Register it with your agent:
 

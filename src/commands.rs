@@ -3,6 +3,7 @@
 use crate::cli::{Cli, Prio, ProbeArgs};
 use crate::config::{self, bytes_to_gb};
 use crate::error::Error;
+use crate::lease::{self, HoldArgs};
 use crate::queue::{self, now_ms, Ctx};
 use crate::state::{Job, State};
 use crate::{doctor, history, hook, kinds, runner, scheduler, setup, status, sys};
@@ -27,9 +28,12 @@ the same place in line (calmrun --ticket <id> -- ...). The place is kept for 10 
 
 See the queue:        calmrun status          (calmrun status --json for tools)
 Move a job forward:   calmrun bump <label>
+Hold a device/resource without running anything (prints a lease id; default 4 h):
+    calmrun hold emulator --label \"my task\"   ...   calmrun release <lease>
 Exit codes: the command's own; 75 = not started in time (place kept); 2 = refused;
 127 = command not found; 130 = Ctrl+C; 137 = stopped by the memory ceiling.
-MCP: `calmrun mcp` offers run_task / queue_status / bump to agents that speak MCP.
+MCP: `calmrun mcp` offers run_task (returns a task_id when still busy after wait_seconds),
+task_status, cancel_task, queue_status and bump to agents that speak MCP.
 ";
 
 /// Print an error the way every subcommand does and return its exit code.
@@ -153,6 +157,24 @@ fn print_jobs(state: &State, now: u64) {
     for (i, j) in waiting.iter().enumerate() {
         row(j, format!("{}{}", i + 1, if j.high { "!" } else { "" }));
     }
+    if !state.leases.is_empty() {
+        println!("leases ({}):", state.leases.len());
+        println!(
+            "  {:<6}  {:<16} {:<24} {:>7}  {:>10}  for",
+            "lease", "resources", "label", "age", "expires in"
+        );
+    }
+    for l in &state.leases {
+        println!(
+            "  {:<6}  {:<16} {:<24} {:>7}  {:>10}  {}",
+            l.id,
+            l.resources.join(","),
+            l.label,
+            history::human_ms(now.saturating_sub(l.granted_ms)),
+            history::human_ms(l.until_ms.saturating_sub(now)),
+            l.for_dir.as_deref().unwrap_or("-")
+        );
+    }
     let kept: Vec<&Job> = state.jobs.iter().filter(|j| j.parked()).collect();
     if !kept.is_empty() {
         println!("kept for a ticket ({}):", kept.len());
@@ -163,6 +185,95 @@ fn print_jobs(state: &State, now: u64) {
     for w in crate::messages::stuck_warnings(state, now, status::STUCK_MS) {
         println!("warning: {w}");
     }
+}
+
+/// `calmrun hold <resource>[,…]` and `calmrun hold --renew <lease>`.
+pub fn hold(mut ctx: Ctx, a: &HoldArgs) -> i32 {
+    let ttl = a.ttl.map(Duration::from_secs);
+    if let Some(raw) = &a.renew {
+        let Some(id) = lease::parse_id(raw) else {
+            return bad_lease_id(raw);
+        };
+        return match lease::renew(&mut ctx, &id, ttl) {
+            Ok(Some(l)) => {
+                println!("{id}");
+                eprintln!("calmrun: renewed {}", lease::line(&l, now_ms()));
+                0
+            }
+            Ok(None) => {
+                eprintln!(
+                    "calmrun: lease {id} is gone (released or expired); take a new one with `calmrun hold`"
+                );
+                1
+            }
+            Err(e) => fail(&e),
+        };
+    }
+    if let Some(d) = a.for_dir.as_ref().filter(|d| !d.is_dir()) {
+        eprintln!("calmrun: --for {}: not a folder", d.display());
+        return 2;
+    }
+    runner::install_signal_handler();
+    let req = queue::HoldRequest {
+        resources: a.resources.clone(),
+        ttl: ttl.unwrap_or(lease::DEFAULT_TTL),
+        label: a.label.clone(),
+        cost: a.cost,
+        // 0 (or less) tries once.
+        wait_timeout: a.wait_timeout.map(|t| Duration::from_secs_f64(t.clamp(0.0, 1e9))),
+        for_dir: a.for_dir.clone(),
+    };
+    let (what, for_ms) = (req.resources.join(","), req.ttl.as_millis() as u64);
+    match queue::hold(&mut ctx, req, &mut queue::StderrNotify::default()) {
+        Ok(id) => {
+            println!("{id}");
+            eprintln!(
+                "calmrun: holding {what} for {} (lease {id}); give it back with `calmrun release {id}{}`",
+                history::human_ms(for_ms),
+                queue_flag(&ctx)
+            );
+            0
+        }
+        Err(out) => {
+            if let Some(m) = &out.message {
+                eprintln!("{m}");
+            }
+            out.code
+        }
+    }
+}
+
+/// `calmrun release <lease>`.
+pub fn release(mut ctx: Ctx, raw: &str) -> i32 {
+    let Some(id) = lease::parse_id(raw) else {
+        return bad_lease_id(raw);
+    };
+    match lease::release(&mut ctx, &id) {
+        Ok(Some(l)) => {
+            eprintln!("calmrun: released {}", lease::line(&l, now_ms()));
+            0
+        }
+        Ok(None) => {
+            eprintln!("calmrun: note: lease {id} was already released or expired");
+            0
+        }
+        Err(e) => fail(&e),
+    }
+}
+
+fn bad_lease_id(raw: &str) -> i32 {
+    eprintln!(
+        "calmrun: \"{raw}\" is not a lease id ({} hex digits, as printed by `calmrun hold`)",
+        lease::ID_LEN
+    );
+    2
+}
+
+fn queue_flag(ctx: &Ctx) -> String {
+    ctx.queue
+        .as_ref()
+        .map(|q| format!(" --id {q}"))
+        .unwrap_or_default()
 }
 
 /// `calmrun bump <label>`.
