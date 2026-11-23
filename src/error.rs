@@ -37,6 +37,10 @@ pub enum Error {
     #[error("invalid queue id \"{0}\": use letters, digits, '-', '_' or '.' (not first)")]
     InvalidQueue(String),
 
+    /// A `--needs` / `hold` resource name that is not a plain name.
+    #[error("invalid resource name \"{0}\": use letters, digits, '-', '_' or '.' (not first)")]
+    InvalidResource(String),
+
     /// The OS did not provide system information (RAM, processes).
     #[error("cannot read system information: {0}")]
     SystemInfo(String),
@@ -65,7 +69,7 @@ impl Error {
         match self {
             Error::Spawn { source, .. } if source.kind() == io::ErrorKind::NotFound => 127,
             Error::Spawn { .. } => 126,
-            Error::InvalidQueue(_) => 2,
+            Error::InvalidQueue(_) | Error::InvalidResource(_) => 2,
             _ => 1,
         }
     }

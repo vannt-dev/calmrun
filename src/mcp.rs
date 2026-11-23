@@ -1,12 +1,15 @@
 //! `calmrun mcp`: an MCP server over stdio (newline-delimited JSON-RPC 2.0).
 //!
-//! Tools are entries in [`TOOLS`]: a name, a schema and a handler. `run_task` waits in the
-//! same queue as the CLI (through [`crate::queue::run`]) on its own thread, so status calls
-//! answer while a task waits. Adding a tool = one entry plus its handler.
+//! Tools are entries in [`TOOLS`]: a name, a schema and a handler. `run_task` hands its job to
+//! a background task ([`crate::tasks`]) that waits in the same queue as the CLI (through
+//! [`crate::queue::run`]); the call answers with the result when the job ends within
+//! `wait_seconds`, else with a task id for `task_status` / `cancel_task`, so agents' tool
+//! timeouts never cost the place in line. Adding a tool = one entry plus its handler.
 
 use crate::error::Error;
 use crate::queue::{self, Ctx, Notify, Request};
-use crate::{history, runner, shell, status};
+use crate::tasks::{self, Phase, Task, Tasks};
+use crate::{history, runner, scheduler, shell, status};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
@@ -26,6 +29,8 @@ const TAIL_LINES: usize = 200;
 const KEEP_LOGS: usize = 200;
 /// A progress notification is repeated at least this often while the line stays the same.
 const PROGRESS_EVERY: Duration = Duration::from_secs(10);
+/// How long `cancel_task` waits for the task to confirm it stopped.
+const CANCEL_WAIT: Duration = Duration::from_secs(15);
 /// JSON-RPC error codes.
 const PARSE_ERROR: i64 = -32700;
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -33,7 +38,10 @@ const INVALID_PARAMS: i64 = -32602;
 
 const INSTRUCTIONS: &str = "Use run_task for heavy commands (tests, type checks, linters, builds, \
 Playwright, docker compose, pytest, cargo/gradle/make/dotnet/go builds) so they wait their turn in the \
-machine-wide queue instead of overloading the computer. Use queue_status to see what is running.";
+machine-wide queue instead of overloading the computer. When the job is not done within wait_seconds \
+(default 25), run_task returns a task_id at once and the job keeps its place: follow it with \
+task_status (output_offset for new output only), stop it with cancel_task. Use queue_status to see \
+what is running.";
 
 type Out = Arc<Mutex<io::Stdout>>;
 
@@ -51,7 +59,9 @@ struct Call<'a> {
     out: &'a Out,
     args: &'a Value,
     progress_token: Option<Value>,
+    /// Set when this request is cancelled (or the server stops).
     cancel: Arc<AtomicBool>,
+    tasks: &'a Arc<Tasks>,
 }
 
 const TOOLS: &[Tool] = &[
@@ -60,6 +70,18 @@ const TOOLS: &[Tool] = &[
         schema: run_task_schema,
         background: true,
         call: run_task,
+    },
+    Tool {
+        name: "task_status",
+        schema: task_status_schema,
+        background: true,
+        call: task_status,
+    },
+    Tool {
+        name: "cancel_task",
+        schema: cancel_task_schema,
+        background: true,
+        call: cancel_task,
     },
     Tool {
         name: "queue_status",
@@ -117,8 +139,12 @@ fn run_task_schema() -> Value {
             compose, pytest, cargo/gradle/make/dotnet/go builds) through the machine-wide calmrun queue, so parallel \
             agents do not overload this computer. Waits for its turn, runs the command at low \
             priority, and returns the exit code, wait and run time, the last 200 lines of output and \
-            the path of the full log. The command runs in the platform shell (sh on macOS/Linux, cmd \
-            on Windows) when it uses shell syntax; plain words run the program directly.",
+            the path of the full log. If the job has not finished within wait_seconds (default 25), \
+            it returns at once with a task_id and state (waiting or running) while the job keeps its \
+            place and goes on in the background: call task_status with the task_id (and \
+            output_offset) until state is done, or cancel_task to stop it. The command runs in the \
+            platform shell (sh on macOS/Linux, cmd on Windows) when it uses shell syntax; plain words \
+            run the program directly.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -132,9 +158,45 @@ fn run_task_schema() -> Value {
                 "wait_timeout_s": {"type": "number", "exclusiveMinimum": 0, "description": "Give up waiting after this many seconds; the result carries a ticket that keeps the place in line for 10 minutes"},
                 "ticket": {"type": "integer", "description": "Ticket from an earlier wait timeout: resume that place in line"},
                 "needs": {"type": "array", "items": {"type": "string"}, "description": "Named resources to hold a slot of, e.g. [\"db\"]"},
+                "wait_seconds": {"type": "number", "minimum": 0, "description": "Answer with the result if the job ends within this many seconds, else with a task_id at once (default 25; 0 = always a task_id; a large value blocks until the end, as before)"},
                 "queue": {"type": "string", "description": QUEUE_PROP}
             },
             "required": ["command"]
+        }
+    })
+}
+
+fn task_status_schema() -> Value {
+    json!({
+        "name": "task_status",
+        "title": "Follow a run_task task",
+        "description": "State of a task started by run_task: waiting (with place in line and points), \
+            running, or done (with exit code and status); wait and run time; and the output written since \
+            output_offset (at most the newest 32 KB) with next_offset to pass next time. With \
+            wait_seconds it waits up to that long for the task to finish first.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "The task_id run_task returned"},
+                "output_offset": {"type": "integer", "minimum": 0, "description": "Byte offset into the output to read from (default 0; use next_offset from the last answer)"},
+                "wait_seconds": {"type": "number", "minimum": 0, "description": "Wait up to this long for the task to finish before answering (default 0)"}
+            },
+            "required": ["task_id"]
+        }
+    })
+}
+
+fn cancel_task_schema() -> Value {
+    json!({
+        "name": "cancel_task",
+        "title": "Cancel a run_task task",
+        "description": "Stop a task started by run_task: a waiting task leaves the queue, a running \
+            command is stopped with its whole process tree. Returns how it ended. A task that has \
+            already finished is left as it is.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"task_id": {"type": "string", "description": "The task_id run_task returned"}},
+            "required": ["task_id"]
         }
     })
 }
@@ -212,8 +274,8 @@ fn is_assignment(w: &str) -> bool {
 }
 
 /// Sends `notifications/progress` while a task waits, if the client gave a token.
-struct McpNotify<'a> {
-    out: &'a Out,
+struct McpNotify {
+    out: Out,
     token: Option<Value>,
     count: u64,
     last_line: String,
@@ -221,7 +283,7 @@ struct McpNotify<'a> {
     started: Instant,
 }
 
-impl McpNotify<'_> {
+impl McpNotify {
     fn progress(&mut self, message: String) {
         let Some(token) = &self.token else {
             return;
@@ -229,14 +291,14 @@ impl McpNotify<'_> {
         self.count += 1;
         let params = json!({"progressToken": token, "progress": self.count, "message": message});
         send(
-            self.out,
+            &self.out,
             &json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": params}),
         );
         self.last_sent = Some(Instant::now());
     }
 }
 
-impl Notify for McpNotify<'_> {
+impl Notify for McpNotify {
     fn wants_line(&self) -> bool {
         self.token.is_some()
     }
@@ -260,6 +322,46 @@ impl Notify for McpNotify<'_> {
     }
 }
 
+/// Records a task's progress, and forwards it as progress notifications while the
+/// `run_task` request is still open (`open`; never after its answer).
+struct TaskNotify {
+    task: Arc<Task>,
+    progress: McpNotify,
+    open: Arc<Mutex<bool>>,
+}
+
+impl TaskNotify {
+    fn forward(&mut self, f: impl FnOnce(&mut McpNotify)) {
+        if let Ok(open) = self.open.lock() {
+            if *open {
+                f(&mut self.progress);
+            }
+        }
+    }
+}
+
+impl Notify for TaskNotify {
+    fn waiting(&mut self, line: &str) {
+        self.task.set_line(line);
+        self.forward(|p| p.waiting(line));
+    }
+
+    fn queued(&mut self, id: u64) {
+        self.task.set_job(id);
+    }
+
+    fn started(&mut self, wait_ms: u64) {
+        self.task.set_started();
+        self.forward(|p| p.started(wait_ms));
+    }
+
+    /// Notes reach the agent in the tool result (and the server's stderr).
+    fn note(&mut self, line: &str) {
+        self.task.add_note(line);
+        eprintln!("{line}");
+    }
+}
+
 /// Settings for the queue named in the arguments.
 fn ctx_for(args: &Value) -> Result<Ctx, Value> {
     let queue = args
@@ -272,11 +374,14 @@ fn ctx_for(args: &Value) -> Result<Ctx, Value> {
         .map_err(|e| error_result(&e))
 }
 
+/// Longest wait or timeout taken from arguments (larger values mean "as long as it takes").
+const MAX_SECS: f64 = 30.0 * 86_400.0;
+
 fn secs(args: &Value, key: &str) -> Option<Duration> {
     args.get(key)
         .and_then(Value::as_f64)
         .filter(|t| *t > 0.0)
-        .map(Duration::from_secs_f64)
+        .map(|t| Duration::from_secs_f64(t.min(MAX_SECS)))
 }
 
 fn string(args: &Value, key: &str) -> Option<String> {
@@ -301,6 +406,7 @@ fn request_for(args: &Value, command: &str, log: PathBuf, cancel: Arc<AtomicBool
         wait_timeout: secs(args, "wait_timeout_s"),
         ticket: args.get("ticket").and_then(Value::as_u64),
         rerun_hint: Some("call run_task again with the same arguments plus \"ticket\": {ticket}".into()),
+        refused_hint: Some("call run_task with \"command\" set to: {command}".into()),
         env: line.env,
         needs: args
             .get("needs")
@@ -335,29 +441,238 @@ fn run_task(c: &Call) -> Value {
         LOG_SEQ.fetch_add(1, Ordering::SeqCst)
     );
     let log = logs.join(name);
-    let req = request_for(c.args, command, log.clone(), c.cancel.clone());
-    let mut notify = McpNotify {
-        out: c.out,
+    // Absent: the default; 0 (or less): answer with a task id at once.
+    let wait = match c.args.get("wait_seconds").and_then(Value::as_f64) {
+        Some(_) => secs(c.args, "wait_seconds").unwrap_or(Duration::ZERO),
+        None => tasks::DEFAULT_WAIT,
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let req = request_for(c.args, command, log.clone(), cancel.clone());
+    let open = Arc::new(Mutex::new(true));
+    let progress = McpNotify {
+        out: c.out.clone(),
         token: c.progress_token.clone(),
         count: 0,
         last_line: String::new(),
         last_sent: None,
         started: Instant::now(),
     };
-    let o = queue::run(&mut ctx, req, &mut notify);
-    task_result(&o, log.exists().then_some(log))
+    let forward = open.clone();
+    let task = c.tasks.start(ctx.queue.clone(), log, cancel, move |task| {
+        let mut notify = TaskNotify {
+            task,
+            progress,
+            open: forward,
+        };
+        queue::run(&mut ctx, req, &mut notify)
+    });
+    let request_cancelled = || c.cancel.load(Ordering::SeqCst);
+    if !task.wait(wait, &request_cancelled) && request_cancelled() {
+        // The request itself was cancelled (or the server stops) while it waited: stop the
+        // task, as a cancelled run_task always did.
+        task.cancel.store(true, Ordering::SeqCst);
+        task.wait(CANCEL_WAIT, &|| false);
+    }
+    // No progress for this request after its answer.
+    if let Ok(mut o) = open.lock() {
+        *o = false;
+    }
+    task_answer(&task, 0, None)
+}
+
+/// The answer about a task: its result once done, else where it is.
+fn task_answer(task: &Task, offset: u64, note: Option<&str>) -> Value {
+    let snap = task.snapshot();
+    let log = task.log.exists().then(|| task.log.clone());
+    let mut v = match &snap.outcome {
+        Some(o) if offset == 0 => task_result(o, log),
+        Some(o) => {
+            let mut v = task_result(o, log);
+            add_output(&mut v, task, offset);
+            v
+        }
+        None => pending_result(task, &snap, offset),
+    };
+    let s = &mut v["structuredContent"];
+    s["task_id"] = json!(task.id);
+    s["state"] = json!(snap.phase.name());
+    if !snap.notes.is_empty() {
+        s["notes"] = json!(snap.notes);
+    }
+    if let Some(n) = note {
+        s["note"] = json!(n);
+    }
+    // Notes go first in the text too, so an agent reading only the text sees them.
+    let lead: Vec<&str> = snap.notes.iter().map(String::as_str).chain(note).collect();
+    if let (false, Some(t)) = (lead.is_empty(), v["content"][0]["text"].as_str()) {
+        v["content"][0]["text"] = json!(format!("{}\n{t}", lead.join("\n")));
+    }
+    v
+}
+
+/// New output since `offset` in a finished task's answer (for `task_status`).
+fn add_output(v: &mut Value, task: &Task, offset: u64) {
+    let (text, next, skipped) = tasks::read_output(&task.log, offset, tasks::OUTPUT_MAX_BYTES);
+    let s = &mut v["structuredContent"];
+    s["output"] = json!(text);
+    s["next_offset"] = json!(next);
+    s["skipped_bytes"] = json!(skipped);
+}
+
+/// A task that is still waiting or running: place in line, times, and output so far.
+fn pending_result(task: &Task, snap: &tasks::Snapshot, offset: u64) -> Value {
+    let now = queue::now_ms();
+    let (output, next, skipped) = tasks::read_output(&task.log, offset, tasks::OUTPUT_MAX_BYTES);
+    let place = queue_place(task, snap.job_id);
+    let state = snap.phase.name();
+    let mut text = match snap.phase {
+        Phase::Waiting => format!(
+            "task {} is waiting for its turn ({}), waited {}",
+            task.id,
+            snap.line
+                .as_deref()
+                .unwrap_or("joining the queue")
+                .trim_start_matches("calmrun: "),
+            history::human_ms(snap.wait_ms(now))
+        ),
+        _ => format!(
+            "task {} is running (waited {}, running for {})",
+            task.id,
+            history::human_ms(snap.wait_ms(now)),
+            history::human_ms(snap.run_ms(now))
+        ),
+    };
+    text.push_str(&format!(
+        "\nIt keeps its place and goes on in the background: call task_status with \
+         {{\"task_id\": \"{}\", \"output_offset\": {next}}} to follow it, or cancel_task to stop it.\n",
+        task.id
+    ));
+    if !output.is_empty() {
+        text.push_str(&format!("--- output so far ---\n{output}"));
+    }
+    let mut structured = json!({
+        "task_id": task.id,
+        "state": state,
+        "waiting_line": snap.line,
+        "wait_ms": snap.wait_ms(now),
+        "run_ms": snap.run_ms(now),
+        "log_path": task.log.exists().then(|| task.log.to_string_lossy().to_string()),
+        "output": output,
+        "output_tail": queue::tail_lines(&task.log, TAIL_LINES),
+        "next_offset": next,
+        "skipped_bytes": skipped,
+    });
+    if let Some(p) = place {
+        for (k, v) in p.as_object().into_iter().flatten() {
+            structured[k] = v.clone();
+        }
+    }
+    text_result(text, false, Some(structured))
+}
+
+/// Place in line and points of the task's job, read from its queue.
+fn queue_place(task: &Task, job_id: Option<u64>) -> Option<Value> {
+    let id = job_id?;
+    let mut ctx = Ctx::load().and_then(|c| c.with_queue(task.queue.clone())).ok()?;
+    let s = status::snapshot(&mut ctx).ok()?;
+    let budget = ctx.cfg.budget;
+    let waiting = scheduler::waiting_in_order(&s.jobs);
+    let me = s.jobs.iter().find(|j| j.id == id)?;
+    Some(json!({
+        "job_id": id,
+        "label": me.label,
+        "kind": me.kind,
+        "cost": me.cost,
+        "place": waiting.iter().position(|j| j.id == id).map(|p| p + 1),
+        "waiting": waiting.len(),
+        "running": s.jobs.iter().filter(|j| j.running()).count(),
+        "used": scheduler::used_points(&s.jobs, budget) + scheduler::leased_points(&s.leases, budget),
+        "budget": budget,
+    }))
+}
+
+fn task_arg(c: &Call) -> Result<Arc<Task>, Value> {
+    let Some(id) = c.args.get("task_id").and_then(Value::as_str) else {
+        return Err(text_result(
+            "needs a \"task_id\" string from run_task".into(),
+            true,
+            None,
+        ));
+    };
+    c.tasks.get(id).ok_or_else(|| {
+        text_result(
+            format!(
+                "unknown task_id \"{id}\": tasks live as long as this MCP server, and only the last \
+                 100 finished ones are kept"
+            ),
+            true,
+            None,
+        )
+    })
+}
+
+fn task_status(c: &Call) -> Value {
+    let task = match task_arg(c) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if let Some(w) = secs(c.args, "wait_seconds") {
+        task.wait(w, &|| c.cancel.load(Ordering::SeqCst));
+    }
+    let offset = c.args.get("output_offset").and_then(Value::as_u64).unwrap_or(0);
+    let mut v = task_answer(&task, offset, None);
+    if task.is_done() && offset == 0 {
+        add_output(&mut v, &task, 0);
+    }
+    v
+}
+
+fn cancel_task(c: &Call) -> Value {
+    let task = match task_arg(c) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if task.is_done() {
+        return task_answer(&task, 0, Some("already finished; nothing to cancel"));
+    }
+    let was = task.snapshot().phase;
+    task.cancel.store(true, Ordering::SeqCst);
+    if !task.wait(CANCEL_WAIT, &|| c.cancel.load(Ordering::SeqCst)) {
+        return task_answer(&task, 0, Some("cancel requested; the task is still stopping"));
+    }
+    let note = match was {
+        Phase::Waiting => "cancelled while waiting: it left the queue",
+        _ => "cancelled: the command and its process tree were stopped",
+    };
+    let mut v = task_answer(&task, 0, Some(note));
+    // The cancel worked: not a tool error, even though the job's exit code is 130.
+    v["isError"] = json!(false);
+    v
+}
+
+/// `exit code 1 · npx vitest · kind test · waited 2.0s · ran 31s`; the status word only
+/// when it says more than the code, and no job details for a refusal or an error before
+/// the job was set up.
+fn summary_line(o: &queue::Outcome) -> String {
+    let mut parts = vec![if o.status == o.code.to_string() || o.status.is_empty() {
+        format!("exit code {}", o.code)
+    } else {
+        format!("exit code {} ({})", o.code, o.status)
+    }];
+    if !o.label.is_empty() {
+        parts.push(o.label.clone());
+    }
+    if !o.kind.is_empty() {
+        parts.push(format!("kind {}", o.kind));
+        parts.push(format!("waited {}", history::human_ms(o.wait_ms)));
+        parts.push(format!("ran {}", history::human_ms(o.run_ms)));
+    }
+    parts.join(" · ")
 }
 
 fn task_result(o: &queue::Outcome, log: Option<PathBuf>) -> Value {
-    let mut text = format!(
-        "exit code {} ({}) · {} · kind {} · waited {} · ran {}\n",
-        o.code,
-        o.status,
-        o.label,
-        o.kind,
-        history::human_ms(o.wait_ms),
-        history::human_ms(o.run_ms)
-    );
+    let mut text = summary_line(o);
+    text.push('\n');
     if let Some(m) = &o.message {
         text.push_str(m);
         text.push('\n');
@@ -431,6 +746,8 @@ struct Server {
     /// Background calls by request id. Taking an entry out (on cancel) also means: no reply.
     running: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     threads: Vec<JoinHandle<()>>,
+    /// Jobs started by `run_task`, which may outlive their request.
+    tasks: Arc<Tasks>,
 }
 
 impl Server {
@@ -514,6 +831,7 @@ impl Server {
                 args: &args,
                 progress_token,
                 cancel,
+                tasks: &self.tasks,
             };
             return reply(&self.out, &id, (tool.call)(&c));
         }
@@ -522,12 +840,14 @@ impl Server {
             m.insert(key.clone(), cancel.clone());
         }
         let (out, running, call) = (self.out.clone(), self.running.clone(), tool.call);
+        let tasks = self.tasks.clone();
         self.threads.push(std::thread::spawn(move || {
             let result = call(&Call {
                 out: &out,
                 args: &args,
                 progress_token,
                 cancel,
+                tasks: &tasks,
             });
             let still_wanted = running
                 .lock()
@@ -539,29 +859,33 @@ impl Server {
         }));
     }
 
-    /// The client went away: stop what still runs, then wait for it.
+    /// The client went away: stop what still runs (calls and tasks), then wait for it.
     fn shutdown(self) {
         if let Ok(m) = self.running.lock() {
             m.values().for_each(|f| f.store(true, Ordering::SeqCst));
         }
+        self.tasks.cancel_all();
         for t in self.threads {
             let _ = t.join();
         }
+        self.tasks.join_all();
     }
 }
 
 /// How long running tasks get to stop after SIGTERM/Ctrl+C before the server exits.
 const SIGNAL_GRACE: Duration = Duration::from_secs(5);
 
-/// On Ctrl+C / SIGTERM: cancel every task (their process trees are stopped like any
-/// cancelled task), give them a moment, then exit.
-fn stop_tasks_on_signal(running: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>) {
+/// On Ctrl+C / SIGTERM: cancel every call and task (their process trees are stopped like
+/// any cancelled task), give them a moment, then exit.
+fn stop_tasks_on_signal(running: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>, tasks: Arc<Tasks>) {
     let _ = ctrlc::set_handler(move || {
         if let Ok(m) = running.lock() {
             m.values().for_each(|f| f.store(true, Ordering::SeqCst));
         }
+        tasks.cancel_all();
         let deadline = Instant::now() + SIGNAL_GRACE;
-        while Instant::now() < deadline && running.lock().is_ok_and(|m| !m.is_empty()) {
+        let busy = || running.lock().is_ok_and(|m| !m.is_empty()) || !tasks.all_done();
+        while Instant::now() < deadline && busy() {
             std::thread::sleep(Duration::from_millis(100));
         }
         std::process::exit(runner::EXIT_INTERRUPTED);
@@ -574,8 +898,9 @@ pub fn serve() -> i32 {
         out: Arc::new(Mutex::new(io::stdout())),
         running: Arc::default(),
         threads: Vec::new(),
+        tasks: Arc::default(),
     };
-    stop_tasks_on_signal(server.running.clone());
+    stop_tasks_on_signal(server.running.clone(), server.tasks.clone());
     for line in io::stdin().lock().lines() {
         let Ok(line) = line else {
             break;
@@ -617,9 +942,35 @@ mod tests {
     }
 
     #[test]
+    fn summary_lines_skip_what_says_nothing() {
+        let ok = queue::Outcome {
+            code: 0,
+            status: "0".into(),
+            label: "npx vitest".into(),
+            kind: "test".into(),
+            wait_ms: 2_000,
+            run_ms: 500,
+            ..Default::default()
+        };
+        assert_eq!(
+            summary_line(&ok),
+            "exit code 0 · npx vitest · kind test · waited 2.0s · ran 0.5s"
+        );
+        let refused = queue::Outcome {
+            code: 2,
+            status: "refused".into(),
+            ..Default::default()
+        };
+        assert_eq!(summary_line(&refused), "exit code 2 (refused)");
+    }
+
+    #[test]
     fn every_tool_has_a_matching_schema() {
         let names: Vec<&str> = TOOLS.iter().map(|t| t.name).collect();
-        assert_eq!(names, vec!["run_task", "queue_status", "bump"]);
+        assert_eq!(
+            names,
+            vec!["run_task", "task_status", "cancel_task", "queue_status", "bump"]
+        );
         for t in TOOLS {
             let s = (t.schema)();
             assert_eq!(s["name"], t.name);

@@ -4,8 +4,8 @@
 //! if its own id is in the result, so the queue behaves as if one scheduler decided. The start
 //! conditions themselves are [`crate::gates`]; this module owns order and passing.
 
-use crate::state::Job;
-use std::collections::BTreeMap;
+use crate::state::{Job, Lease};
+use std::collections::{BTreeMap, HashMap};
 
 /// Queue-wide limits from the config.
 #[derive(Debug, Clone, Copy)]
@@ -31,7 +31,7 @@ pub fn recent_reservation(jobs: &[Job], now_ms: u64, limits: &Limits) -> u64 {
         .filter_map(|j| j.started_ms.map(|s| (j, now_ms.saturating_sub(s))))
         .filter(|(_, age)| *age < limits.reserve_window_ms)
         .map(|(j, age)| {
-            let full = limits.ram_per_point * effective_cost(j.cost, limits.budget) as u64;
+            let full = limits.ram_per_point * job_points(j, limits.budget) as u64;
             (full as u128 * (limits.reserve_window_ms - age) as u128 / limits.reserve_window_ms as u128)
                 as u64
         })
@@ -46,11 +46,37 @@ pub struct Inputs<'a> {
     pub limits: Limits,
     /// Slots per named resource.
     pub caps: &'a BTreeMap<String, u32>,
+    /// Resource leases (`calmrun hold`): slots and points held without a running job.
+    pub leases: &'a [Lease],
 }
 
 /// Cost as the scheduler sees it: at least 1, at most the budget.
 pub fn effective_cost(cost: u32, budget: u32) -> u32 {
     cost.clamp(1, budget.max(1))
+}
+
+/// Points a job takes: [`effective_cost`], except that a `calmrun hold` waiter may take 0
+/// (it runs nothing unless it asked for points with `--cost`).
+pub fn job_points(j: &Job, budget: u32) -> u32 {
+    if j.is_hold() {
+        j.cost.min(budget.max(1))
+    } else {
+        effective_cost(j.cost, budget)
+    }
+}
+
+/// Points held by leases.
+pub fn leased_points(leases: &[Lease], budget: u32) -> u32 {
+    leases.iter().map(|l| l.cost.min(budget.max(1))).sum()
+}
+
+/// Slots of each named resource held by leases.
+pub fn leased_slots(leases: &[Lease]) -> HashMap<&str, u32> {
+    let mut held = HashMap::new();
+    for n in leases.iter().flat_map(|l| &l.resources) {
+        *held.entry(n.as_str()).or_default() += 1;
+    }
+    held
 }
 
 /// Waiting jobs in queue order: prio high first, then `order` (first come). Parked entries
@@ -65,7 +91,7 @@ pub fn waiting_in_order(jobs: &[Job]) -> Vec<&Job> {
 pub fn used_points(jobs: &[Job], budget: u32) -> u32 {
     jobs.iter()
         .filter(|j| j.running())
-        .map(|j| effective_cost(j.cost, budget))
+        .map(|j| job_points(j, budget))
         .sum()
 }
 
@@ -119,7 +145,8 @@ impl Plan {
 
 /// Walk the waiters in order; admit each that passes every gate, taking its share of each.
 /// A later waiter may pass a blocked one only while no blocked waiter ahead of it has waited
-/// longer than the pass limit.
+/// longer than the pass limit. A waiter blocked only because leases hold every slot of a
+/// resource never stops others from passing: a lease may last hours.
 pub fn schedule(jobs: &[Job], inputs: &Inputs) -> Plan {
     schedule_with(jobs, inputs, crate::gates::standard(jobs, inputs))
 }
@@ -133,6 +160,11 @@ pub fn schedule_with<'a>(
     let mut active = jobs.iter().any(Job::running);
     let mut plan = Plan::default();
     let mut barrier = false;
+    let leased = leased_slots(inputs.leases);
+    let held_by_leases = |r: &Block| match r {
+        Block::Resource(n) => leased.get(n.as_str()).copied().unwrap_or(0) >= capacity(inputs.caps, n),
+        _ => false,
+    };
     for w in waiting_in_order(jobs) {
         let reason = if barrier {
             Some(Block::Order)
@@ -148,7 +180,7 @@ pub fn schedule_with<'a>(
             Some(r) => {
                 let waited = inputs.now_ms.saturating_sub(w.queued_ms);
                 let limit = inputs.limits.pass_limit_ms;
-                barrier |= limit == 0 || waited > limit;
+                barrier |= !held_by_leases(&r) && (limit == 0 || waited > limit);
                 plan.blocked.push((w.id, r));
             }
         }
@@ -171,6 +203,19 @@ pub fn plan_with(
     limits: Limits,
     caps: &BTreeMap<String, u32>,
 ) -> (Vec<u64>, Vec<(u64, Block)>) {
+    plan_leased(jobs, now_ms, free_ram, limits, caps, &[])
+}
+
+/// Test shorthand with named resources and leases.
+#[cfg(test)]
+pub fn plan_leased(
+    jobs: &[Job],
+    now_ms: u64,
+    free_ram: u64,
+    limits: Limits,
+    caps: &BTreeMap<String, u32>,
+    leases: &[Lease],
+) -> (Vec<u64>, Vec<(u64, Block)>) {
     let p = schedule(
         jobs,
         &Inputs {
@@ -178,6 +223,7 @@ pub fn plan_with(
             free_ram,
             limits,
             caps,
+            leases,
         },
     );
     (p.admitted, p.blocked)
@@ -221,6 +267,7 @@ mod tests {
             mem_bytes: None,
             disk_short: false,
             needs: Vec::new(),
+            hold_ttl_ms: None,
         }
     }
     fn keyed(mut j: Job, k: &str) -> Job {
@@ -378,6 +425,7 @@ mod tests {
             free_ram: 16 * GB,
             limits: LIM,
             caps: &caps,
+            leases: &[],
         };
         let mut gates = crate::gates::standard(&jobs, &inputs);
         gates.push(Box::new(EvenOnly));
@@ -425,6 +473,81 @@ mod tests {
         let jobs = vec![parked, job(2, 2, false)];
         assert_eq!(admissible(&jobs, 2_000, 16 * GB, LIM), vec![2]);
         assert_eq!(waiting_in_order(&jobs).len(), 1);
+    }
+
+    fn lease(id: &str, resources: &[&str], cost: u32) -> Lease {
+        Lease {
+            id: id.into(),
+            resources: resources.iter().map(|r| r.to_string()).collect(),
+            cost,
+            until_ms: u64::MAX,
+            ..Lease::default()
+        }
+    }
+
+    fn needing(mut j: Job, n: &str) -> Job {
+        j.needs = vec![n.to_string()];
+        j
+    }
+
+    #[test]
+    fn a_lease_holds_a_resource_slot() {
+        let caps = BTreeMap::new();
+        let jobs = vec![needing(job(1, 1, false), "emulator"), job(2, 1, false)];
+        let leases = [lease("abc123", &["emulator"], 0)];
+        let (adm, blocked) = plan_leased(&jobs, 2_000, 16 * GB, LIM, &caps, &leases);
+        assert_eq!(adm, vec![2]);
+        assert_eq!(blocked, vec![(1, Block::Resource("emulator".into()))]);
+        // With two slots the lease takes one and the job the other.
+        let caps = BTreeMap::from([("emulator".to_string(), 2)]);
+        assert_eq!(
+            plan_leased(&jobs, 2_000, 16 * GB, LIM, &caps, &leases).0,
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn a_lease_never_freezes_the_queue_behind_it() {
+        let caps = BTreeMap::new();
+        let leases = [lease("abc123", &["emulator"], 0)];
+        // The emulator waiter is far past the pass limit, and even strict order is on: the
+        // next waiter still starts, because only a lease blocks the first.
+        let jobs = vec![needing(job(1, 1, false), "emulator"), job(2, 1, false)];
+        let now = 1_000 + 5 * 3_600_000;
+        for limit in [LIM.pass_limit_ms, 0] {
+            let lim = Limits {
+                pass_limit_ms: limit,
+                ..LIM
+            };
+            assert_eq!(plan_leased(&jobs, now, 16 * GB, lim, &caps, &leases).0, vec![2]);
+        }
+        // A running job holding the slot still keeps strict order.
+        let jobs = vec![
+            needing(job(1, 1, true), "db"),
+            needing(job(2, 1, false), "db"),
+            job(3, 1, false),
+        ];
+        assert!(plan_leased(&jobs, now, 16 * GB, LIM, &caps, &leases).0.is_empty());
+    }
+
+    #[test]
+    fn holds_take_no_points_unless_asked() {
+        let mut hold = needing(job(2, 0, false), "emulator");
+        hold.hold_ttl_ms = Some(60_000);
+        // The budget is full, the hold still gets the free emulator.
+        let jobs = vec![job(1, 4, true), hold.clone()];
+        let caps = BTreeMap::new();
+        assert_eq!(plan_leased(&jobs, 2_000, 16 * GB, LIM, &caps, &[]).0, vec![2]);
+        // Not even when free RAM is short.
+        assert_eq!(plan_leased(&jobs, 2_000, GB, LIM, &caps, &[]).0, vec![2]);
+        // With --cost 1 it waits for a point like any job.
+        hold.cost = 1;
+        let jobs = vec![job(1, 4, true), hold];
+        assert!(plan_leased(&jobs, 2_000, 16 * GB, LIM, &caps, &[]).0.is_empty());
+        // A lease with points takes them from the budget.
+        let leases = [lease("abc123", &[], 3)];
+        let jobs = vec![job(1, 2, false), job(2, 1, false)];
+        assert_eq!(plan_leased(&jobs, 2_000, 16 * GB, LIM, &caps, &leases).0, vec![2]);
     }
 
     #[test]

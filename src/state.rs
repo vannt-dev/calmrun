@@ -43,6 +43,10 @@ pub struct Job {
     /// Named resources this job takes one slot of (`--needs db`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub needs: Vec<String>,
+    /// Set on a `calmrun hold` waiter: the lease's time to live. Such an entry runs nothing;
+    /// once admitted it turns into a [`Lease`] in the same locked step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_ttl_ms: Option<u64>,
 }
 
 impl Job {
@@ -55,6 +59,34 @@ impl Job {
     pub fn parked(&self) -> bool {
         self.parked_until.is_some()
     }
+
+    /// Whether this entry waits for a resource lease (`calmrun hold`) instead of a command.
+    pub fn is_hold(&self) -> bool {
+        self.hold_ttl_ms.is_some()
+    }
+}
+
+/// Resource slots held without a running command (`calmrun hold`), until released or
+/// expired. No process owns a lease: it ends with `calmrun release` or at `until_ms`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Lease {
+    /// Short hex id printed by `calmrun hold`.
+    pub id: String,
+    /// The named resources it holds one slot of each.
+    pub resources: Vec<String>,
+    pub label: String,
+    /// Budget points it holds (0 unless `--cost` was given).
+    #[serde(default)]
+    pub cost: u32,
+    pub cwd: String,
+    /// The process that asked for it (for display; the lease outlives it).
+    #[serde(default)]
+    pub pid: u32,
+    pub granted_ms: u64,
+    /// The lease lapses at this time unless renewed.
+    pub until_ms: u64,
+    /// The time to live it was granted with (the default for `--renew`).
+    pub ttl_ms: u64,
 }
 
 /// The contents of `state.json`.
@@ -67,6 +99,9 @@ pub struct State {
     /// The last free-RAM reading, shared so every waiter decides on the same number.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ram_sample: Option<RamSample>,
+    /// Resource leases (`calmrun hold`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leases: Vec<Lease>,
 }
 
 /// Free RAM as read by some calmrun at a moment.
@@ -224,15 +259,17 @@ impl Store {
     }
 }
 
-/// Drop entries whose owner is gone (pid dead or reused by a different process). A parked
-/// entry has no owner; it stays until its ticket expires.
+/// Drop entries whose owner is gone (pid dead or reused by a different process) and expired
+/// leases. A parked entry has no owner; it stays until its ticket expires. Returns how many
+/// entries and leases were dropped.
 pub fn prune(state: &mut State, now_ms: u64, alive: impl Fn(u32, u64) -> bool) -> usize {
-    let before = state.jobs.len();
+    let before = state.jobs.len() + state.leases.len();
     state.jobs.retain(|j| match j.parked_until {
         Some(until) => until > now_ms,
         None => alive(j.pid, j.pid_start),
     });
-    before - state.jobs.len()
+    state.leases.retain(|l| l.until_ms > now_ms);
+    before - state.jobs.len() - state.leases.len()
 }
 
 #[cfg(test)]
@@ -258,6 +295,7 @@ mod tests {
             mem_bytes: None,
             disk_short: false,
             needs: Vec::new(),
+            hold_ttl_ms: None,
         }
     }
 
@@ -289,6 +327,30 @@ mod tests {
                 .unwrap(),
             vec![1]
         );
+    }
+
+    #[test]
+    fn expired_leases_are_pruned_without_an_owner_check() {
+        let mut s = State::default();
+        for (id, until) in [("aaaaaa", 500), ("bbbbbb", 1_500)] {
+            s.leases.push(Lease {
+                id: id.into(),
+                until_ms: until,
+                ..Lease::default()
+            });
+        }
+        // The lease's pid is never asked about: no process owns a lease.
+        assert_eq!(prune(&mut s, 1_000, |_, _| panic!("no owner check")), 1);
+        assert_eq!(s.leases.len(), 1);
+        assert_eq!(s.leases[0].id, "bbbbbb");
+    }
+
+    #[test]
+    fn a_state_without_leases_still_reads_and_writes_the_same() {
+        let old = r#"{"next_id": 3, "jobs": []}"#;
+        let s: State = serde_json::from_str(old).unwrap();
+        assert!(s.leases.is_empty());
+        assert!(!serde_json::to_string(&s).unwrap().contains("leases"));
     }
 
     #[test]
