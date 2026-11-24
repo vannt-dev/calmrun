@@ -16,10 +16,31 @@ All notable changes to this project are documented here. The format follows
   come later. `calmrun bump --back <selector>` moves waiting jobs to the end with prio low.
 - `calmrun status` marks places with `^` (bumped) and `-` (prio low) next to `!` (high);
   `status --json` and MCP `queue_status` show `low` and `bumped` per job.
+- Working or hung? A running job's owner now adds up the CPU time of its whole process tree
+  with the memory sample (Windows, Linux, macOS). `calmrun status` shows the recent CPU use,
+  `idle 5m` once the tree has used under 2% of one core for 2 minutes, the usual run time
+  from the history (`usually 40s`, median of the newest successful runs of the label in the
+  same folder, else anywhere) and `longer than usual`. Idle is a hint only, never a stop.
+- The waiting line names these hints for the running jobs (`running: npx vitest in lane
+  (12m00s, usually 40s, idle 5m)`) and, when one looks stuck, a `calmrun: next:` line with
+  `calmrun status` and `calmrun stop <id>`. `status --json`, MCP `queue_status` and
+  `task_status` carry the same data (`cpu_pct`, `idle_ms`, `usual_ms`, `timeout_ms`, ...).
+- Run time limit: `--timeout SECS` (0 = no limit for this run), `max_run_min` in the config
+  (env `CALMRUN_MAX_RUN_MIN`) and `[kinds.<name>] max_run_min`. By default test, vitest,
+  jest, pytest, typecheck, tsc, lint and eslint jobs stop after 60 minutes; builds and the
+  other kinds have no limit. Exit 124 (history `timeout`); the message names the setting.
+- `calmrun stop <id>` / `calmrun stop --label TEXT`: the job's calmrun stops its command tree
+  (or leaves the line), prints `calmrun: stopped by calmrun stop` and exits 130 (history
+  `stopped`). An owner that does not react within `--wait` seconds (default 10), such as a
+  0.3 calmrun, is killed with its tree after a pid and start time check. CLI only, no MCP tool.
+- `calmrun status` has an `id` column for running and waiting jobs.
+- History lines carry `cwd` (the folder as a path key).
 
 ### Changed
 
 - A job resumed with `--ticket` keeps whether it was bumped or pushed back.
+- A config file with `max_run_min` is an unknown key to calmrun 0.3.x, which then ignores the
+  whole file: restart long-lived 0.3 processes (`calmrun mcp` servers) after upgrading.
 
 ### Fixed
 
@@ -28,6 +49,8 @@ All notable changes to this project are documented here. The format follows
   behind it say so: `bumped job "npx vitest" ahead (1st in line) to start`. While it waits for
   an exclusive key, a resource or disk space, others may still pass it. A 0.3.x calmrun
   waiting in the same queue does not know this rule and may still pass it.
+- Linux: the memory ceiling counted every thread of a process as a process of its own, with
+  the whole process's memory, so a multi-threaded tree looked many times bigger than it was.
 
 ## [0.3.1] - 2026-11-24
 
