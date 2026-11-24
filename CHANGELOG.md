@@ -6,6 +6,21 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-24
+
+### Added
+
+- A hook for the [Pi coding agent](https://github.com/earendil-works/pi): `calmrun hook pi`.
+  `calmrun setup --write --hook pi` writes a small Pi extension,
+  `~/.pi/agent/extensions/calmrun.js` (under `$PI_CODING_AGENT_DIR` when that is set), that asks
+  calmrun before Pi's `bash` tool (or the optional `powershell` tool on Windows) runs a command.
+  Heavy commands are blocked with the calmrun command to run instead, or changed in place with
+  `CALMRUN_HOOK_MODE=rewrite`; if calmrun cannot be asked, the command runs unchanged. The wait
+  cap is added only when the call sets a `timeout`. `--hook all` now includes Pi.
+- `calmrun setup --agents pi` adds the calmrun block to `~/.pi/agent/AGENTS.md`. Pi reads only
+  one instructions file per folder, so when that folder has a `CLAUDE.md` and no `AGENTS.md`,
+  the block goes into `CLAUDE.md`; an `AGENTS.override.md` is reported, as for Codex.
+
 ## [0.4.0] - 2026-11-24
 
 ### Added
