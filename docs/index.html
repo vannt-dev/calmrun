@@ -581,13 +581,15 @@ Do not wrap light commands (git, ls, cat, package installs).</pre>
               <th><code>calmrun [flags] -- &lt;cmd&gt;</code></th>
               <td data-i18n="cmd.run">
                 Queue the command, then run it at low priority. Flags: <code>--kind</code>, <code>--cost N</code>,
-                <code>--prio high</code>, <code>--label L</code>, <code>--needs db,gpu</code>, <code>--id QUEUE</code>,
-                <code>--wait-timeout SECS</code>, <code>--ticket ID</code>. One quoted string runs through the shell.
+                <code>--prio high|low</code>, <code>--label L</code>, <code>--needs db,gpu</code>, <code>--id QUEUE</code>,
+                <code>--wait-timeout SECS</code>, <code>--ticket ID</code>, <code>--timeout SECS</code>, <code>--log</code>. One quoted string runs through the shell.
               </td>
             </tr>
-            <tr><th><code>calmrun status</code></th><td data-i18n="cmd.status">What runs, what waits and why, the budget and free RAM. <code>--json</code> for tools.</td></tr>
+            <tr><th><code>calmrun status</code></th><td data-i18n="cmd.status">What runs, what waits and why, the budget and free RAM; for a running job its CPU, how long it has been idle, its usual time and its last output. <code>--json</code> for tools.</td></tr>
             <tr><th><code>calmrun stats</code></th><td data-i18n="cmd.stats">Runs, failures, wait and run times per label over <code>--days N</code> (default 7).</td></tr>
-            <tr><th><code>calmrun bump &lt;label&gt;</code></th><td data-i18n="cmd.bump">Move waiting jobs whose label contains the text to the front.</td></tr>
+            <tr><th><code>calmrun bump &lt;label&gt;</code></th><td data-i18n="cmd.bump">Move waiting jobs to the front, where later jobs may not pass them while they wait for room; pick them by label, <code>--pos N</code>, <code>--ticket ID</code> or <code>--dir PATH</code>. <code>--back</code> moves them to the end.</td></tr>
+            <tr><th><code>calmrun stop &lt;id&gt;</code></th><td data-i18n="cmd.stop">Stop a running or waiting job (the id column of <code>status</code>, or <code>--label</code>); a calmrun that does not react is killed.</td></tr>
+            <tr><th><code>calmrun logs &lt;id&gt;</code></th><td data-i18n="cmd.logs">The output of a job that keeps a log (MCP tasks, runs with <code>--log</code>): <code>--tail N</code>, <code>--follow</code>.</td></tr>
             <tr><th><code>calmrun doctor</code></th><td data-i18n="cmd.doctor">Cores, RAM, disk, battery, where state lives, and the suggested config.</td></tr>
             <tr><th><code>calmrun init</code></th><td data-i18n="cmd.init">Write a commented <code>config.toml</code> with this machine's defaults (<code>--force</code> overwrites).</td></tr>
             <tr><th><code>calmrun guide</code></th><td data-i18n="cmd.guide">Short instructions for coding agents.</td></tr>
@@ -603,9 +605,9 @@ Do not wrap light commands (git, ls, cat, package installs).</pre>
             <tr><th data-i18n="exit.cmd">the command's own</th><td data-i18n="exit.cmd.d">it ran (a Unix signal <code>n</code> becomes 128 + n)</td></tr>
             <tr><th>2</th><td data-i18n="exit.2">refused (watch mode, attached <code>docker compose up</code>), bad arguments or an invalid <code>--id</code></td></tr>
             <tr><th>75</th><td data-i18n="exit.75">not started within <code>--wait-timeout</code>; the place is kept, run the printed <code>calmrun: next:</code> line</td></tr>
-            <tr><th>124</th><td data-i18n="exit.124">stopped by the MCP <code>timeout_s</code></td></tr>
+            <tr><th>124</th><td data-i18n="exit.124">stopped by its run time limit: <code>--timeout</code>, MCP <code>timeout_s</code> or <code>max_run_min</code> (60 min for test-like kinds)</td></tr>
             <tr><th>126 · 127</th><td data-i18n="exit.127">the command could not be started · was not found</td></tr>
-            <tr><th>130</th><td data-i18n="exit.130">Ctrl+C</td></tr>
+            <tr><th>130</th><td data-i18n="exit.130">Ctrl+C or <code>calmrun stop</code></td></tr>
             <tr><th>137</th><td data-i18n="exit.137">stopped by the memory ceiling or the critical free-RAM floor</td></tr>
           </table>
         </div>
@@ -822,10 +824,12 @@ patterns = ["make", "bazel build"]</pre>
           'ag.guide': 'In ra hướng dẫn ngắn để dán vào ngữ cảnh của agent. Hoặc tự thêm đoạn này vào <code>CLAUDE.md</code> hay <code>AGENTS.md</code>:',
           'cmd.h2': 'Các lệnh',
           'cmd.run':
-            'Xếp lệnh vào hàng chờ rồi chạy ở mức ưu tiên thấp. Tùy chọn: <code>--kind</code>, <code>--cost N</code>, <code>--prio high</code>, <code>--label L</code>, <code>--needs db,gpu</code>, <code>--id QUEUE</code>, <code>--wait-timeout SECS</code>, <code>--ticket ID</code>. Một chuỗi trong dấu nháy sẽ chạy qua shell.',
-          'cmd.status': 'Việc nào đang chạy, việc nào đang chờ và vì sao, ngân sách điểm và RAM trống. <code>--json</code> cho công cụ.',
+            'Xếp lệnh vào hàng chờ rồi chạy ở mức ưu tiên thấp. Tùy chọn: <code>--kind</code>, <code>--cost N</code>, <code>--prio high|low</code>, <code>--label L</code>, <code>--needs db,gpu</code>, <code>--id QUEUE</code>, <code>--wait-timeout SECS</code>, <code>--ticket ID</code>, <code>--timeout SECS</code>, <code>--log</code>. Một chuỗi trong dấu nháy sẽ chạy qua shell.',
+          'cmd.status': 'Việc nào đang chạy, việc nào đang chờ và vì sao, ngân sách điểm và RAM trống; với việc đang chạy: CPU, đã đứng yên bao lâu, thời gian thường lệ và lần in ra cuối. <code>--json</code> cho công cụ.',
           'cmd.stats': 'Số lần chạy, số lần lỗi, thời gian chờ và chạy theo nhãn trong <code>--days N</code> ngày (mặc định 7).',
-          'cmd.bump': 'Đưa các việc đang chờ có nhãn chứa đoạn chữ này lên đầu hàng.',
+          'cmd.bump': 'Đưa việc đang chờ lên đầu hàng; khi nó chờ chỗ trống thì việc sau không được chen lên. Chọn theo nhãn, <code>--pos N</code>, <code>--ticket ID</code> hoặc <code>--dir PATH</code>. <code>--back</code> đẩy xuống cuối hàng.',
+          'cmd.stop': 'Dừng một việc đang chạy hoặc đang chờ (cột id của <code>status</code>, hoặc <code>--label</code>); calmrun nào không phản hồi sẽ bị kill.',
+          'cmd.logs': 'Output của việc có ghi log (task MCP, lệnh chạy với <code>--log</code>): <code>--tail N</code>, <code>--follow</code>.',
           'cmd.doctor': 'Số lõi, RAM, ổ đĩa, pin, nơi lưu trạng thái và cấu hình gợi ý.',
           'cmd.init': 'Ghi một <code>config.toml</code> có chú thích với giá trị mặc định của máy này (<code>--force</code> để ghi đè).',
           'cmd.guide': 'Hướng dẫn ngắn cho coding agent.',
@@ -838,9 +842,9 @@ patterns = ["make", "bazel build"]</pre>
           'exit.cmd.d': 'lệnh đã chạy (trên Unix, tín hiệu <code>n</code> thành 128 + n)',
           'exit.2': 'bị từ chối (chế độ watch, <code>docker compose up</code> không tách nền), tham số sai hoặc <code>--id</code> không hợp lệ',
           'exit.75': 'chưa bắt đầu trong <code>--wait-timeout</code>; chỗ trong hàng vẫn được giữ, chạy dòng <code>calmrun: next:</code> được in ra',
-          'exit.124': 'bị dừng bởi <code>timeout_s</code> của MCP',
+          'exit.124': 'bị dừng vì quá giới hạn thời gian chạy: <code>--timeout</code>, <code>timeout_s</code> của MCP hoặc <code>max_run_min</code> (60 phút cho các loại test)',
           'exit.127': 'không khởi động được lệnh · không tìm thấy lệnh',
-          'exit.130': 'Ctrl+C',
+          'exit.130': 'Ctrl+C hoặc <code>calmrun stop</code>',
           'exit.137': 'bị dừng bởi trần bộ nhớ hoặc ngưỡng RAM trống tối thiểu',
           'cfg.h2': 'Cấu hình và biến môi trường',
           'cfg.sub':
