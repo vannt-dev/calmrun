@@ -27,6 +27,7 @@ If it has not started in 120 s it exits 75 and prints the exact command that res
 the same place in line (calmrun --ticket <id> -- ...). The place is kept for 10 minutes.
 
 See the queue:        calmrun status          (calmrun status --json for tools)
+See a job's output:   calmrun logs <id> --follow   (jobs run with --log, or through MCP)
 Move a job forward:   calmrun bump <label>      (or --pos N, the # in calmrun status)
 Let others go first:  calmrun bump --back <label>, or run with --prio low
 A running job shows its CPU use, `idle 5m` when its processes have used no CPU for a while,
@@ -64,7 +65,9 @@ pub fn run_queued(mut ctx: Ctx, cli: Cli) -> i32 {
             );
         }
     }
+    let log = (cli.log || ctx.cfg.log) && !cli.no_log;
     let req = queue::Request {
+        tee: log.then(|| crate::joblog::new_log(&ctx.home)),
         rerun_hint: Some(rerun_hint(
             &runner::program_name(),
             std::env::args().skip(1).collect(),
@@ -147,7 +150,7 @@ pub fn status(mut ctx: Ctx, as_json: bool) -> i32 {
     };
     let why = |id: u64| field("waiting", id, "why");
     let hint = |id: u64| field("running", id, "hint");
-    print_jobs(&state, now_ms(), &why, &hint);
+    print_jobs(&state, now_ms(), &why, &hint, ctx.queue.as_deref());
     for w in v["warnings"].as_array().into_iter().flatten() {
         println!("warning: {}", w.as_str().unwrap_or_default());
     }
@@ -171,6 +174,7 @@ fn print_jobs(
     now: u64,
     why: &dyn Fn(u64) -> Option<String>,
     hint: &dyn Fn(u64) -> Option<String>,
+    queue: Option<&str>,
 ) {
     let header = |first: &str, time: &str| {
         println!(
@@ -201,6 +205,9 @@ fn print_jobs(
         row(j, String::new());
         if let Some(h) = hint(j.id) {
             println!("       now: {h}");
+        }
+        if let Some(l) = crate::logs::status_line(j, now, queue) {
+            println!("       {l}");
         }
     }
     println!("waiting ({}):", waiting.len());
@@ -569,6 +576,21 @@ pub fn setup(opts: setup::Options) -> i32 {
 pub fn probe(a: &ProbeArgs) -> i32 {
     /// How long the probe's daemon lives.
     const DAEMON_MS: &str = "6000";
+    if a.cat {
+        let mut input = Vec::new();
+        let _ = std::io::stdin().read_to_end(&mut input);
+        use std::io::Write;
+        let _ = std::io::stdout().write_all(&input);
+    }
+    if let Some(text) = &a.stderr {
+        eprintln!("{text}");
+    }
+    for i in 0..a.ticks {
+        if i > 0 {
+            std::thread::sleep(Duration::from_millis(a.tick_ms));
+        }
+        println!("tick {i}");
+    }
     if let Some(var) = &a.print_env {
         println!("{}", std::env::var(var).unwrap_or_default());
     }

@@ -96,6 +96,8 @@ calmrun -- cargo build --release
 calmrun --cost 3 --label e2e -- npx playwright test
 calmrun "npm ci && npm test"     # one quoted string runs through the shell
 calmrun status                   # what runs, what waits, and why
+calmrun --log -- npm test        # also keep a log of the output
+calmrun logs 3 --follow          # watch the output of job 3 (one with a log)
 calmrun stats --days 30          # how long jobs waited and ran
 calmrun bump e2e                 # move a waiting job to the front
 calmrun bump --back --pos 2      # or to the end of the line
@@ -400,13 +402,28 @@ calmrun release "$lease"
   calmrun: next: if it was still working, set [kinds.vitest] max_run_min (or max_run_min for every kind, or CALMRUN_MAX_RUN_MIN) in the config; 0 = no limit; or --timeout SECS for one run (--timeout 0 = no limit)
   ```
 
+- **Output and logs.** By default the command writes straight to your terminal and no copy is
+  kept. With `--log` (or `log = true` in the config) calmrun copies its stdout and stderr, each
+  chunk as it arrives, to the terminal and to a log file under `logs/` in the state directory
+  (shared with MCP tasks; the newest 200 are kept). stdin, the exit code and Ctrl+C work as
+  without it, and each stream keeps its order. The trade-off: the command now writes to a pipe,
+  not a terminal, so many tools turn off colours, progress bars and prompts (some take
+  `--color=always` or `FORCE_COLOR=1`), and stdout and stderr lines may interleave differently.
+  On a Windows console the copy is shown as UTF-8. A process the command leaves running (a
+  daemon) keeps the pipe open: calmrun reads on for at most 2 s after the command exits and
+  then drops that process's output, so run such commands without `--log`. While a job with a
+  log runs, `calmrun status` shows the file and when the job last printed (`last output 6m10s
+  ago`), waiting lines end with `output of npx vitest: calmrun logs 3`, and
+  `calmrun logs 3 --follow` prints its output as it comes.
+
 - **Process tree.** When the command exits normally, processes it deliberately left running (a
   Gradle or Kotlin daemon, a dev server started in the background) are left alone. When the run
   ends abnormally (Ctrl+C, or calmrun itself being killed) the whole tree is ended.
 - **History.** Each run appends one JSON line to `history.jsonl`: `at`, `label`, `kind`, `cost`,
   `wait_ms`, `run_ms`, `status` (`ceiling` or `low-memory` for memory stops, `timeout` for the
   run time limit, `stopped` for `calmrun stop`, `cancelled` for Ctrl+C while waiting), and `cwd`
-  (the folder as a path key, so usual run times are per project). A calmrun killed hard
+  (the folder as a path key, so usual run times are per project), plus `id` and `log` for a job
+  with a log (so `calmrun logs <id>` finds it afterwards). A calmrun killed hard
   (`taskkill /F`, `kill -9`) is recorded by the next calmrun that finds it gone: `killed` if its
   command was running, `abandoned` if it was still waiting. Past 4 MB the file becomes
   `history.1.jsonl`; `stats` reads both. The label is `--label` or the tool and subcommand only
@@ -428,6 +445,9 @@ line of every job behind it) says what can be measured:
   else nothing. `usually 40s`, and `longer than usual` once the job has run more than
   max(3 x usual, usual + 2 min).
 - **Limit.** The run time limit in force (`limit 60m`), see [While it runs](#while-it-runs).
+- **Output.** For a job with a log (run with `--log`, or an MCP task): its file and when it last
+  printed, on a `log:` line (`last output 6m10s ago`), and `calmrun logs <id> --follow` shows
+  what it prints. See [Output and logs](#while-it-runs).
 
 ```
 running (1):
@@ -462,8 +482,10 @@ clear other agents' jobs out of its way (`cancel_task` stops its own tasks).
 
 ```
 calmrun [--kind K] [--cost N] [--prio normal|high|low] [--label L] [--needs NAME,…] [--id QUEUE]
-        [--wait-timeout SECS] [--ticket ID] [--timeout SECS] -- <command...>
+        [--wait-timeout SECS] [--ticket ID] [--timeout SECS] [--log | --no-log]
+        -- <command...>
 calmrun status [--json] [--id QUEUE]
+calmrun logs <id> | --label TEXT [--follow] [--tail N] [--id QUEUE]
 calmrun stats [--days N] [--json]
 calmrun bump <label-substring> | --pos N | --ticket ID | --dir PATH [--back] [--id QUEUE]
 calmrun stop <id> | --label TEXT [--wait SECS] [--id QUEUE]
@@ -492,6 +514,8 @@ calmrun mcp
 | `--wait-timeout SECS` | Give up waiting after this long: exit 75, place kept for 10 minutes |
 | `--ticket ID` | Resume the place kept by an earlier `--wait-timeout` run |
 | `--timeout SECS` | Stop the command once it has run this long: exit 124. `0` = no limit for this run. Default: `max_run_min` from the config (60 min for test-like kinds, else none) |
+| `--log` | Also copy stdout and stderr to a log file that `calmrun logs` shows; the command then writes to a pipe (see [Output and logs](#while-it-runs)) |
+| `--no-log` | No log for this run, even with `log = true` in the config |
 
 - Separate words (`calmrun -- npx vitest run`) run the program directly. On Windows calmrun
   looks the name up on `PATH` with `PATHEXT`, so `npm`, `npx` and other `.cmd` shims work, and
@@ -506,7 +530,8 @@ calmrun mcp
 
 | Command | What it does |
 | --- | --- |
-| `status [--json]` | Running and waiting jobs (with their `id`) with the reason each one waits (`waits for: RAM: ...`; in JSON `why` and `why_code`: `budget`, `order`, `ram`, `disk`, `key`, `resource`, or `starting`), the queue's budget, free RAM, kept tickets and leases. Running jobs show CPU use, `idle`, their usual run time and limit (see [Working or hung?](#working-or-hung)). `--json` (with `mem_bytes`, `cpu_pct`, `idle_ms`, `usual_ms`, `timeout_ms` per running job) for tools. |
+| `status [--json]` | Running and waiting jobs (with their `id`) with the reason each one waits (`waits for: RAM: ...`; in JSON `why` and `why_code`: `budget`, `order`, `ram`, `disk`, `key`, `resource`, or `starting`), the queue's budget, free RAM, kept tickets and leases. Running jobs show CPU use, `idle`, their usual run time and limit (see [Working or hung?](#working-or-hung)). `--json` (with `mem_bytes`, `cpu_pct`, `idle_ms`, `usual_ms`, `timeout_ms` per running job) for tools. A running job with a log gets a `log:` line (in JSON `log_path`, `output_ms` and `output_ago_ms`: when it last printed). |
+| `logs <id>` | Print the last `--tail N` lines (default 50) of a job's log; `--follow` keeps printing new output until the job ends, then exits 0. `<id>` is the job's `id` in `calmrun status`; `--label TEXT` picks the job by part of its label instead and must match one job (else exit 2 with the candidates). Works for jobs run with `--log` and MCP tasks, while they run and afterwards while the file is kept; a job without a log says how to get one. Read-only. |
 | `stats [--days N] [--json]` | Runs, failures, average and maximum wait, average run time per label and kind, and waits that gave up before starting, over the last N days (default 7). |
 | `bump <text>` | Move waiting jobs whose label contains the text (case-insensitive) to the front, where later jobs may not pass them while they wait for points or RAM. Instead of the text: `--pos N`, `--ticket ID` or `--dir PATH` (exactly one). `--back` moves them to the end with prio low. See [Order and passing](#order-and-passing). |
 | `stop <id>` | Stop a running or waiting job, or `--label TEXT` (exact, one job); its calmrun exits 130. An owner that does not react within `--wait SECS` (default 10) is killed with its tree. CLI only. See [Stopping a job](#working-or-hung). |
@@ -520,7 +545,7 @@ calmrun mcp
 | `mcp` | An MCP server on stdin/stdout with `run_task`, `task_status`, `cancel_task`, `queue_status` and `bump`. |
 
 `--id QUEUE` is accepted by every subcommand, before or after its name; it matters for running,
-`status`, `bump`, `stop`, `hold` and `release`.
+`status`, `logs`, `bump`, `stop`, `hold` and `release`.
 
 ## Config
 
@@ -536,6 +561,7 @@ ceiling_gb = 8          # 0 = off
 min_free_disk_gb = 5    # 0 = off
 critical_free_gb = 0.8  # 0 = off
 max_run_min = 120       # run time limit for every kind; 0 = no limit
+log = false             # true: every run keeps a log, as with --log
 
 [resources]                      # named resources for --needs, with their slots
 db = 1
@@ -560,6 +586,7 @@ patterns = ["make", "bazel build"]
 | `ceiling_gb` | `CALMRUN_CEILING_GB` | half the RAM | Memory ceiling for one job's process tree; `0` = off |
 | `critical_free_gb` | `CALMRUN_CRITICAL_FREE_GB` | 5% of RAM, at most 1 GB | Free-RAM floor that stops the biggest job; `0` = off |
 | `max_run_min` | `CALMRUN_MAX_RUN_MIN` | 60 for test, vitest, jest, pytest, typecheck, tsc, lint, eslint; none for other kinds | Run time limit in minutes for every kind without its own; `0` = no limit (exit 124 when it passes) |
+| `log` | `CALMRUN_LOG` | false | `true` (variable `1`) gives every CLI run a log, as `--log` does; `--no-log` or `CALMRUN_LOG=0` turns it off |
 | `[resources]` | `CALMRUN_RESOURCES` | none (1 slot each) | Named resource slots, e.g. `db=1,gpu=2`; the variable adds to the table |
 | `[kinds.<name>]` | | built-in costs | `cost`, `patterns` (command's first words) and `max_run_min` (wins over the global one) |
 | | `CALMRUN_LOW_CPU` | on | `0`, `false`, `no` or `off` keeps normal priority |
@@ -583,9 +610,9 @@ restarted.
 | Linux | `$XDG_STATE_HOME/calmrun` or `~/.local/state/calmrun` |
 
 It holds `state.json` (running and waiting jobs), `state.lock`, `history.jsonl`, `config.toml`
-and `logs/` (MCP task output). Entries of processes that died are removed automatically:
-calmrun checks the pid together with the process start time, so a reused pid is not mistaken for
-a live job. A corrupt `state.json` is set aside; an unreadable one is an error.
+and `logs/` (output of MCP tasks and `--log` runs). Entries of processes that died are removed
+automatically: calmrun checks the pid together with the process start time, so a reused pid is
+not mistaken for a live job. A corrupt `state.json` is set aside; an unreadable one is an error.
 
 ## Coding agents
 
@@ -805,7 +832,9 @@ server process; the last 100 finished ones stay queryable.
 - Notes for the agent travel in the result (`notes`, and first in the text): for example a
   `ticket` that has expired, so the job joined the end of the line. A refused command names
   the `run_task` call to make instead.
-- Full logs are kept under `logs/` in the state directory; the newest 200 are kept.
+- Full logs are kept under `logs/` in the state directory; the newest 200 are kept. While a
+  task runs, `calmrun status` shows its log and when it last printed, and
+  `calmrun logs <id> --follow` prints its output from a terminal.
 - A `command` made of plain words runs the program directly (and gets the worker rules);
   leading `VAR=value` words become the command's environment, so `CI=1 npm test` works on
   Windows too. One that uses shell syntax (`&&`, pipes, redirects, `$VAR`, …) runs in `sh -c`
@@ -966,6 +995,10 @@ falls back to calmrun's absolute path in its suggestions.
 **A job waits although nothing seems to run.** `calmrun status` says why each job waits. On a
 busy machine the RAM gate is the usual reason (`waiting for RAM: … free, needs …`): lower
 `min_free_gb`, or set it to `0`. Entries of dead processes are removed automatically.
+
+**Is the job ahead working or hung?** If it runs with a log (`--log`, or an MCP task),
+`calmrun status` says when it last printed and `calmrun logs <id> --follow` shows its output.
+Run long jobs with `--log` (or `log = true`) to have that.
 
 **A job I need now is stuck behind others.** `calmrun bump <label>` (or `--pos N` from
 `calmrun status`), or run it with `--prio high`. A job that can wait: `calmrun bump --back

@@ -55,6 +55,15 @@ pub struct Cli {
     #[arg(long, value_name = "SECS")]
     pub timeout: Option<f64>,
 
+    /// Also copy the command's output to a log file (see `calmrun logs`). The command then
+    /// writes to a pipe instead of the terminal, so many tools drop colours and progress bars.
+    #[arg(long, conflicts_with = "no_log")]
+    pub log: bool,
+
+    /// Keep the terminal and write no log, even with `log = true` in the config.
+    #[arg(long)]
+    pub no_log: bool,
+
     /// The command to run. Separate words run directly; one quoted string runs in the shell.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "COMMAND")]
     pub command: Vec<String>,
@@ -164,6 +173,9 @@ pub enum Sub {
     /// Stop a running or waiting job (by its id from `calmrun status`, or --label): its
     /// calmrun stops the command tree and exits 130. An owner that does not react is killed.
     Stop(StopArgs),
+    /// Print the output of a running (or recently finished) job that has a log: one run
+    /// with --log or through MCP.
+    Logs(LogsArgs),
     /// Move waiting jobs to the front of the queue (or with --back, to the end).
     Bump(BumpArgs),
     /// Show cores, RAM, disk, battery and the suggested config.
@@ -215,6 +227,27 @@ pub enum Sub {
     CtrlC { pid: u32 },
 }
 
+/// Arguments of `calmrun logs`.
+#[derive(Debug, Clone, clap::Args)]
+pub struct LogsArgs {
+    /// The job's id, as in `calmrun status` (`id` in --json).
+    #[arg(
+        value_name = "JOB",
+        required_unless_present = "label",
+        conflicts_with = "label"
+    )]
+    pub job: Option<u64>,
+    /// Pick the job by part of its label (case-insensitive) instead; it must match one job.
+    #[arg(long, value_name = "TEXT")]
+    pub label: Option<String>,
+    /// Keep printing new output until the job ends (or Ctrl+C).
+    #[arg(long, short = 'f')]
+    pub follow: bool,
+    /// How many of the last lines to print first.
+    #[arg(long, value_name = "N", default_value_t = 50)]
+    pub tail: usize,
+}
+
 /// Agents calmrun has a hook for.
 #[derive(Debug, Subcommand)]
 pub enum HookTarget {
@@ -261,6 +294,17 @@ pub struct ProbeArgs {
     /// Print the received arguments as JSON.
     #[arg(long)]
     pub print_args: bool,
+    /// Print this text to stderr.
+    #[arg(long)]
+    pub stderr: Option<String>,
+    /// Print `tick <i>` to stdout this many times, `--tick-ms` apart.
+    #[arg(long, default_value_t = 0)]
+    pub ticks: u32,
+    #[arg(long, default_value_t = 0)]
+    pub tick_ms: u64,
+    /// Copy stdin to stdout.
+    #[arg(long)]
+    pub cat: bool,
     /// Print the value of this environment variable (empty if unset).
     #[arg(long)]
     pub print_env: Option<String>,
@@ -366,5 +410,25 @@ mod tests {
         let c = parse("calmrun --timeout 600 -- npx vitest run");
         assert_eq!(c.timeout, Some(600.0));
         assert_eq!(c.command, vec!["npx", "vitest", "run"]);
+    }
+
+    #[test]
+    fn logs_takes_a_job_or_a_label() {
+        let c = parse("calmrun --id q logs 5 --follow --tail 10");
+        let Some(Sub::Logs(a)) = c.sub else { panic!() };
+        assert_eq!(
+            (a.job, a.follow, a.tail, c.id.as_deref()),
+            (Some(5), true, 10, Some("q"))
+        );
+        let Some(Sub::Logs(a)) = parse("calmrun logs --label e2e").sub else {
+            panic!()
+        };
+        assert_eq!((a.job, a.label.as_deref(), a.tail), (None, Some("e2e"), 50));
+        let args = |l: &str| l.split(' ').map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert!(Cli::try_parse_from(args("calmrun logs")).is_err());
+        assert!(Cli::try_parse_from(args("calmrun logs 5 --label x")).is_err());
+        let c = parse("calmrun --log -- npm test");
+        assert!(c.log && c.sub.is_none());
+        assert!(Cli::try_parse_from(args("calmrun --log --no-log -- npm test")).is_err());
     }
 }

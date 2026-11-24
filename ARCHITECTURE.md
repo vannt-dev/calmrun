@@ -24,6 +24,8 @@ process evaluates the same way, admits it. Only then does it run the command.
 | `memwatch.rs` | Process-tree memory and CPU time, and the critical free-RAM floor, while a job runs. |
 | `watch.rs` | Working or hung: CPU, idle and usual-run-time hints for `status`, the waiting line and MCP (hints only, never a stop). |
 | `stop.rs` | `calmrun stop`: mark the job for its owner, wait, then kill an owner that does not react (pid + start time checked). |
+| `joblog.rs` | Job logs: their names and pruning in `logs/`, the `--log` copy of stdout and stderr to the terminal and the log (one thread per stream), and noticing new output for `output_ms`. |
+| `logs.rs` | `calmrun logs`: picks the job (id, label, or a finished run in the history), prints the tail and follows it; the log hints in `status` and waiting lines. |
 | `runner.rs` | Spawns the command: name lookup, priority, Job Object or process group, signals, exit codes. |
 | `sys.rs` | Machine facts: RAM, cores, process liveness, disks, power, path normalisation. |
 | `mcp.rs` | The MCP server: newline-delimited JSON-RPC on stdio and the tool registry. |
@@ -35,7 +37,8 @@ process evaluates the same way, admits it. Only then does it run the command.
 | `doctor.rs` | The `doctor` report. |
 | `error.rs` | The one error type. Every message says what to do next. |
 
-All code that differs per OS lives in `runner.rs` (its private `imp` module) and `sys.rs`.
+All code that differs per OS lives in `runner.rs` (its private `imp` module) and `sys.rs`;
+`joblog.rs` only decodes the `--log` copy as UTF-8 on a Windows console.
 
 ## Data flow of one run
 

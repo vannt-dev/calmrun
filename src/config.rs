@@ -38,6 +38,8 @@ pub struct FileConfig {
     pub min_free_disk_gb: Option<f64>,
     pub critical_free_gb: Option<f64>,
     pub max_run_min: Option<f64>,
+    /// Copy every CLI run's output to a log file (`--log` by default).
+    pub log: Option<bool>,
     #[serde(default)]
     pub kinds: BTreeMap<String, KindConfig>,
     /// Named resources and their slots (`[resources] db = 1`).
@@ -62,6 +64,8 @@ pub struct Config {
     /// Run time limit in minutes for every kind without its own (`None`: the built-in
     /// per-kind defaults; 0 = no limit).
     pub max_run_min: Option<f64>,
+    /// CLI runs copy their output to a log file unless `--no-log` (`log = true`).
+    pub log: bool,
     pub kinds: BTreeMap<String, KindConfig>,
     pub resources: BTreeMap<String, u32>,
 }
@@ -248,6 +252,11 @@ pub fn resolve(m: Machine, file: FileConfig, env: &dyn Fn(&str) -> Option<String
         env("CALMRUN_LOW_CPU").as_deref().map(str::trim),
         Some("0" | "false" | "no" | "off")
     );
+    let log = match env("CALMRUN_LOG").as_deref().map(str::trim) {
+        Some("1" | "true" | "yes" | "on") => true,
+        Some("0" | "false" | "no" | "off") => false,
+        _ => file.log.unwrap_or(false),
+    };
     Config {
         budget,
         min_free_bytes: (min_free_gb * GB) as u64,
@@ -258,6 +267,7 @@ pub fn resolve(m: Machine, file: FileConfig, env: &dyn Fn(&str) -> Option<String
         critical_free_bytes: (critical_gb * GB) as u64,
         min_free_disk_bytes: (disk_gb * GB) as u64,
         max_run_min,
+        log,
         kinds: file.kinds,
         resources: {
             let mut r = file.resources;
@@ -312,6 +322,11 @@ pub fn default_config_text(m: Machine) -> String {
 # 0 = no limit. Default: 60 for test, vitest, jest, pytest, typecheck, tsc, lint and eslint;
 # none for build, monorepo, docker, capture and other kinds. `--timeout SECS` sets one run.
 # max_run_min = 60
+
+# Copy the output of every `calmrun -- <cmd>` to a log file under logs/ in the state
+# directory, as --log does (env CALMRUN_LOG=1). `calmrun logs <id>` shows it. The command
+# then writes to a pipe, so many tools drop colours and progress bars; --no-log skips it.
+# log = false
 
 # Named resources and how many jobs may hold each at once (env CALMRUN_RESOURCES="db=1").
 # A job takes a slot with --needs db. A resource that is not listed has 1 slot.
@@ -392,6 +407,21 @@ mod tests {
         assert_eq!(c.pass_limit_ms, 120_000);
         assert!(!c.low_cpu);
         assert_eq!(c.kinds["vitest"].cost, Some(3));
+        assert!(!c.log, "off by default");
+    }
+
+    #[test]
+    fn log_from_file_and_env() {
+        let file: FileConfig = toml::from_str(
+            "log = true
+",
+        )
+        .unwrap();
+        assert!(resolve(m(8, 16), file.clone(), &|_| None).log);
+        let off = |k: &str| (k == "CALMRUN_LOG").then(|| "0".to_string());
+        assert!(!resolve(m(8, 16), file, &off).log, "env 0 beats the file");
+        let on = |k: &str| (k == "CALMRUN_LOG").then(|| "1".to_string());
+        assert!(resolve(m(8, 16), FileConfig::default(), &on).log);
     }
 
     #[test]

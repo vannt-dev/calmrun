@@ -37,12 +37,24 @@ All notable changes to this project are documented here. The format follows
   no MCP tool.
 - `calmrun status` has an `id` column for running and waiting jobs.
 - History lines carry `cwd` (the folder as a path key).
+- `calmrun --log -- <cmd>` copies the command's stdout and stderr to the terminal and to a log
+  file under `logs/` in the state directory (same names and retention as MCP task logs). stdin,
+  the exit code and Ctrl+C work as before. The command writes to a pipe then, so many tools
+  drop colours and progress bars; that is why it is opt-in. `log = true` in the config (or
+  `CALMRUN_LOG=1`) turns it on for every run, `--no-log` off for one.
+- `calmrun logs <id> [--follow] [--tail N]` prints the log of a running or recently finished
+  job (by the `id` column of `calmrun status`, or `--label TEXT` matching one job, else exit 2
+  with the candidates); `--follow` streams new output and exits 0 when the job ends.
+- `status` shows a running job's log and when it last printed (`last output 6m10s ago`; in
+  JSON `log_path`, `output_ms`, `output_ago_ms`), for MCP tasks too. Waiting lines name
+  `calmrun logs <id>` for a running job with a log. History lines record the job id and log.
 
 ### Changed
 
 - A job resumed with `--ticket` keeps whether it was bumped or pushed back.
-- A config file with `max_run_min` is an unknown key to calmrun 0.3.x, which then ignores the
-  whole file: restart long-lived 0.3 processes (`calmrun mcp` servers) after upgrading.
+- A config file with `max_run_min` (or `log`) is an unknown key to calmrun 0.3.x, which then
+  ignores the whole file: restart long-lived 0.3 processes (`calmrun mcp` servers) after
+  upgrading.
 
 ### Fixed
 

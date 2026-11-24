@@ -659,3 +659,44 @@ fn refusals_and_lost_tickets_speak_to_the_agent() {
     let text = r["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("invalid resource name"), "{text}");
 }
+
+#[test]
+fn a_running_task_shows_its_log_in_the_queue() {
+    let home = tempfile::tempdir().unwrap();
+    let mut c = Client::start(home.path());
+    init(&mut c);
+    let r = c.call(
+        2,
+        "run_task",
+        json!({"command": probe_cmd("--ticks 40 --tick-ms 250"), "wait_seconds": 0}),
+        None,
+    );
+    let id = structured(&r)["task_id"].as_str().unwrap().to_string();
+    // While it runs, the queue knows its log and when it last wrote to it.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let job = loop {
+        let r = c.call(3, "queue_status", json!({}), None);
+        let job = structured(&r)["running"][0].clone();
+        if job["output_ms"].as_u64().is_some() {
+            break job;
+        }
+        assert!(Instant::now() < deadline, "no output_ms: {r}");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let log = job["log_path"].as_str().unwrap();
+    assert!(Path::new(log).starts_with(home.path().join("logs")), "{job}");
+    // The CLI shows the same log.
+    let out = calmrun(home.path())
+        .args(["logs", &job["id"].to_string(), "--tail", "1"])
+        .stderr(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with("tick "),
+        "{out:?}"
+    );
+    // The finished task's log is the same file.
+    let r = c.call(4, "task_status", json!({"task_id": id, "wait_seconds": 30}), None);
+    assert_eq!(structured(&r)["log_path"], log, "{r}");
+}

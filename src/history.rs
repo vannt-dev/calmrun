@@ -24,6 +24,12 @@ pub struct Record {
     /// run time of `npx vitest` is not mixed across projects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// The job's id in its queue, so `calmrun logs <id>` finds a finished job's log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
+    /// Its log file (MCP task or `--log`), if it had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<String>,
 }
 
 /// The newest successful runs kept per label (and per label and folder) for a median.
@@ -309,6 +315,8 @@ mod tests {
                 status: st.into(),
                 queue: None,
                 cwd: None,
+                id: None,
+                log: None,
             })
             .unwrap()
         };
@@ -355,6 +363,8 @@ mod tests {
             status: "0".into(),
             queue: None,
             cwd: None,
+            id: None,
+            log: None,
         };
         for i in 0..5 {
             append_rotating(&path, &rec(&format!("r{i}")), 200).unwrap();
@@ -383,6 +393,8 @@ mod tests {
                 status: st.into(),
                 queue: None,
                 cwd: cwd.map(String::from),
+                id: None,
+                log: None,
             })
             .unwrap()
         };
