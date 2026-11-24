@@ -6,6 +6,30 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-24
+
+### Added
+
+- Resources with instances (devices): a resource in `[resources]` can list its instances,
+  e.g. `android = ["emulator-5554", "emulator-5556"]`, or find them with a table
+  (`instances`, `discover = "adb devices"`, `health = "adb -s {instance} get-state"`, `env`).
+  Each job with `--needs android` gets its own free instance in `CALMRUN_ANDROID` and in the
+  variable named by `env` (`ANDROID_SERIAL` by default for `android` and `emulator`), and
+  calmrun prints `calmrun: using android emulator-5554 (…)` when it starts. Instances that are
+  not ready (offline, unauthorized, a failing `health` check) are skipped; when none is free,
+  the job waits and says who holds them.
+- `status` shows the instance under each job (`uses: android=emulator-5554`) and in the leases
+  table; `status --json` and the MCP `run_task`, `task_status` and `queue_status` carry
+  `instances`.
+- `calmrun hold` holds one instance and names it; its jobs get that instance, and
+  `hold --print-env` prints the instance variables after `CALMRUN_LEASE=…`.
+
+### Changed
+
+- Every calmrun that shares a queue should be 0.6.0 or later once a resource has instances:
+  an older calmrun counts such a resource as one slot and drops the instance records when it
+  rewrites the queue state.
+
 ## [0.5.0] - 2026-11-24
 
 ### Added
