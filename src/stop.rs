@@ -3,7 +3,6 @@
 //! may be wedged). CLI only: an agent must not clear other agents' jobs out of its way.
 
 use crate::error::Result;
-use crate::memwatch::tree_members;
 use crate::queue::{self, locked, now_ms, Ctx, Outcome};
 use crate::state::{Job, State, Store};
 use std::time::{Duration, Instant};
@@ -14,6 +13,11 @@ const POLL: Duration = Duration::from_millis(100);
 const RENEW_EVERY: Duration = Duration::from_secs(1);
 /// Start times of the same process read twice may differ by rounding (as in `sys`).
 const START_TIME_SLACK_S: u64 = 1;
+/// How long a killed process may take to disappear.
+const KILL_WAIT: Duration = Duration::from_secs(5);
+/// How long an owner that keeps running (it owns other jobs) gets to clean up after its
+/// command was killed.
+const OWNER_CLEANUP: Duration = Duration::from_secs(5);
 
 /// Which job to stop.
 #[derive(Debug, Clone)]
@@ -30,10 +34,15 @@ pub enum Stopped {
     ByOwner,
     /// The owner did not react: it was killed with this many processes of its tree.
     Killed { processes: usize },
+    /// The owner did not react but also owns other jobs (an MCP server): only this job's
+    /// command tree was killed, this many processes; the owner lives on.
+    CommandKilled { processes: usize },
     /// The owner was already gone; the entry was removed.
     OwnerGone,
     /// A place kept for a ticket (no owner): dropped.
     Ticket,
+    /// The owner did not react and could not be ended safely: why (the entry is left).
+    NotKilled(String),
 }
 
 /// The selection failed: the text to print (exit 2).
@@ -152,8 +161,18 @@ pub fn stop(
             });
         }
     }
-    let how = kill_owner(&job);
-    // Gone either way now: take the entry out and record the stop (nobody else will).
+    let how = match kill_owner(&store, &job) {
+        Ok(h) => h,
+        Err(why) => return Ok(Ok((job, Stopped::NotKilled(why)))),
+    };
+    if matches!(how, Stopped::CommandKilled { .. }) {
+        // The owner sees its command end and leaves the queue itself, recording the run.
+        let until = Instant::now() + OWNER_CLEANUP;
+        while Instant::now() < until && store.peek().jobs.iter().any(|j| j.id == job.id) {
+            std::thread::sleep(POLL);
+        }
+    }
+    // Gone now: take the entry out and record the stop (nobody else will).
     let current = store
         .with_lock(|s| {
             let found = s.jobs.iter().find(|j| j.id == job.id).cloned();
@@ -168,51 +187,150 @@ pub fn stop(
     Ok(Ok((job, how)))
 }
 
+/// The processes below `root` (pid, start time). On Windows a process keeps the pid of its
+/// parent even after that parent died and the pid was reused, so a link only counts when the
+/// child started no earlier than its parent.
+fn descendants(sys: &System, root: u32) -> Vec<(u32, u64)> {
+    let start = |pid: u32| sys.process(Pid::from_u32(pid)).map(|p| p.start_time());
+    let mut children: std::collections::HashMap<u32, Vec<u32>> = Default::default();
+    for (pid, p) in sys.processes() {
+        if let Some(pp) = p.parent().map(Pid::as_u32).filter(|pp| *pp != pid.as_u32()) {
+            children.entry(pp).or_default().push(pid.as_u32());
+        }
+    }
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::from([root]);
+    let mut stack = vec![root];
+    while let Some(parent) = stack.pop() {
+        let Some(parent_start) = start(parent) else {
+            continue;
+        };
+        for &c in children.get(&parent).into_iter().flatten() {
+            let Some(cs) = start(c) else { continue };
+            if cs + START_TIME_SLACK_S >= parent_start && seen.insert(c) {
+                out.push((c, cs));
+                stack.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// Kill `(pid, start)` processes that still have that start time; returns how many.
+fn kill_all(sys: &System, procs: &[(u32, u64)]) -> usize {
+    procs
+        .iter()
+        .filter(|(pid, start)| {
+            sys.process(Pid::from_u32(*pid))
+                .filter(|p| p.start_time() == *start)
+                .is_some_and(|p| p.kill())
+        })
+        .count()
+}
+
+/// Whether `pid` with start time `start` is gone, waiting up to [`KILL_WAIT`].
+fn gone(sys: &mut System, pid: u32, start: u64) -> bool {
+    let until = Instant::now() + KILL_WAIT;
+    let p = Pid::from_u32(pid);
+    loop {
+        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[p]), true, ProcessRefreshKind::nothing());
+        let alive = sys.process(p).is_some_and(|pr| {
+            pr.start_time().abs_diff(start) <= START_TIME_SLACK_S
+                && !matches!(
+                    pr.status(),
+                    sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead
+                )
+        });
+        if !alive {
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
 /// End the owner of `job` and every process of its tree, after checking the pid still
-/// belongs to that owner (same start time); a reused pid is never touched.
-fn kill_owner(job: &Job) -> Stopped {
+/// belongs to that owner (same start time); a reused pid is never touched. An owner that also
+/// owns other jobs (an MCP server runs every task under one pid) is not killed: only this
+/// job's command tree is, and a waiting job of such an owner is refused. `Err` says why
+/// nothing was done (the entry is left as it is).
+fn kill_owner(store: &Store, job: &Job) -> std::result::Result<Stopped, String> {
     let Ok(mut sys) = System::new() else {
-        return Stopped::OwnerGone;
+        return Err("calmrun: cannot read the process list to stop the job's calmrun".into());
     };
     sys.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
         ProcessRefreshKind::nothing().without_tasks(),
     );
-    let same = |pid: u32, start: u64| {
+    let same = |sys: &System, pid: u32, start: u64| {
         sys.process(Pid::from_u32(pid))
             .is_some_and(|p| p.start_time().abs_diff(start) <= START_TIME_SLACK_S)
     };
-    if !same(job.pid, job.pid_start) {
-        return Stopped::OwnerGone;
+    if !same(&sys, job.pid, job.pid_start) {
+        return Ok(Stopped::OwnerGone);
     }
-    let links: Vec<(u32, Option<u32>)> = sys
-        .processes()
-        .iter()
-        .map(|(pid, p)| (pid.as_u32(), p.parent().map(Pid::as_u32)))
-        .collect();
-    // The tree before the owner goes: afterwards its children have a new parent.
-    let tree: Vec<(u32, u64)> = tree_members(&links, job.pid)
+    let others: Vec<u64> = store
+        .peek()
+        .jobs
         .into_iter()
-        .filter(|pid| *pid != job.pid)
-        .filter_map(|pid| sys.process(Pid::from_u32(pid)).map(|p| (pid, p.start_time())))
+        .chain(
+            store
+                .others()
+                .unwrap_or_default()
+                .into_iter()
+                .flat_map(|o| o.state.jobs),
+        )
+        .filter(|j| j.id != job.id || j.queued_ms != job.queued_ms)
+        .filter(|j| j.pid == job.pid && j.pid_start == job.pid_start && !j.parked())
+        .map(|j| j.id)
         .collect();
+    if !others.is_empty() {
+        let list = others.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
+        let child = job.child_pid.filter(|_| job.running());
+        let Some(child) = child else {
+            return Err(format!(
+                "calmrun: job {} did not leave the line: its calmrun (pid {}) did not react, and \
+                 it also owns jobs {list} (an MCP server?), which killing it would stop too; \
+                 cancel the task there or restart that server",
+                job.id, job.pid
+            ));
+        };
+        // Only the command, if it is still the owner's own child.
+        let child_start = sys
+            .process(Pid::from_u32(child))
+            .filter(|p| p.parent().map(Pid::as_u32) == Some(job.pid))
+            .map(|p| p.start_time())
+            .filter(|cs| cs + START_TIME_SLACK_S >= job.pid_start);
+        let Some(child_start) = child_start else {
+            return Err(format!(
+                "calmrun: job {}'s calmrun (pid {}) did not react and also owns jobs {list}; its \
+                 command (pid {child}) is no longer its child, so nothing was killed",
+                job.id, job.pid
+            ));
+        };
+        let mut tree = vec![(child, child_start)];
+        tree.extend(descendants(&sys, child));
+        return Ok(Stopped::CommandKilled {
+            processes: kill_all(&sys, &tree),
+        });
+    }
+    // The tree before the owner goes: afterwards its children have a new parent.
+    let tree = descendants(&sys, job.pid);
     // The owner first, so it cannot record the killed command as a normal end.
-    if let Some(p) = sys.process(Pid::from_u32(job.pid)) {
-        p.kill();
+    let killed = sys.process(Pid::from_u32(job.pid)).is_some_and(|p| p.kill());
+    if !killed || !gone(&mut sys, job.pid, job.pid_start) {
+        return Err(format!(
+            "calmrun: job {}'s calmrun (pid {}) did not react and could not be killed (another \
+             user's process?); the entry is left as it is",
+            job.id, job.pid
+        ));
     }
-    let mut killed = 0;
-    for (pid, start) in &tree {
-        if let Some(p) = sys
-            .process(Pid::from_u32(*pid))
-            .filter(|p| p.start_time() == *start)
-        {
-            if p.kill() {
-                killed += 1;
-            }
-        }
-    }
-    Stopped::Killed { processes: killed }
+    Ok(Stopped::Killed {
+        processes: kill_all(&sys, &tree),
+    })
 }
 
 /// The history line for a job `stop` ended itself.

@@ -32,7 +32,9 @@ All notable changes to this project are documented here. The format follows
 - `calmrun stop <id>` / `calmrun stop --label TEXT`: the job's calmrun stops its command tree
   (or leaves the line), prints `calmrun: stopped by calmrun stop` and exits 130 (history
   `stopped`). An owner that does not react within `--wait` seconds (default 10), such as a
-  0.3 calmrun, is killed with its tree after a pid and start time check. CLI only, no MCP tool.
+  0.3 calmrun, is killed with its tree after a pid and start time check; one that runs other
+  jobs too (an MCP server) keeps running and only the job's command tree is killed. CLI only,
+  no MCP tool.
 - `calmrun status` has an `id` column for running and waiting jobs.
 - History lines carry `cwd` (the folder as a path key).
 

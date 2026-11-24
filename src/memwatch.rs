@@ -349,6 +349,34 @@ mod tests {
         assert_eq!(tree_bytes(&rows, 99), 0);
     }
 
+    /// On Linux sysinfo lists threads as processes unless told not to: a tree sum would count
+    /// the process's memory once per thread.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn threads_are_not_counted_as_processes() {
+        let threads: Vec<_> = (0..6)
+            .map(|_| std::thread::spawn(|| std::thread::sleep(Duration::from_secs(3))))
+            .collect();
+        let me = std::process::id();
+        let lim = Limits {
+            ceiling: 0,
+            floor: 0,
+            min_stop: 0,
+        };
+        let mut w = MemWatch::new(lim).unwrap();
+        w.check(me, &mut |_| false);
+        let mut sys = System::new().unwrap();
+        let pid = Pid::from_u32(me);
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing().with_memory(),
+        );
+        let own = sys.process(pid).unwrap().memory();
+        assert!(w.used < own * 2, "tree {} vs process {own}", w.used);
+        threads.into_iter().for_each(|t| t.join().unwrap());
+    }
+
     #[test]
     fn cpu_total_keeps_the_time_of_exited_processes() {
         let mut t = CpuTrack::default();

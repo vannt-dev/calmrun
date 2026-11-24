@@ -398,11 +398,11 @@ pub fn stop(mut ctx: Ctx, a: &StopArgs) -> i32 {
     let what = format!("job {} ({})", job.id, job.label);
     match how {
         crate::stop::Stopped::ByOwner => eprintln!(
-            "calmrun: stopped {what}: its calmrun stopped {} and exited",
+            "calmrun: stopped {what}: its calmrun {}",
             if job.running() {
-                "the command and its process tree"
+                "stopped the command and its process tree"
             } else {
-                "waiting"
+                "took it out of the line"
             }
         ),
         crate::stop::Stopped::Killed { processes } => eprintln!(
@@ -411,6 +411,17 @@ pub fn stop(mut ctx: Ctx, a: &StopArgs) -> i32 {
             job.pid,
             wait.as_secs()
         ),
+        crate::stop::Stopped::CommandKilled { processes } => eprintln!(
+            "calmrun: stopped {what}: its calmrun (pid {}) did not react within {}s and also \
+             runs other jobs, so only the command was killed ({processes} process(es)); that \
+             calmrun keeps running",
+            job.pid,
+            wait.as_secs()
+        ),
+        crate::stop::Stopped::NotKilled(why) => {
+            eprintln!("{why}");
+            return 1;
+        }
         crate::stop::Stopped::OwnerGone => {
             eprintln!("calmrun: stopped {what}: its calmrun was already gone; removed the entry")
         }

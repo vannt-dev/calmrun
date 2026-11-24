@@ -450,8 +450,12 @@ prints `calmrun: stopped by calmrun stop` and exits **130** (history status `sto
 the owner does not react within 10 seconds (`--wait SECS`), for example a calmrun older than
 0.4 or a wedged process, `stop` kills the owner and its process tree itself, after checking
 that the pid still belongs to that owner (same start time, as the cleanup of dead entries
-does), removes the entry and says which way it went. A place kept for a ticket is just
-dropped. `stop` is a CLI command only: the MCP server has no such tool, so an agent cannot
+does), removes the entry and says which way it went. A child process only counts as part of
+the tree when it started after its parent (Windows keeps a dead parent's pid, which may be
+reused). An owner that also runs other jobs (an MCP server runs every task under its own
+pid) is never killed: for a running job only its command tree is, and a waiting job of such
+an owner is refused with exit 1. An owner that cannot be killed leaves the entry as it is
+(exit 1). A place kept for a ticket is just dropped. `stop` is a CLI command only: the MCP server has no such tool, so an agent cannot
 clear other agents' jobs out of its way (`cancel_task` stops its own tasks).
 
 ## Commands

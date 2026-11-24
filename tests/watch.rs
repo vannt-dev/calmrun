@@ -201,13 +201,11 @@ fn stop_needs_a_label_that_names_one_job() {
     assert_eq!(finish(b, Duration::from_secs(30)).0, 0);
 }
 
-#[test]
-fn stop_kills_an_owner_that_does_not_react() {
-    let home = tempfile::tempdir().unwrap();
-    let pidfile = home.path().join("daemon.pid");
-    // A fake owner: a process that never reads the state (like a calmrun older than 0.4),
-    // with a child of its own.
-    let mut fake = Command::new(EXE)
+/// A fake owner: a process that never reads the state (like a calmrun older than 0.4), with
+/// a child of its own. Returns it, the child's pid and its own start time.
+fn fake_owner(home: &Path) -> (Child, u32, u64) {
+    let pidfile = home.join("daemon.pid");
+    let fake = Command::new(EXE)
         .args(["__probe", "--sleep-ms", "30000", "--spawn-daemon"])
         .arg(&pidfile)
         .stdin(Stdio::null())
@@ -230,6 +228,13 @@ fn stop_kills_an_owner_that_does_not_react() {
     let pid = sysinfo::Pid::from_u32(fake.id());
     sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
     let start = sys.process(pid).unwrap().start_time();
+    (fake, daemon, start)
+}
+
+#[test]
+fn stop_kills_an_owner_that_does_not_react() {
+    let home = tempfile::tempdir().unwrap();
+    let (mut fake, daemon, start) = fake_owner(home.path());
     let now = now_ms();
     let state = serde_json::json!({
         "next_id": 7,
@@ -349,4 +354,66 @@ fn a_busy_job_shows_its_cpu_and_the_usual_run_time() {
         "{err}"
     );
     assert_eq!(finish(busy, Duration::from_secs(30)).0, 0);
+}
+
+#[test]
+fn stop_never_kills_an_owner_that_runs_other_jobs_too() {
+    let home = tempfile::tempdir().unwrap();
+    // One fake owner with two entries, like an MCP server running two tasks.
+    let (mut fake, daemon, start) = fake_owner(home.path());
+    let now = now_ms();
+    let entry = |id: u64, running: bool| {
+        serde_json::json!({
+            "id": id, "pid": fake.id(), "pid_start": start, "label": format!("task {id}"),
+            "kind": "test", "cost": 1, "keys": [], "cwd": home.path(), "high": false,
+            "order": id, "queued_ms": now,
+            "started_ms": if running { Some(now) } else { None },
+            "child_pid": if running { Some(daemon) } else { None }
+        })
+    };
+    let state = serde_json::json!({"next_id": 8, "jobs": [entry(7, true), entry(8, false)]});
+    std::fs::write(home.path().join("state.json"), state.to_string()).unwrap();
+    // The waiting one cannot be stopped without killing the owner: refused, entry kept.
+    let out = run(home.path(), &["stop", "8", "--wait", "1"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("also owns jobs 7"), "{}", stderr(&out));
+    assert_eq!(len(&status(home.path())["waiting"]), 1);
+    // The running one: only its command goes; the owner lives on.
+    let out = run(home.path(), &["stop", "7", "--wait", "1"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("only the command was killed (1 process(es))"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!alive(daemon), "the command survived");
+    assert!(alive(fake.id()), "the shared owner was killed");
+    let s = status(home.path());
+    assert_eq!((len(&s["running"]), len(&s["waiting"])), (0, 1), "{s}");
+    let _ = fake.kill();
+    let _ = fake.wait();
+}
+
+#[test]
+fn the_usual_run_time_is_per_folder() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Three runs here are enough (five would be needed across folders).
+    for _ in 0..3 {
+        let c = calmrun(home.path())
+            .current_dir(&dir)
+            .args(["--label", "quick", "--", EXE, "__probe", "--sleep-ms", "10"])
+            .status()
+            .unwrap();
+        assert!(c.success());
+    }
+    let c = calmrun(home.path())
+        .current_dir(&dir)
+        .args(["--label", "quick", "--", EXE, "__probe", "--sleep-ms", "4000"])
+        .spawn()
+        .unwrap();
+    let s = wait_for(home.path(), "running", |s| len(&s["running"]) == 1);
+    assert!(s["running"][0]["usual_ms"].as_u64().is_some(), "{s}");
+    assert_eq!(finish(c, Duration::from_secs(20)).0, 0);
 }

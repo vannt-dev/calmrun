@@ -84,7 +84,7 @@ impl LimitFrom {
     pub fn how_to_change(&self) -> String {
         let one_run = "--timeout SECS for one run (--timeout 0 = no limit)";
         match self {
-            LimitFrom::Asked => format!("pass a larger {one_run}"),
+            LimitFrom::Asked => format!("pass a larger {one_run}, or a larger timeout_s (MCP run_task)"),
             LimitFrom::Kind(k) => format!("raise [kinds.{k}] max_run_min in the config, or {one_run}"),
             LimitFrom::Global => {
                 format!("raise max_run_min in the config (or CALMRUN_MAX_RUN_MIN), or {one_run}")
