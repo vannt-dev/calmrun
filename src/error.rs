@@ -50,8 +50,8 @@ pub enum Error {
         "this calmrun runs inside a sandbox (a Windows AppContainer, such as Antigravity's \
          terminal sandbox) that hides the other processes and the shared state folder, so it \
          cannot take part in the queue\n\
-         calmrun: next: let the agent run calmrun outside its sandbox (Antigravity: a \
-         `command(regex:...calmrun...)` allow rule, see the README), or run the command \
+         calmrun: next: run the agent without its terminal sandbox (Antigravity: a mode \
+         other than auto, such as `--mode accept-edits`, see the README), or run the command \
          without calmrun"
     )]
     Sandboxed,

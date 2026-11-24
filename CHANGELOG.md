@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- The one-line MCP result summary uses plain ASCII separators (`exit code 0, npx vitest, kind test,
+  ...`) like the CLI messages, so it shows correctly in terminals without UTF-8.
+- Antigravity: the sandbox refusal and the README no longer suggest a `command(...)` allow rule,
+  which only skips the prompt and keeps the command inside the sandbox. They point to a mode
+  other than `auto` (such as `--mode accept-edits`), tested with agy 1.5.15 on Windows.
+
 ## [0.3.0] - 2026-11-23
 
 ### Added

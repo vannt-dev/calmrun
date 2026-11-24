@@ -637,7 +637,7 @@ fn refusals_and_lost_tickets_speak_to_the_agent() {
     let text = r["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("joining the end of the line"), "{text}");
     // A plain success shows no status word that only repeats the code.
-    assert!(text.contains("exit code 0 · "), "{text}");
+    assert!(text.contains("exit code 0, "), "{text}");
     assert!(!text.contains("exit code 0 (0)"), "{text}");
     // Resource names are plain names.
     let r = c.call(
