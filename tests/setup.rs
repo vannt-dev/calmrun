@@ -9,6 +9,7 @@ fn setup(home: &Path, args: &[&str]) -> (i32, String) {
     let mut c = Command::new(EXE);
     c.env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("CODEX_HOME")
+        .env_remove("PI_CODING_AGENT_DIR")
         .env("CALMRUN_HOME", home.join("calmrun state"))
         .arg("setup")
         .arg("--home")
@@ -202,6 +203,51 @@ fn opencode_plugin_is_written_and_only_its_own_file_replaced() {
     assert_eq!(
         std::fs::read_to_string(&plugin).unwrap(),
         "export const Mine = 1;
+"
+    );
+}
+
+#[test]
+fn pi_gets_the_block_and_its_extension() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join(".pi/agent");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Pi reads CLAUDE.md here when there is no AGENTS.md: the block goes there.
+    std::fs::write(
+        dir.join("CLAUDE.md"),
+        "# Mine
+",
+    )
+    .unwrap();
+    let args = ["--write", "--hook", "pi", "--agents", "pi"];
+    let (code, out) = setup(home.path(), &args);
+    assert_eq!(code, 0, "{out}");
+    assert!(!dir.join("AGENTS.md").exists(), "{out}");
+    let md = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
+    assert!(
+        md.starts_with(
+            "# Mine
+
+<!-- calmrun:start"
+        ),
+        "{md}"
+    );
+    let ext = dir.join("extensions/calmrun.js");
+    let text = std::fs::read_to_string(&ext).unwrap();
+    assert!(text.starts_with("// calmrun:extension"), "{text}");
+    assert!(text.contains(" hook pi"), "{text}");
+    assert!(out.contains("write the Pi extension"), "{out}");
+    let (_, out) = setup(home.path(), &args);
+    assert!(out.contains("calmrun.js: unchanged"), "{out}");
+    let (code, _) = setup(
+        home.path(),
+        &["--write", "--remove", "--hook", "pi", "--agents", "pi"],
+    );
+    assert_eq!(code, 0);
+    assert!(!ext.exists());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap(),
+        "# Mine
 "
     );
 }

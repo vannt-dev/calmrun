@@ -3,7 +3,7 @@
 //! One decision for every agent ([`plan`]): which parts of a shell command are heavy, the
 //! command with each of them wrapped in `calmrun --`, and a `--wait-timeout` below the tool's
 //! own time limit. Each agent has a thin adapter that reads its tool call and writes its answer:
-//! Claude Code here ([`handle`]), Codex, Antigravity and OpenCode in the child modules.
+//! Claude Code here ([`handle`]), Codex, Antigravity, OpenCode and Pi in the child modules.
 //!
 //! Claude Code contract (https://code.claude.com/docs/en/hooks): the hook reads JSON with
 //! `tool_name` and `tool_input` on stdin. To block a call it prints
@@ -14,6 +14,7 @@
 pub mod antigravity;
 pub mod codex;
 pub mod opencode;
+pub mod pi;
 
 use crate::config::KindConfig;
 use crate::detect::{detect_words, disposition, parse, tool_name, Disposition};
@@ -36,6 +37,7 @@ pub enum Agent {
     Codex,
     Antigravity,
     OpenCode,
+    Pi,
 }
 
 /// What every adapter needs besides the agent's input.
@@ -71,6 +73,7 @@ pub fn run(agent: Agent, input: &str, o: &Opts) -> Option<String> {
         Agent::Codex => codex::handle(input, o),
         Agent::Antigravity => antigravity::handle(input, o),
         Agent::OpenCode => opencode::handle(input, o),
+        Agent::Pi => pi::handle(input, o),
     }
 }
 

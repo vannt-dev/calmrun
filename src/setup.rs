@@ -41,6 +41,9 @@ pub struct AgentSpec {
     pub file: &'static str,
     /// Another file in the folder that the agent reads instead, when it exists.
     pub shadowed_by: Option<&'static str>,
+    /// Files the agent reads in place of `file` when `file` is missing (it reads only one):
+    /// the block goes into the first that exists, so a new `file` never hides it.
+    pub fallbacks: &'static [&'static str],
 }
 
 /// Agents `setup` knows, with paths taken from each agent's documentation.
@@ -51,6 +54,7 @@ pub const AGENTS: &[AgentSpec] = &[
         home_dir: &[".claude"],
         file: "CLAUDE.md",
         shadowed_by: None,
+        fallbacks: &[],
     },
     AgentSpec {
         name: "codex",
@@ -58,6 +62,7 @@ pub const AGENTS: &[AgentSpec] = &[
         home_dir: &[".codex"],
         file: "AGENTS.md",
         shadowed_by: Some("AGENTS.override.md"),
+        fallbacks: &[],
     },
     AgentSpec {
         name: "gemini",
@@ -65,6 +70,7 @@ pub const AGENTS: &[AgentSpec] = &[
         home_dir: &[".gemini"],
         file: "GEMINI.md",
         shadowed_by: None,
+        fallbacks: &[],
     },
     AgentSpec {
         name: "opencode",
@@ -72,6 +78,15 @@ pub const AGENTS: &[AgentSpec] = &[
         home_dir: &[".config", "opencode"],
         file: "AGENTS.md",
         shadowed_by: None,
+        fallbacks: &[],
+    },
+    AgentSpec {
+        name: "pi",
+        env_dir: Some("PI_CODING_AGENT_DIR"),
+        home_dir: &[".pi", "agent"],
+        file: "AGENTS.md",
+        shadowed_by: Some("AGENTS.override.md"),
+        fallbacks: &["AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"],
     },
 ];
 
@@ -100,9 +115,19 @@ pub fn agents(home: &Path, env: &dyn Fn(&str) -> Option<String>) -> Vec<Agent> {
                         .iter()
                         .fold(home.to_path_buf(), |p, part| p.join(part))
                 });
+            let main = dir.join(spec.file);
+            let file = if main.is_file() {
+                main
+            } else {
+                spec.fallbacks
+                    .iter()
+                    .map(|f| dir.join(f))
+                    .find(|p| p.is_file())
+                    .unwrap_or(main)
+            };
             Agent {
                 name: spec.name,
-                file: dir.join(spec.file),
+                file,
                 dir,
                 shadowed_by: spec.shadowed_by,
             }
@@ -206,7 +231,7 @@ pub fn run(opts: &Options, env: &dyn Fn(&str) -> Option<String>) -> (String, i32
     let mut r = Report::default();
     if chosen.is_empty() {
         r.fail(
-            "calmrun: no agent folders found; name them with --agents claude,codex,gemini,opencode".into(),
+            "calmrun: no agent folders found; name them with --agents claude,codex,gemini,opencode,pi".into(),
         );
         return (r.text, r.code);
     }
@@ -362,5 +387,32 @@ mod tests {
         assert_eq!(a[1].file, Path::new("/c/AGENTS.md"));
         assert_eq!(a[2].file, Path::new("/h/.gemini/GEMINI.md"));
         assert_eq!(a[3].file, Path::new("/h/.config/opencode/AGENTS.md"));
+        assert_eq!(a[4].file, Path::new("/h/.pi/agent/AGENTS.md"));
+        let env = |k: &str| (k == "PI_CODING_AGENT_DIR").then(|| "/p".to_string());
+        assert_eq!(agents(home, &env)[4].file, Path::new("/p/AGENTS.md"));
+    }
+
+    #[test]
+    fn pi_keeps_a_claude_md_it_reads_instead() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".pi/agent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let pi = |h: &Path| agents(h, &|_| None).into_iter().find(|a| a.name == "pi").unwrap();
+        assert_eq!(pi(home.path()).file, dir.join("AGENTS.md"));
+        // Pi reads only the first of AGENTS.md and CLAUDE.md: a new AGENTS.md would hide it.
+        std::fs::write(
+            dir.join("CLAUDE.md"),
+            "mine
+",
+        )
+        .unwrap();
+        assert_eq!(pi(home.path()).file, dir.join("CLAUDE.md"));
+        std::fs::write(
+            dir.join("AGENTS.md"),
+            "mine
+",
+        )
+        .unwrap();
+        assert_eq!(pi(home.path()).file, dir.join("AGENTS.md"));
     }
 }
