@@ -106,11 +106,21 @@ pub fn leased_slots(leases: &[Lease]) -> HashMap<&str, u32> {
     held
 }
 
-/// Waiting jobs in queue order: prio high first, then `order` (first come). Parked entries
-/// (owner gone, place kept for a ticket) are not waiting.
+/// Priority tier: high (0), normal (1), low (2). `high` wins if both flags are set.
+pub fn tier(j: &Job) -> u8 {
+    match (j.high, j.low) {
+        (true, _) => 0,
+        (false, false) => 1,
+        (false, true) => 2,
+    }
+}
+
+/// Waiting jobs in queue order: prio high first, then normal, then low; within a tier by
+/// `order` (first come, or moved by `bump`). Parked entries (owner gone, place kept for a
+/// ticket) are not waiting.
 pub fn waiting_in_order(jobs: &[Job]) -> Vec<&Job> {
     let mut w: Vec<&Job> = jobs.iter().filter(|j| !j.running() && !j.parked()).collect();
-    w.sort_by_key(|j| (!j.high, j.order, j.id));
+    w.sort_by_key(|j| (tier(j), j.order, j.id));
     w
 }
 
@@ -152,6 +162,11 @@ pub enum Block {
     Resource(String),
     /// Kept in line behind a waiter that may no longer be passed.
     Order,
+    /// Kept in line behind this waiter moved to the front by `calmrun bump`, which waits for
+    /// points or RAM: passing it would delay it.
+    Bumped {
+        id: u64,
+    },
 }
 
 /// The outcome of one scheduling pass.
@@ -181,7 +196,10 @@ impl Plan {
 /// Walk the waiters in order; admit each that passes every gate, taking its share of each.
 /// A later waiter may pass a blocked one only while no blocked waiter ahead of it has waited
 /// longer than the pass limit. A waiter that needs a resource whose every slot is leased
-/// never stops others from passing: a lease may last hours.
+/// never stops others from passing: a lease may last hours. A bumped waiter is never passed
+/// while it waits only for points or RAM (what a passing job would take); one that waits for
+/// an exclusive key, a resource slot or disk space may be passed, since that can last long and
+/// passing does not delay it.
 pub fn schedule(jobs: &[Job], inputs: &Inputs) -> Plan {
     schedule_with(jobs, inputs, crate::gates::standard(jobs, inputs))
 }
@@ -194,7 +212,8 @@ pub fn schedule_with<'a>(
 ) -> Plan {
     let mut active = jobs.iter().any(Job::running) || !inputs.foreign.is_empty();
     let mut plan = Plan::default();
-    let mut barrier = false;
+    // Set by the first blocked waiter that may not be passed; every later waiter waits too.
+    let mut barrier: Option<Block> = None;
     let leased = leased_slots(inputs.leases);
     // A waiter that needs a resource whose every slot is leased may wait hours, whatever
     // gate reports first; it never holds the others back.
@@ -205,10 +224,9 @@ pub fn schedule_with<'a>(
         })
     };
     for w in waiting_in_order(jobs) {
-        let reason = if barrier {
-            Some(Block::Order)
-        } else {
-            gates.iter().find_map(|g| g.blocks(w, active))
+        let reason = match &barrier {
+            Some(b) => Some(b.clone()),
+            None => gates.iter().find_map(|g| g.blocks(w, active)),
         };
         match reason {
             None => {
@@ -217,14 +235,30 @@ pub fn schedule_with<'a>(
                 plan.admitted.push(w.id);
             }
             Some(r) => {
-                let waited = inputs.now_ms.saturating_sub(w.queued_ms);
-                let limit = inputs.limits.pass_limit_ms;
-                barrier |= !leased_out(w) && (limit == 0 || waited > limit);
+                if barrier.is_none() {
+                    let waited = inputs.now_ms.saturating_sub(w.queued_ms);
+                    let limit = inputs.limits.pass_limit_ms;
+                    if !leased_out(w) && (limit == 0 || waited > limit) {
+                        barrier = Some(Block::Order);
+                    } else if w.bumped && waits_only_for_room(&gates, w, active) {
+                        barrier = Some(Block::Bumped { id: w.id });
+                    }
+                }
                 plan.blocked.push((w.id, r));
             }
         }
     }
     plan
+}
+
+/// Whether every gate that blocks `w` is about room (points or RAM) that a job passing it
+/// would take. The first gate to block is not enough: points are checked first, and a job
+/// short of points may also wait for a key or a resource slot.
+fn waits_only_for_room<'a>(gates: &[Box<dyn crate::gates::Gate<'a> + 'a>], w: &'a Job, active: bool) -> bool {
+    gates
+        .iter()
+        .filter_map(|g| g.blocks(w, active))
+        .all(|b| matches!(b, Block::Points { .. } | Block::Ram { .. }))
 }
 
 /// Test shorthand: no named resources.
@@ -459,6 +493,89 @@ mod tests {
         b.order = -1;
         let jobs = vec![job(1, 2, true), job(2, 2, false), b];
         assert_eq!(admissible(&jobs, 2_000, 16 * GB, LIM), vec![3]);
+    }
+
+    fn bumped(mut j: Job) -> Job {
+        j.bumped = true;
+        j.high = true;
+        j.order = -1;
+        j
+    }
+
+    #[test]
+    fn a_bumped_waiter_short_of_points_or_ram_is_not_passed() {
+        let lim = Limits { budget: 3, ..LIM };
+        // Budget 3, a cost-2 job runs, the bumped cost-2 waiter does not fit: the cost-1 job
+        // behind it would fit, but starting it would delay the bumped one. It waits, naming it.
+        let jobs = vec![job(1, 2, true), bumped(job(2, 2, false)), job(3, 1, false)];
+        let (adm, blocked) = plan(&jobs, 2_000, 16 * GB, lim);
+        assert!(adm.is_empty(), "{blocked:?}");
+        assert_eq!(blocked[1], (3, Block::Bumped { id: 2 }));
+        // Only moved forward (an older binary, or high prio): passing is allowed.
+        let mut plain = jobs.clone();
+        plain[1].bumped = false;
+        assert_eq!(admissible(&plain, 2_000, 16 * GB, lim), vec![3]);
+        // Short of RAM: a hold that takes no points (and no RAM) still waits behind it.
+        let mut hold = needing(job(3, 0, false), "emulator");
+        hold.hold_ttl_ms = Some(60_000);
+        let jobs = vec![job(1, 1, true), bumped(job(2, 1, false)), hold];
+        let (adm, blocked) = plan(&jobs, 2_000, GB, LIM);
+        assert!(adm.is_empty());
+        assert!(matches!(blocked[0], (2, Block::Ram { .. })), "{blocked:?}");
+        assert_eq!(blocked[1], (3, Block::Bumped { id: 2 }));
+        // Once it fits, it starts first and the others follow as room allows.
+        let jobs = vec![bumped(job(2, 2, false)), job(3, 1, false), job(4, 1, false)];
+        assert_eq!(admissible(&jobs, 2_000, 16 * GB, lim), vec![2, 3]);
+    }
+
+    #[test]
+    fn a_bumped_waiter_held_by_a_key_resource_or_disk_may_be_passed() {
+        let lim = Limits { budget: 3, ..LIM };
+        // Its dependency folder is in use: a strict line would stall behind one long job.
+        let jobs = vec![
+            keyed(job(1, 1, true), "nm:a"),
+            bumped(keyed(job(2, 1, false), "nm:a")),
+            job(3, 1, false),
+        ];
+        assert_eq!(admissible(&jobs, 2_000, 16 * GB, lim), vec![3]);
+        // Short of points as well (reported first): the key still decides, no barrier.
+        let jobs = vec![
+            keyed(job(1, 2, true), "nm:a"),
+            bumped(keyed(job(2, 2, false), "nm:a")),
+            job(3, 1, false),
+        ];
+        let (adm, blocked) = plan(&jobs, 2_000, 16 * GB, lim);
+        assert_eq!(adm, vec![3]);
+        assert!(matches!(blocked[0], (2, Block::Points { .. })), "{blocked:?}");
+        // A resource slot held by a running job, or a lease.
+        let caps = BTreeMap::new();
+        let jobs = vec![
+            needing(job(1, 1, true), "db"),
+            bumped(needing(job(2, 1, false), "db")),
+            job(3, 1, false),
+        ];
+        assert_eq!(plan_with(&jobs, 2_000, 16 * GB, lim, &caps).0, vec![3]);
+        let leases = [lease("abc123", &["emulator"], 0)];
+        let jobs = vec![bumped(needing(job(2, 1, false), "emulator")), job(3, 1, false)];
+        assert_eq!(plan_leased(&jobs, 2_000, 16 * GB, lim, &caps, &leases).0, vec![3]);
+        // Its drive is short of space.
+        let mut short = bumped(job(2, 1, false));
+        short.disk_short = true;
+        let jobs = vec![job(1, 1, true), short, job(3, 1, false)];
+        assert_eq!(admissible(&jobs, 2_000, 16 * GB, lim), vec![3]);
+    }
+
+    #[test]
+    fn low_prio_goes_after_normal_and_high() {
+        let mut lo = job(1, 1, false);
+        lo.low = true;
+        let mut hi = job(3, 1, false);
+        hi.high = true;
+        let mut both = job(4, 1, false);
+        (both.high, both.low) = (true, true);
+        let jobs = vec![lo, job(2, 1, false), hi, both, job(5, 1, true)];
+        let ids: Vec<u64> = waiting_in_order(&jobs).iter().map(|j| j.id).collect();
+        assert_eq!(ids, vec![3, 4, 2, 1]);
     }
 
     #[test]

@@ -154,7 +154,7 @@ fn run_task_schema() -> Value {
                 "cost": {"type": "integer", "minimum": 1, "description": "Budget points; default by kind"},
                 "label": {"type": "string", "description": "Name shown in the queue"},
                 "timeout_s": {"type": "number", "exclusiveMinimum": 0, "description": "Stop the command after this many seconds (exit 124)"},
-                "prio": {"type": "string", "enum": ["normal", "high"]},
+                "prio": {"type": "string", "enum": ["normal", "high", "low"], "description": "high goes before every normal job, low after every normal one (default normal)"},
                 "wait_timeout_s": {"type": "number", "exclusiveMinimum": 0, "description": "Give up waiting after this many seconds; the result carries a ticket that keeps the place in line for 10 minutes"},
                 "ticket": {"type": "integer", "description": "Ticket from an earlier wait timeout: resume that place in line"},
                 "needs": {"type": "array", "items": {"type": "string"}, "description": "Named resources to hold a slot of, e.g. [\"db\"]"},
@@ -214,15 +214,20 @@ fn queue_status_schema() -> Value {
 fn bump_schema() -> Value {
     json!({
         "name": "bump",
-        "title": "Move waiting jobs to the front",
-        "description": "Move waiting jobs whose label contains the given text to the front of the queue.",
+        "title": "Move waiting jobs to the front (or the back)",
+        "description": "Move waiting jobs to the front of the queue, picked by exactly one of label, pos, \
+            ticket or dir. Later jobs may not pass them while they wait for points or RAM. With back \
+            set, move them to the end of the line instead, with prio low.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "label": {"type": "string", "description": "Part of the label (case-insensitive)"},
+                "pos": {"type": "integer", "minimum": 1, "description": "Place in the waiting line (place in queue_status)"},
+                "ticket": {"type": "integer", "description": "The job id (id in queue_status, or a wait-timeout ticket)"},
+                "dir": {"type": "string", "description": "Jobs whose folder is this one or inside it"},
+                "back": {"type": "boolean", "description": "Move them to the end of the line instead, with prio low"},
                 "queue": {"type": "string", "description": QUEUE_PROP}
-            },
-            "required": ["label"]
+            }
         }
     })
 }
@@ -399,6 +404,7 @@ fn request_for(args: &Value, command: &str, log: PathBuf, cancel: Arc<AtomicBool
         kind: string(args, "kind"),
         cost: args.get("cost").and_then(Value::as_u64).map(|c| c.max(1) as u32),
         high: args.get("prio").and_then(Value::as_str) == Some("high"),
+        low: args.get("prio").and_then(Value::as_str) == Some("low"),
         label: string(args, "label"),
         timeout: secs(args, "timeout_s"),
         log: Some(log),
@@ -719,25 +725,62 @@ fn queue_status(c: &Call) -> Value {
     }
 }
 
-fn bump(c: &Call) -> Value {
-    let Some(label) = c
-        .args
-        .get("label")
-        .and_then(Value::as_str)
-        .filter(|l| !l.is_empty())
-    else {
-        return text_result("bump needs a \"label\" string".into(), true, None);
+/// The one selector of a `bump` call: exactly one of `label`, `pos`, `ticket`, `dir`, each
+/// of the right type.
+fn bump_selector(args: &Value) -> Result<status::Selector, String> {
+    use status::Selector;
+    const KEYS: [&str; 4] = ["label", "pos", "ticket", "dir"];
+    let given: Vec<&str> = KEYS
+        .into_iter()
+        .filter(|k| args.get(k).is_some_and(|v| !v.is_null()))
+        .collect();
+    let [key] = given[..] else {
+        return Err(format!(
+            "bump needs exactly one of \"label\", \"pos\", \"ticket\" or \"dir\" (got {})",
+            if given.is_empty() {
+                "none".to_string()
+            } else {
+                given.join(", ")
+            }
+        ));
     };
+    let v = &args[key];
+    let text = || v.as_str().filter(|t| !t.is_empty()).map(String::from);
+    let sel = match key {
+        "label" => text().map(Selector::Label),
+        "pos" => v.as_u64().filter(|p| *p >= 1).map(|p| Selector::Pos(p as usize)),
+        "ticket" => v.as_u64().map(Selector::Ticket),
+        _ => text().map(|d| Selector::dir(std::path::Path::new(&d))),
+    };
+    sel.ok_or_else(|| {
+        let want = match key {
+            "label" | "dir" => "a non-empty string",
+            "pos" => "an integer of at least 1",
+            _ => "an integer",
+        };
+        format!("bump: \"{key}\" must be {want}")
+    })
+}
+
+fn bump(c: &Call) -> Value {
+    let sel = match bump_selector(c.args) {
+        Ok(sel) => sel,
+        Err(e) => return text_result(e, true, None),
+    };
+    let back = c.args.get("back").and_then(Value::as_bool).unwrap_or(false);
     let mut ctx = match ctx_for(c.args) {
         Ok(ctx) => ctx,
         Err(e) => return e,
     };
-    match status::bump(&mut ctx, label) {
-        Ok(n) => text_result(
-            format!("moved {n} waiting job(s) matching \"{label}\" to the front"),
-            false,
-            Some(json!({"moved": n, "matched": n})),
-        ),
+    match status::bump(&mut ctx, &sel, back) {
+        Ok(n) => {
+            let to = if back { "the end (prio low)" } else { "the front" };
+            text_result(
+                format!("moved {n} waiting job(s) matching {} to {to}", sel.describe()),
+                false,
+                Some(json!({"moved": n, "matched": n, "back": back})),
+            )
+        }
         Err(e) => error_result(&e),
     }
 }
@@ -918,6 +961,28 @@ pub fn serve() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bump_takes_exactly_one_selector() {
+        use status::Selector;
+        let sel = |v: Value| bump_selector(&v);
+        assert_eq!(sel(json!({"label": "e2e"})), Ok(Selector::Label("e2e".into())));
+        assert_eq!(sel(json!({"pos": 2, "back": true})), Ok(Selector::Pos(2)));
+        assert_eq!(sel(json!({"ticket": 7, "label": null})), Ok(Selector::Ticket(7)));
+        assert!(matches!(sel(json!({"dir": "."})), Ok(Selector::Dir(_))));
+        let err = sel(json!({})).unwrap_err();
+        assert!(err.contains("exactly one") && err.contains("none"), "{err}");
+        let err = sel(json!({"label": "a", "pos": 1})).unwrap_err();
+        assert!(err.contains("label, pos"), "{err}");
+        for bad in [
+            json!({"pos": 0}),
+            json!({"pos": "2"}),
+            json!({"label": ""}),
+            json!({"ticket": -1}),
+        ] {
+            assert!(sel(bad.clone()).unwrap_err().contains("must be"), "{bad}");
+        }
+    }
 
     #[test]
     fn plain_words_run_directly() {

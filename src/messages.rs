@@ -45,7 +45,9 @@ pub fn waiting_line(s: &State, why: &Block, c: &WaitContext) -> String {
     let r = reason(s, why, c);
     let line = match why {
         Block::Ram { .. } | Block::Disk => format!("calmrun: waiting for {r}"),
-        Block::Resource(_) => format!("calmrun: waiting for {r}, {} in line", ordinal(place)),
+        Block::Resource(_) | Block::Bumped { .. } => {
+            format!("calmrun: waiting for {r}, {} in line", ordinal(place))
+        }
         _ => format!("calmrun: waiting - {r}, {} in line", ordinal(place)),
     };
     match running_summary(s, c.now_ms) {
@@ -58,7 +60,7 @@ pub fn waiting_line(s: &State, why: &Block, c: &WaitContext) -> String {
 pub fn reason_code(why: &Block) -> &'static str {
     match why {
         Block::Points { .. } => "budget",
-        Block::Order => "order",
+        Block::Order | Block::Bumped { .. } => "order",
         Block::Ram { .. } => "ram",
         Block::Disk => "disk",
         Block::Key { .. } => "key",
@@ -129,6 +131,15 @@ pub fn reason(s: &State, why: &Block, c: &WaitContext) -> String {
             c.budget,
             scheduler::job_points(c.me, c.budget)
         ),
+        Block::Bumped { id } => {
+            let waiting = scheduler::waiting_in_order(&s.jobs);
+            let place = waiting.iter().position(|j| j.id == *id);
+            let label = place.map_or("?", |p| waiting[p].label.as_str());
+            format!(
+                "bumped job \"{label}\" ahead ({} in line) to start",
+                ordinal(place.map_or(1, |p| p + 1))
+            )
+        }
     }
 }
 
@@ -329,6 +340,41 @@ mod tests {
     }
 
     #[test]
+    fn a_waiter_behind_a_bumped_job_names_it() {
+        let ahead = Job {
+            id: 5,
+            label: "npx vitest".into(),
+            high: true,
+            bumped: true,
+            order: -1,
+            ..Default::default()
+        };
+        let me = Job {
+            id: 6,
+            order: 6,
+            ..Default::default()
+        };
+        let s = State {
+            jobs: vec![me.clone(), ahead],
+            ..State::default()
+        };
+        let caps = BTreeMap::new();
+        let c = WaitContext {
+            me: &me,
+            budget: 2,
+            disk: None,
+            caps: &caps,
+            now_ms: 0,
+        };
+        let why = Block::Bumped { id: 5 };
+        assert_eq!(
+            waiting_line(&s, &why, &c),
+            "calmrun: waiting for bumped job \"npx vitest\" ahead (1st in line) to start, 2nd in line"
+        );
+        assert_eq!(reason_code(&why), "order");
+    }
+
+    #[test]
     fn ordinals() {
         let got: Vec<String> = [1, 2, 3, 4, 11, 12, 13, 21, 22, 101]
             .iter()
@@ -430,6 +476,7 @@ mod tests {
         let blocks = [
             Block::Points { used: 2, needs: 1 },
             Block::Order,
+            Block::Bumped { id: 7 },
             Block::Disk,
             Block::Key { holder: "x".into() },
             Block::Resource("db".into()),

@@ -84,6 +84,8 @@ fn job_json(j: &Job, now: u64, place: Option<usize>) -> Value {
         "needs": j.needs,
         "cwd": j.cwd,
         "high": j.high,
+        "low": j.low,
+        "bumped": j.bumped,
         "since_ms": since,
         "for_ms": now.saturating_sub(since),
         "place": place,
@@ -174,23 +176,80 @@ pub fn status_json(ctx: &mut Ctx, state: &State) -> Value {
     })
 }
 
-/// Move waiting jobs whose label contains `needle` (any case) to the front, keeping their
-/// relative order. Returns how many moved.
-pub fn bump(ctx: &mut Ctx, needle: &str) -> Result<usize> {
-    let needle = needle.to_lowercase();
+/// Which jobs `bump` moves. Every selector picks from the waiting line as `calmrun status`
+/// shows it; `Ticket` also finds a place kept for that ticket.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Selector {
+    /// The label contains this text (any case).
+    Label(String),
+    /// 1-based place in the waiting line (the `#` column of `calmrun status`).
+    Pos(usize),
+    /// The job id (the ticket `--wait-timeout` prints).
+    Ticket(u64),
+    /// The job's folder is this one or inside it, as a [`crate::sys::path_key`].
+    Dir(String),
+}
+
+impl Selector {
+    /// `Dir` for a folder given by the user (relative to the current one).
+    pub fn dir(path: &std::path::Path) -> Selector {
+        let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        Selector::Dir(crate::sys::path_key(&abs))
+    }
+
+    fn matches(&self, place: usize, j: &Job) -> bool {
+        match self {
+            Selector::Label(t) => j.label.to_lowercase().contains(&t.to_lowercase()),
+            Selector::Pos(p) => place == *p,
+            Selector::Ticket(id) => j.id == *id,
+            Selector::Dir(key) if j.cwd_key.is_empty() => {
+                scheduler::inside(&crate::sys::path_key(std::path::Path::new(&j.cwd)), key)
+            }
+            Selector::Dir(key) => scheduler::inside(&j.cwd_key, key),
+        }
+    }
+
+    /// The selector in words, for "no waiting job matches ...".
+    pub fn describe(&self) -> String {
+        match self {
+            Selector::Label(t) => format!("label \"{t}\""),
+            Selector::Pos(p) => format!("place {p}"),
+            Selector::Ticket(id) => format!("id {id}"),
+            Selector::Dir(key) => format!("folder {key}"),
+        }
+    }
+}
+
+/// Move the selected waiting jobs, keeping their relative order. To the front (`back` false):
+/// prio high, before every other entry, and marked bumped so that later waiters may not pass
+/// them while they wait for points or RAM. To the back: prio low, after every other entry.
+/// Returns how many moved.
+pub fn bump(ctx: &mut Ctx, sel: &Selector, back: bool) -> Result<usize> {
     let store = ctx.store()?;
     locked(&store, &mut ctx.sys, |s| {
-        let min = s.jobs.iter().map(|j| j.order).min().unwrap_or(0);
-        let ids: Vec<u64> = scheduler::waiting_in_order(&s.jobs)
+        let mut ids: Vec<u64> = scheduler::waiting_in_order(&s.jobs)
             .into_iter()
-            .filter(|j| j.label.to_lowercase().contains(&needle))
-            .map(|j| j.id)
+            .enumerate()
+            .filter(|(i, j)| sel.matches(i + 1, j))
+            .map(|(_, j)| j.id)
             .collect();
+        if let Selector::Ticket(t) = sel {
+            if ids.is_empty() && s.jobs.iter().any(|j| j.id == *t && j.parked()) {
+                ids.push(*t);
+            }
+        }
         let n = ids.len() as i64;
+        let min = s.jobs.iter().map(|j| j.order).min().unwrap_or(0);
+        let max = s.jobs.iter().map(|j| j.order).max().unwrap_or(0);
         for (i, id) in ids.iter().enumerate() {
             if let Some(j) = s.jobs.iter_mut().find(|j| j.id == *id) {
-                j.high = true;
-                j.order = min - n + i as i64;
+                if back {
+                    (j.high, j.bumped, j.low) = (false, false, true);
+                    j.order = max + 1 + i as i64;
+                } else {
+                    (j.high, j.bumped, j.low) = (true, true, false);
+                    j.order = min - n + i as i64;
+                }
             }
         }
         ids.len()

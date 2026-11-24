@@ -6,6 +6,29 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `calmrun bump` picks jobs by `--pos N` (the `#` column of `calmrun status`), `--ticket ID`
+  (job id, also a place kept by `--wait-timeout`) or `--dir PATH` (jobs in that folder or
+  below), besides a label substring; exactly one. The MCP `bump` tool takes `label`, `pos`,
+  `ticket` or `dir` (exactly one; `label` is no longer required) and `back`.
+- `--prio low` (MCP `run_task` `prio: "low"`): after every normal and high job, also ones that
+  come later. `calmrun bump --back <selector>` moves waiting jobs to the end with prio low.
+- `calmrun status` marks places with `^` (bumped) and `-` (prio low) next to `!` (high);
+  `status --json` and MCP `queue_status` show `low` and `bumped` per job.
+
+### Changed
+
+- A job resumed with `--ticket` keeps whether it was bumped or pushed back.
+
+### Fixed
+
+- A bumped job holds the front: while it waits for budget points or RAM, later jobs no longer
+  pass it (before, a smaller job that came later could start first and delay it). Waiters
+  behind it say so: `bumped job "npx vitest" ahead (1st in line) to start`. While it waits for
+  an exclusive key, a resource or disk space, others may still pass it. A 0.3.x calmrun
+  waiting in the same queue does not know this rule and may still pass it.
+
 ## [0.3.1] - 2026-11-24
 
 ### Fixed

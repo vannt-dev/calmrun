@@ -299,6 +299,164 @@ fn bump_moves_a_waiter_forward() {
 }
 
 #[test]
+fn a_bumped_waiter_holds_the_front() {
+    // Budget 3: A (cost 2) runs; B (cost 2) waits and is bumped. C (cost 1) arrives later and
+    // would fit next to A, but starting it would delay B: it waits until B has started.
+    let env = Env::new();
+    let a = env.probe(3, &["--cost", "2", "--label", "a"], "a", 4000, None);
+    env.wait_queue(1, 0);
+    let b = env.probe(3, &["--cost", "2", "--label", "front"], "b", 300, None);
+    env.wait_queue(1, 1);
+    let out = env.cmd(3).args(["bump", "front"]).status().unwrap();
+    assert!(out.success());
+    let c = env.probe(3, &["--cost", "1", "--label", "late"], "c", 300, None);
+    env.wait_queue(1, 2);
+    let s = env.status();
+    assert_eq!(s["waiting"][0]["bumped"], true, "{s}");
+    assert_eq!(s["waiting"][1]["why_code"], "order", "{s}");
+    let why = s["waiting"][1]["why"].as_str().unwrap();
+    assert_eq!(why, "bumped job \"front\" ahead (1st in line) to start", "{s}");
+    assert!(wait_all(vec![a, b, c], Duration::from_secs(60))
+        .iter()
+        .all(|&x| x == 0));
+    let iv = env.intervals();
+    let end_of = |id: &str| iv.iter().find(|x| x.0 == id).unwrap().2;
+    let start_of = |id: &str| iv.iter().find(|x| x.0 == id).unwrap().1;
+    assert!(start_of("c") >= end_of("a"), "{iv:?}");
+    assert!(start_of("b") >= end_of("a"), "{iv:?}");
+}
+
+fn bump(env: &Env, args: &[&str]) -> i32 {
+    env.cmd(1)
+        .arg("bump")
+        .args(args)
+        .status()
+        .unwrap()
+        .code()
+        .unwrap_or(-1)
+}
+
+fn waiting_labels(env: &Env) -> Vec<String> {
+    let s = env.status();
+    s["waiting"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|j| j["label"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn bump_selectors_and_pushing_back() {
+    let env = Env::new();
+    let sub = env.home.path().join("w").join("b");
+    std::fs::create_dir_all(&sub).unwrap();
+    let a = env.probe(1, &["--label", "a"], "a", 6000, None);
+    env.wait_queue(1, 0);
+    let mut kids = vec![a];
+    for (i, (l, flags)) in [
+        ("b", vec![]),
+        ("c", vec![]),
+        ("d", vec![]),
+        ("e", vec!["--prio", "low"]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut f = vec!["--label", l];
+        f.extend(flags);
+        let cwd = (l == "b").then_some(sub.as_path());
+        kids.push(env.probe(1, &f, l, 100, cwd));
+        env.wait_queue(1, i + 1);
+    }
+    assert_eq!(waiting_labels(&env), ["b", "c", "d", "e"]);
+    // --pos counts as the # column of `calmrun status` does.
+    assert_eq!(bump(&env, &["--pos", "3"]), 0);
+    assert_eq!(waiting_labels(&env), ["d", "b", "c", "e"]);
+    // --back: after everything, low ones included, keeping order among the pushed.
+    assert_eq!(bump(&env, &["--back", "--pos", "1"]), 0);
+    assert_eq!(waiting_labels(&env), ["b", "c", "e", "d"]);
+    let s = env.status();
+    let id_of = |l: &str| {
+        s["waiting"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|j| j["label"] == l)
+            .unwrap()["id"]
+            .to_string()
+    };
+    assert_eq!(bump(&env, &["--ticket", &id_of("c")]), 0);
+    assert_eq!(waiting_labels(&env), ["c", "b", "e", "d"]);
+    // --dir: jobs in the folder or below it (the folder of a job, not a prefix of one).
+    let w = env.home.path().join("w");
+    assert_eq!(bump(&env, &[&format!("--dir={}", w.display())]), 0);
+    assert_eq!(waiting_labels(&env), ["b", "c", "e", "d"]);
+    let wb = env.home.path().join("w").join("bb");
+    assert_eq!(bump(&env, &[&format!("--dir={}", wb.display())]), 1);
+    assert_eq!(bump(&env, &["--pos", "9"]), 1);
+    assert_eq!(bump(&env, &["--pos", "1", "--ticket", "1"]), 2);
+    // Status marks bumped (^), high (!) and low (-) places.
+    let out = env.cmd(1).arg("status").stdout(Stdio::piped()).output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    let mark = |label: &str| {
+        text.lines()
+            .find(|l| l.split_whitespace().nth(1) == Some(label))
+            .and_then(|l| l.split_whitespace().next())
+            .unwrap_or_else(|| panic!("{label} not in {text}"))
+            .to_string()
+    };
+    assert_eq!(
+        [mark("b"), mark("c"), mark("e"), mark("d")],
+        ["1!^", "2!^", "3-", "4-"],
+        "{text}"
+    );
+    assert!(text.is_ascii(), "{text}");
+    assert!(wait_all(kids, Duration::from_secs(60)).iter().all(|&x| x == 0));
+    let order: Vec<String> = env.intervals().into_iter().map(|x| x.0).collect();
+    assert_eq!(order, vec!["a", "b", "c", "e", "d"]);
+}
+
+#[test]
+fn a_kept_place_keeps_its_push_back() {
+    let env = Env::new();
+    let a = env.probe(1, &["--label", "a"], "a", 5000, None);
+    env.wait_queue(1, 0);
+    let out = env
+        .cmd(1)
+        .args([
+            "--label",
+            "p",
+            "--wait-timeout",
+            "1",
+            "--",
+            EXE,
+            "__probe",
+            "--name",
+            "p",
+        ])
+        .arg("--log")
+        .arg(&env.log)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(75));
+    let ticket = env.status()["parked"][0]["ticket"].as_u64().unwrap().to_string();
+    let n = env.probe(1, &["--label", "n"], "n", 100, None);
+    env.wait_queue(1, 1);
+    // The kept place goes to the back; coming back with its ticket keeps it there.
+    assert_eq!(bump(&env, &["--back", "--ticket", &ticket]), 0);
+    let p = env.probe(1, &["--label", "p", "--ticket", &ticket], "p", 100, None);
+    env.wait_queue(1, 2);
+    assert_eq!(waiting_labels(&env), ["n", "p"]);
+    assert_eq!(env.status()["waiting"][1]["low"], true);
+    assert!(wait_all(vec![a, n, p], Duration::from_secs(60))
+        .iter()
+        .all(|&x| x == 0));
+    let order: Vec<String> = env.intervals().into_iter().map(|x| x.0).collect();
+    assert_eq!(order, vec!["a", "n", "p"]);
+}
+
+#[test]
 fn hook_denies_heavy_and_allows_light() {
     let env = Env::new();
     let run = |cmd: &str| -> String {
