@@ -153,7 +153,13 @@ fn log_copies_both_streams_and_keeps_the_exit_code() {
     let id = rec["id"].as_u64().unwrap().to_string();
     let shown = env.run(&["logs", &id, "--tail", "2"]);
     assert_eq!(shown.status.code(), Some(0), "{shown:?}");
-    assert_eq!(text(&shown.stdout), "tick 298\ntick 299\n");
+    // The last two lines of the file, whichever stream wrote them (stderr may come last).
+    let lines: Vec<&str> = log.lines().collect();
+    let last_two: String = lines[lines.len() - 2..]
+        .iter()
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert_eq!(text(&shown.stdout), last_two);
 }
 
 #[test]
