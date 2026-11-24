@@ -25,10 +25,11 @@ All notable changes to this project are documented here. The format follows
   (12m00s, usually 40s, idle 5m)`) and, when one looks stuck, a `calmrun: next:` line with
   `calmrun status` and `calmrun stop <id>`. `status --json`, MCP `queue_status` and
   `task_status` carry the same data (`cpu_pct`, `idle_ms`, `usual_ms`, `timeout_ms`, ...).
-- Run time limit: `--timeout SECS` (0 = no limit for this run), `max_run_min` in the config
-  (env `CALMRUN_MAX_RUN_MIN`) and `[kinds.<name>] max_run_min`. By default test, vitest,
-  jest, pytest, typecheck, tsc, lint and eslint jobs stop after 60 minutes; builds and the
-  other kinds have no limit. Exit 124 (history `timeout`); the message names the setting.
+- Run time limit: `--timeout SECS` (0 = no limit for this run; MCP `timeout_s`, same 0),
+  `max_run_min` in the config (env `CALMRUN_MAX_RUN_MIN`) and `[kinds.<name>] max_run_min`.
+  By default test, vitest, jest, pytest, typecheck, tsc, lint and eslint jobs stop after
+  60 minutes; builds and the other kinds have no limit. Exit 124 (history `timeout`); the
+  message names the setting.
 - `calmrun stop <id>` / `calmrun stop --label TEXT`: the job's calmrun stops its command tree
   (or leaves the line), prints `calmrun: stopped by calmrun stop` and exits 130 (history
   `stopped`). An owner that does not react within `--wait` seconds (default 10), such as a
