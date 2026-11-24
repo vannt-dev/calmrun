@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-24
+
 ### Fixed
 
 - The one-line MCP result summary uses plain ASCII separators (`exit code 0, npx vitest, kind test,
