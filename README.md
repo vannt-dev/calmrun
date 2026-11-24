@@ -286,15 +286,18 @@ calmrun --needs android -- ./gradlew connectedAndroidTest   # at the same time: 
   instance whose check does not exit 0 within 10 s is skipped. An instance name may only use
   letters, digits and `- _ . : @ / +`, so it is safe in a command line.
 - The waiting job runs these commands itself, outside every lock, and looks again every 5 s
-  while it waits. When no instance is ready, it waits with
+  while it waits. `health` runs for every instance, busy or not, so keep it quick and
+  read-only (a state query, not a reboot). When no instance is ready, it waits with
   `calmrun: waiting for a ready instance of "android" (…)`, and it never holds back the jobs
   behind it. When every ready instance is in use, it waits like any resource:
   `waiting for resource "android" (all 2 ready instance(s) in use by …)`.
 - A [lease](#leases-holding-a-resource-without-a-command) holds one instance; jobs that use
   the lease get that instance. A resource without instances (`db = 1`) works as before.
+- Like every named resource, instances belong to a queue: two [separate queues](#separate-queues)
+  (`--id`) may hand out the same device.
 
-Instances need calmrun 0.6 or newer in every process that shares the queue: an older calmrun
-counts the resource as one slot and drops the instance records when it rewrites the state.
+Every calmrun that shares the queue must know instances: an older calmrun counts the resource
+as one slot and drops the instance records when it rewrites the state.
 
 ### Order and passing
 

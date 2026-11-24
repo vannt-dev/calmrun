@@ -224,9 +224,18 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Ready instances are looked up again after this long while a job waits.
 pub const REFRESH: Duration = Duration::from_secs(5);
 
-/// Run a shell line (no stdin, no stderr) for at most `timeout`. Returns whether it exited
-/// 0 and its output; a command that cannot start or runs too long fails.
-pub fn run_probe(line: &str, instance: Option<&str>, timeout: Duration) -> (bool, String) {
+/// After the command exits, output still arriving is read until it pauses this long.
+const OUTPUT_GRACE: Duration = Duration::from_millis(200);
+
+/// Run a shell line (no stdin, no stderr) for at most `timeout`, or until `stop` says so.
+/// Returns whether it exited 0 and its output; a command that cannot start, runs too long or
+/// is stopped fails.
+pub fn run_probe(
+    line: &str,
+    instance: Option<&str>,
+    timeout: Duration,
+    stop: &dyn Fn() -> bool,
+) -> (bool, String) {
     let line = match instance {
         Some(i) => line.replace("{instance}", i),
         None => line.to_string(),
@@ -241,40 +250,54 @@ pub fn run_probe(line: &str, instance: Option<&str>, timeout: Duration) -> (bool
     let Ok(mut child) = cmd.spawn() else {
         return (false, String::new());
     };
-    let mut stdout = child.stdout.take();
-    let reader = std::thread::spawn(move || {
-        let mut out = Vec::new();
-        if let Some(s) = stdout.as_mut() {
-            let _ = s.read_to_end(&mut out);
-        }
-        String::from_utf8_lossy(&out).to_string()
-    });
+    // The reader hands over what it reads as it comes: a process the command started (an adb
+    // server) may keep the pipe open long after the command itself has exited.
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    if let Some(mut s) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n @ 1..) = s.read(&mut buf) {
+                if tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+    }
     let end = Instant::now() + timeout;
+    let mut out = Vec::new();
     let ok = loop {
+        while let Ok(chunk) = rx.try_recv() {
+            out.extend(chunk);
+        }
         match child.try_wait() {
             Ok(Some(status)) => break status.success(),
-            Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) if Instant::now() < end && !stop() => std::thread::sleep(Duration::from_millis(20)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                break false;
+                return (false, String::new());
             }
         }
     };
-    // A grandchild may keep the pipe open after a kill: do not wait on it then.
-    let out = match ok {
-        true => reader.join().unwrap_or_default(),
-        false => String::new(),
-    };
-    (ok, out)
+    // Exited: take what is still on its way, until the output pauses or the time is up.
+    let grace_end = end.max(Instant::now() + OUTPUT_GRACE);
+    loop {
+        let left = grace_end.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(OUTPUT_GRACE.min(left)) {
+            Ok(chunk) => out.extend(chunk),
+            Err(_) => break,
+        }
+    }
+    (ok, String::from_utf8_lossy(&out).to_string())
 }
 
 /// The instances of `pool` that are ready now: the fixed ones, then the discovered ones not
-/// already listed, each kept only if its health command passes (checked in parallel).
-pub fn ready_now(pool: &Pool) -> Vec<String> {
+/// already listed, each kept only if its health command passes (checked in parallel). `stop`
+/// cuts the commands short (the wait is cancelled or timed out).
+pub fn ready_now(pool: &Pool, stop: &(dyn Fn() -> bool + Sync)) -> Vec<String> {
     let mut all = pool.instances.clone();
     if let Some(d) = &pool.discover {
-        let (ok, out) = run_probe(d, None, PROBE_TIMEOUT);
+        let (ok, out) = run_probe(d, None, PROBE_TIMEOUT, stop);
         if ok {
             for i in parse_list(&out) {
                 if !all.contains(&i) {
@@ -289,7 +312,7 @@ pub fn ready_now(pool: &Pool) -> Vec<String> {
     let passed: Vec<bool> = std::thread::scope(|scope| {
         let checks: Vec<_> = all
             .iter()
-            .map(|i| scope.spawn(move || run_probe(health, Some(i), PROBE_TIMEOUT).0))
+            .map(|i| scope.spawn(move || run_probe(health, Some(i), PROBE_TIMEOUT, stop).0))
             .collect();
         checks.into_iter().map(|c| c.join().unwrap_or(false)).collect()
     });
@@ -308,17 +331,25 @@ pub struct Probe {
 
 impl Probe {
     /// The ready instances of each of `needs` that has a pool (other needs are left out).
+    /// `stop` cuts the commands short; what they found by then is not kept for later.
     pub fn ready(
         &mut self,
         needs: &[String],
         pools: &BTreeMap<String, Pool>,
+        stop: &(dyn Fn() -> bool + Sync),
     ) -> BTreeMap<String, Vec<String>> {
         let mut ready = BTreeMap::new();
         for n in needs {
             let Some(pool) = pools.get(n) else { continue };
             let fresh = self.cache.get(n).is_some_and(|(at, _)| at.elapsed() < REFRESH);
             if !fresh {
-                self.cache.insert(n.clone(), (Instant::now(), ready_now(pool)));
+                let found = ready_now(pool, stop);
+                let at = match stop() {
+                    // Stale at once, so a later look runs the commands again.
+                    true => Instant::now().checked_sub(REFRESH).unwrap_or_else(Instant::now),
+                    false => Instant::now(),
+                };
+                self.cache.insert(n.clone(), (at, found));
             }
             ready.insert(n.clone(), self.cache[n].1.clone());
         }
@@ -425,21 +456,55 @@ mod tests {
             instances: vec!["a".into(), "b".into()],
             ..Pool::default()
         };
-        assert_eq!(ready_now(&p), ["a", "b"]);
+        assert_eq!(ready_now(&p, &never), ["a", "b"]);
         let pools = BTreeMap::from([("dev".to_string(), p)]);
         let mut probe = Probe::default();
-        let ready = probe.ready(&["db".into(), "dev".into()], &pools);
+        let ready = probe.ready(&["db".into(), "dev".into()], &pools, &never);
         assert_eq!(ready.len(), 1, "only needs with a pool: {ready:?}");
         assert_eq!(ready["dev"], ["a", "b"]);
+    }
+
+    fn never() -> bool {
+        false
     }
 
     #[test]
     fn probes_report_exit_and_output() {
         // Shell builtins that sh and cmd both have.
-        let (ok, out) = run_probe("echo {instance}", Some("dev-1"), PROBE_TIMEOUT);
+        let (ok, out) = run_probe("echo {instance}", Some("dev-1"), PROBE_TIMEOUT, &never);
         assert!(ok);
         assert_eq!(out.trim(), "dev-1");
-        assert!(!run_probe("exit 3", None, PROBE_TIMEOUT).0);
-        assert!(!run_probe("no-such-command-calmrun-xyz", None, PROBE_TIMEOUT).0);
+        assert!(!run_probe("exit 3", None, PROBE_TIMEOUT, &never).0);
+        assert!(!run_probe("no-such-command-calmrun-xyz", None, PROBE_TIMEOUT, &never).0);
+    }
+
+    /// A command that leaves a process behind holding its output, as `adb devices` does when
+    /// it starts the adb server, and one that is stopped.
+    #[test]
+    fn probes_return_when_the_command_exits_or_is_stopped() {
+        #[cfg(windows)]
+        let (lingers, slow) = (
+            "start /b \"\" ping -n 6 127.0.0.1 & echo calmrun-done",
+            "ping -n 6 127.0.0.1",
+        );
+        #[cfg(not(windows))]
+        let (lingers, slow) = ("sleep 5 & echo calmrun-done", "sleep 5");
+        let t0 = Instant::now();
+        let (ok, out) = run_probe(lingers, None, PROBE_TIMEOUT, &never);
+        assert!(ok);
+        assert!(out.contains("calmrun-done"), "{out:?}");
+        assert!(
+            t0.elapsed() < Duration::from_secs(3),
+            "waited for the leftover: {:?}",
+            t0.elapsed()
+        );
+        let t0 = Instant::now();
+        let stop = move || t0.elapsed() > Duration::from_millis(300);
+        assert!(!run_probe(slow, None, PROBE_TIMEOUT, &stop).0);
+        assert!(
+            t0.elapsed() < Duration::from_secs(3),
+            "not stopped: {:?}",
+            t0.elapsed()
+        );
     }
 }

@@ -101,8 +101,8 @@ const TWO: &str = "[resources]\nandroid = [\"emulator-5554\", \"emulator-5556\"]
 #[test]
 fn parallel_jobs_get_different_instances() {
     let env = Env::new(TWO);
-    let a = env.spawn(&["--needs", "android"], "ANDROID_SERIAL", 2000);
-    let b = env.spawn(&["--needs", "android"], "ANDROID_SERIAL", 2000);
+    let a = env.spawn(&["--needs", "android"], "ANDROID_SERIAL", 5000);
+    let b = env.spawn(&["--needs", "android"], "ANDROID_SERIAL", 5000);
     // Both start at once (two instances), each shown with its instance.
     let s = env.wait_running(2);
     let mut shown: Vec<String> = s["running"]

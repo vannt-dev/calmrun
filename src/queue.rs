@@ -780,7 +780,14 @@ fn wait_turn(
             usual = Some((Instant::now(), history::Usual::load(store.history_path())));
         }
         let short = disk.short();
-        let ready = probe.ready(&entry.needs, &ctx.cfg.pools);
+        // Cut the discover and health commands short on a cancel or when the wait is over.
+        let (cancel, deadline) = (p.req.cancel.clone(), p.req.wait_timeout.map(|t| wait_started + t));
+        let stop = move || {
+            runner::INTERRUPTED.load(Ordering::SeqCst)
+                || cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst))
+                || deadline.is_some_and(|d| Instant::now() >= d)
+        };
+        let ready = probe.ready(&entry.needs, &ctx.cfg.pools, &stop);
         let input = TickInput {
             store,
             entry,

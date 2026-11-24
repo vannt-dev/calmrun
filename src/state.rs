@@ -84,7 +84,7 @@ pub struct Job {
     /// alone gives no recent rate).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_pct: Option<u32>,
-    // Fields added in 0.6, additive like the 0.4 ones.
+    // Fields for resources with instances, additive like the 0.4 ones.
     /// Published by a waiting owner: the ready instances of each of its needs that has
     /// instances (`[resources.android] instances`), in the order they are handed out.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
