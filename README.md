@@ -629,12 +629,17 @@ this to `~/.codex/hooks.json` (or `$CODEX_HOME/hooks.json`), next to any hooks a
 terminal sandbox (a Windows AppContainer; on by default) that hides every other process and
 blocks calmrun's state folder, so the wrapped command cannot join the machine-wide queue
 there: calmrun refuses with a `next:` line rather than drop other agents' jobs it cannot see.
-`setup --hook all` leaves Antigravity out; name it (`--hook antigravity`) to install it. To use
-it, let calmrun run outside the sandbox, for example with an allow rule in
-`~/.gemini/antigravity-cli/settings.json` such as
-`"permissions": {"allow": ["command(regex:.*calmrun.*)"]}` (Antigravity's
-[sandbox docs](https://antigravity.google/docs/sandbox?tab=cli) say a `command` allow rule runs
-the command inside or outside the sandbox without prompting; not yet verified with calmrun).
+`setup --hook all` leaves Antigravity out; name it (`--hook antigravity`) to install it.
+
+To use it, run Antigravity without the terminal sandbox: `auto` mode turns the sandbox on, so pick
+another mode (for example `agy --mode accept-edits`) and keep `enableTerminalSandbox` off (the
+default). Then the wrapped command joins the queue; add
+`"permissions": {"allow": ["command(regex:.*calmrun.*)"]}` to
+`~/.gemini/antigravity-cli/settings.json` so it runs without a prompt. Tested with agy 1.5.15 on
+Windows 11. An allow rule alone does not help inside the sandbox: a `command` rule only skips the
+prompt, and the per-command `unsandboxed(...)` rule is ignored on personal accounts (see
+Antigravity's [sandbox](https://antigravity.google/docs/sandbox?tab=cli) and
+[permissions](https://antigravity.google/docs/permissions) docs).
 
 `calmrun hook antigravity` reads [Antigravity hook](https://antigravity.google/docs/hooks)
 input for the `run_command` tool (`toolCall.args.CommandLine`). `calmrun setup --write --hook
