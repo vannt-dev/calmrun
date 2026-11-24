@@ -652,7 +652,7 @@ fn cancel_task(c: &Call) -> Value {
     v
 }
 
-/// `exit code 1 · npx vitest · kind test · waited 2.0s · ran 31s`; the status word only
+/// `exit code 1, npx vitest, kind test, waited 2.0s, ran 31s`; the status word only
 /// when it says more than the code, and no job details for a refusal or an error before
 /// the job was set up.
 fn summary_line(o: &queue::Outcome) -> String {
@@ -669,7 +669,7 @@ fn summary_line(o: &queue::Outcome) -> String {
         parts.push(format!("waited {}", history::human_ms(o.wait_ms)));
         parts.push(format!("ran {}", history::human_ms(o.run_ms)));
     }
-    parts.join(" · ")
+    parts.join(", ")
 }
 
 fn task_result(o: &queue::Outcome, log: Option<PathBuf>) -> Value {
@@ -956,7 +956,7 @@ mod tests {
         };
         assert_eq!(
             summary_line(&ok),
-            "exit code 0 · npx vitest · kind test · waited 2.0s · ran 0.5s"
+            "exit code 0, npx vitest, kind test, waited 2.0s, ran 0.5s"
         );
         let refused = queue::Outcome {
             code: 2,
