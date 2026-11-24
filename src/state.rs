@@ -1,6 +1,7 @@
 //! Shared queue state: `state.json` guarded by an OS file lock on `state.lock`.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -83,6 +84,15 @@ pub struct Job {
     /// alone gives no recent rate).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_pct: Option<u32>,
+    // Fields added in 0.6, additive like the 0.4 ones.
+    /// Published by a waiting owner: the ready instances of each of its needs that has
+    /// instances (`[resources.android] instances`), in the order they are handed out.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ready: BTreeMap<String, Vec<String>>,
+    /// The instance of each such resource the job got when it started (its own, or the one
+    /// of a lease it uses).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub instances: BTreeMap<String, String>,
 }
 
 impl Job {
@@ -130,6 +140,9 @@ pub struct Lease {
     /// That folder as a path key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub for_key: Option<String>,
+    /// The instance it holds of each resource that has instances.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub instances: BTreeMap<String, String>,
 }
 
 /// The contents of `state.json`.

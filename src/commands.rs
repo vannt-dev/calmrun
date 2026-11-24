@@ -203,6 +203,9 @@ fn print_jobs(
     }
     for j in &running {
         row(j, String::new());
+        if !j.instances.is_empty() {
+            println!("       uses: {}", crate::pools::describe(&j.needs, &j.instances));
+        }
         if let Some(h) = hint(j.id) {
             println!("       now: {h}");
         }
@@ -220,18 +223,25 @@ fn print_jobs(
             println!("       waits for: {w}");
         }
     }
+    // Resources with the instance each lease holds (`android=emulator-5554`) may be long.
+    let held: Vec<String> = state
+        .leases
+        .iter()
+        .map(|l| crate::pools::describe(&l.resources, &l.instances))
+        .collect();
+    let w = held.iter().map(String::len).max().unwrap_or(0).max(16);
     if !state.leases.is_empty() {
         println!("leases ({}):", state.leases.len());
         println!(
-            "  {:<6}  {:<16} {:<24} {:>7}  {:>10}  for",
+            "  {:<6}  {:<w$} {:<24} {:>7}  {:>10}  for",
             "lease", "resources", "label", "age", "expires in"
         );
     }
-    for l in &state.leases {
+    for (l, what) in state.leases.iter().zip(&held) {
         println!(
-            "  {:<6}  {:<16} {:<24} {:>7}  {:>10}  {}",
+            "  {:<6}  {:<w$} {:<24} {:>7}  {:>10}  {}",
             l.id,
-            l.resources.join(","),
+            what,
             l.label,
             history::human_ms(now.saturating_sub(l.granted_ms)),
             history::human_ms(l.until_ms.saturating_sub(now)),
@@ -287,16 +297,37 @@ pub fn hold(mut ctx: Ctx, a: &HoldArgs) -> i32 {
         wait_timeout: a.wait_timeout.map(|t| Duration::from_secs_f64(t.clamp(0.0, 1e9))),
         for_dir: a.for_dir.clone(),
     };
-    let (what, for_ms) = (req.resources.join(","), req.ttl.as_millis() as u64);
+    let (names, for_ms) = (req.resources.clone(), req.ttl.as_millis() as u64);
     match queue::hold(&mut ctx, req, &mut queue::StderrNotify::default()) {
-        Ok(id) => {
-            println!("{id}");
+        Ok((id, instances)) => {
+            let env = crate::pools::env_for(&instances, &ctx.cfg.pools);
+            match a.print_env {
+                true => {
+                    println!("CALMRUN_LEASE={id}");
+                    for (k, v) in &env {
+                        println!("{k}={v}");
+                    }
+                }
+                false => println!("{id}"),
+            }
+            let what = crate::pools::describe(&names, &instances);
             eprintln!(
                 "calmrun: holding {what} for {} (lease {id}); give it back with `{} release {id}{}`",
                 history::human_ms(for_ms),
                 runner::program_name(),
                 queue_flag(&ctx)
             );
+            if !env.is_empty() {
+                let vars: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                eprintln!(
+                    "calmrun: jobs that use the lease (CALMRUN_LEASE={id}{}) get {}",
+                    match a.for_dir {
+                        Some(_) => ", or run inside --for",
+                        None => "",
+                    },
+                    vars.join(" ")
+                );
+            }
             0
         }
         Err(out) => {
@@ -577,6 +608,12 @@ pub fn setup(opts: setup::Options) -> i32 {
 pub fn probe(a: &ProbeArgs) -> i32 {
     /// How long the probe's daemon lives.
     const DAEMON_MS: &str = "6000";
+    if a.exists.as_ref().is_some_and(|p| !p.exists()) {
+        return 1;
+    }
+    if let Some(p) = &a.print_file {
+        print!("{}", std::fs::read_to_string(p).unwrap_or_default());
+    }
     if a.cat {
         let mut input = Vec::new();
         let _ = std::io::stdin().read_to_end(&mut input);

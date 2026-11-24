@@ -13,7 +13,8 @@ process evaluates the same way, admits it. Only then does it run the command.
 | `commands.rs` | One function per CLI subcommand. Each returns the exit code. |
 | `queue.rs` | **The service.** `queue::run(ctx, Request, Notify) -> Outcome` submits, waits, runs and records a job. The CLI and the MCP server both call it. |
 | `scheduler.rs` | **Pure.** `schedule(jobs, inputs) -> Plan` handles queue order, prio, passing, the pass limit and bumped jobs holding the front. |
-| `gates.rs` | Start conditions: points, exclusive keys, named resources, disk, RAM. These are the `Gate` trait and its implementations. |
+| `gates.rs` | Start conditions: points, exclusive keys, named resources (slots, or a free instance), disk, RAM. These are the `Gate` trait and its implementations. |
+| `pools.rs` | Resources with instances: the `[resources]` entry, the `discover` output parser, `health` checks with a timeout (run by the waiting owner, outside every lock), and the variables a job gets (`CALMRUN_<NAME>`, `ANDROID_SERIAL`). |
 | `kinds.rs` | **The tool table.** Kinds with default costs and key rules, detection rules, and worker hints. |
 | `detect.rs` | Finds the program in a command line (wrappers, launchers), the label, hint application, exclusive keys and refusals. |
 | `shell.rs` | Just enough shell syntax for that: words, `&&`/`|`/`;` segments, heredocs and here-strings. |
@@ -59,6 +60,14 @@ CLI / MCP ──Request──▶ queue::run
 A `calmrun hold` takes the same path with an entry marked `hold_ttl_ms` that runs nothing: in
 the locked step that admits it, the entry becomes a `Lease` in `state.leases`, which has no
 owner process and lapses at `until_ms`. The gates count leases' slots and points as taken.
+
+For a resource with instances, the waiting owner runs `discover` and `health` before it takes
+any lock (cached for 5 s) and publishes the ready instances in its entry (`Job::ready`), like
+`disk_short`. The resources gate then picks, from that list, the first instance that no running
+job (`Job::instances`), lease (`Lease::instances`) or job admitted earlier in the pass holds,
+and reports it in `Plan::instances`. The locked step that sets `started_ms` (or grants the
+lease) records it; a job that uses a lease takes the lease's instance instead. The command gets
+it in its environment, and the `Outcome` carries it back.
 
 Every admission takes `machine.lock` first (then the queue's `state.lock`, never the other way
 round) and passes the running jobs of the other `--id` queues to the scheduler as `foreign`:
@@ -137,6 +146,8 @@ pure. Integration tests in `tests/` drive the real binary against a temporary
 - `memory.rs`: the memory ceiling.
 - `mcp.rs`: the JSON-RPC protocol, and tasks: handles, offsets, cancel, server exit.
 - `lease.rs`: `hold` / `release`: lifecycle, expiry, contention with `--needs`, queues.
+- `instances.rs`: resources with instances: one per parallel job, health checks and discovery
+  (the probe stands in for `adb`: `--exists`, `--print-file`), leases, count-only resources.
 - `watch.rs`: CPU and usual-time hints, the run time limit, `calmrun stop` (running, waiting,
   and an owner that does not react).
 - `setup.rs`: setup against a temporary home.

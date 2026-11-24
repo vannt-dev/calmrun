@@ -97,6 +97,27 @@ pub fn uses_lease(w: &Job, n: &str, leases: &[Lease]) -> bool {
         })
 }
 
+/// The instances `w` gets from the leases it uses (`CALMRUN_LEASE` or the lease's folder):
+/// for each such need, the instance of the first of those leases that has one.
+pub fn lease_instances(w: &Job, leases: &[Lease]) -> BTreeMap<String, String> {
+    if w.is_hold() {
+        return BTreeMap::new();
+    }
+    w.needs
+        .iter()
+        .filter_map(|n| {
+            leases
+                .iter()
+                .filter(|l| {
+                    w.use_leases.contains(&l.id)
+                        || l.for_key.as_deref().is_some_and(|d| inside(&w.cwd_key, d))
+                })
+                .find_map(|l| l.instances.get(n))
+                .map(|i| (n.clone(), i.clone()))
+        })
+        .collect()
+}
+
 /// Slots of each named resource held by leases.
 pub fn leased_slots(leases: &[Lease]) -> HashMap<&str, u32> {
     let mut held = HashMap::new();
@@ -158,8 +179,11 @@ pub enum Block {
     Key {
         holder: String,
     },
-    /// All slots of this named resource are taken.
+    /// All slots (or every ready instance) of this named resource are taken.
     Resource(String),
+    /// This resource has instances, but none is ready: none listed or found, or none passed
+    /// its health check.
+    NoInstance(String),
     /// Kept in line behind a waiter that may no longer be passed.
     Order,
     /// Kept in line behind this waiter moved to the front by `calmrun bump`, which waits for
@@ -176,6 +200,8 @@ pub struct Plan {
     pub admitted: Vec<u64>,
     /// Every other waiter with its reason.
     pub blocked: Vec<(u64, Block)>,
+    /// The instances given to admitted waiters, for their resources that have instances.
+    pub instances: BTreeMap<u64, BTreeMap<String, String>>,
 }
 
 impl Plan {
@@ -217,10 +243,16 @@ pub fn schedule_with<'a>(
     let leased = leased_slots(inputs.leases);
     // A waiter that needs a resource whose every slot is leased may wait hours, whatever
     // gate reports first; it never holds the others back.
+    // The same for a resource with instances when none is ready, or every ready one is leased.
     let leased_out = |w: &Job| {
         w.needs.iter().any(|n| {
             !uses_lease(w, n, inputs.leases)
-                && leased.get(n.as_str()).copied().unwrap_or(0) >= capacity(inputs.caps, n)
+                && match w.ready.get(n) {
+                    Some(ready) => ready
+                        .iter()
+                        .all(|i| inputs.leases.iter().any(|l| l.instances.get(n) == Some(i))),
+                    None => leased.get(n.as_str()).copied().unwrap_or(0) >= capacity(inputs.caps, n),
+                }
         })
     };
     for w in waiting_in_order(jobs) {
@@ -231,6 +263,9 @@ pub fn schedule_with<'a>(
         match reason {
             None => {
                 gates.iter_mut().for_each(|g| g.admit(w));
+                if let Some(picked) = gates.iter().find_map(|g| g.picked(w)) {
+                    plan.instances.insert(w.id, picked);
+                }
                 active = true;
                 plan.admitted.push(w.id);
             }
@@ -606,6 +641,154 @@ mod tests {
         // Unconfigured resources have one slot.
         let jobs = vec![need(job(1, 1, false), "x"), need(job(2, 1, false), "x")];
         assert_eq!(plan_with(&jobs, 2_000, 16 * GB, LIM, &caps).0, vec![1]);
+    }
+
+    /// A job that needs `android`, with the ready instances it published (waiting) or the
+    /// instance it holds (running).
+    fn on_device(id: u64, running: bool, ready: &[&str], holds: Option<&str>) -> Job {
+        let mut j = job(id, 1, running);
+        j.needs = vec!["android".into()];
+        if !running {
+            j.ready
+                .insert("android".into(), ready.iter().map(|s| s.to_string()).collect());
+        }
+        if let Some(i) = holds {
+            j.instances.insert("android".into(), i.into());
+        }
+        j
+    }
+
+    fn schedule_leased(jobs: &[Job], leases: &[Lease]) -> Plan {
+        schedule(
+            jobs,
+            &Inputs {
+                now_ms: 2_000,
+                free_ram: 16 * GB,
+                limits: LIM,
+                caps: &BTreeMap::new(),
+                leases,
+                foreign: &[],
+            },
+        )
+    }
+
+    fn picked(plan: &Plan, id: u64) -> Option<&str> {
+        plan.instances
+            .get(&id)
+            .and_then(|m| m.get("android"))
+            .map(String::as_str)
+    }
+
+    #[test]
+    fn instances_go_one_per_job() {
+        let both = ["emulator-5554", "emulator-5556"];
+        // Two waiters, two instances: both start, each with its own.
+        let jobs = vec![on_device(1, false, &both, None), on_device(2, false, &both, None)];
+        let plan = schedule_leased(&jobs, &[]);
+        assert_eq!(plan.admitted, vec![1, 2]);
+        assert_eq!(picked(&plan, 1), Some("emulator-5554"));
+        assert_eq!(picked(&plan, 2), Some("emulator-5556"));
+        // A third waits for one of them.
+        let mut jobs = jobs;
+        jobs.push(on_device(3, false, &both, None));
+        let plan = schedule_leased(&jobs, &[]);
+        assert_eq!(plan.admitted, vec![1, 2]);
+        assert_eq!(plan.reason(3), Block::Resource("android".into()));
+        // A running job holds the first: the waiter gets the second, whatever the order.
+        let jobs = vec![
+            on_device(1, true, &[], Some("emulator-5554")),
+            on_device(2, false, &both, None),
+            on_device(3, false, &both, None),
+        ];
+        let plan = schedule_leased(&jobs, &[]);
+        assert_eq!(plan.admitted, vec![2]);
+        assert_eq!(picked(&plan, 2), Some("emulator-5556"));
+        // A lease holds the second.
+        let lease = Lease {
+            id: "abc123".into(),
+            resources: vec!["android".into()],
+            instances: BTreeMap::from([("android".to_string(), "emulator-5556".to_string())]),
+            until_ms: u64::MAX,
+            ..Lease::default()
+        };
+        let jobs = vec![on_device(1, false, &both, None), on_device(2, false, &both, None)];
+        let plan = schedule_leased(&jobs, std::slice::from_ref(&lease));
+        assert_eq!(plan.admitted, vec![1]);
+        assert_eq!(picked(&plan, 1), Some("emulator-5554"));
+    }
+
+    #[test]
+    fn a_waiter_takes_only_its_ready_instances() {
+        // Job 1 found only the second instance healthy; job 2 both. Job 1 gets the second,
+        // job 2 the first, so both start.
+        let jobs = vec![
+            on_device(1, false, &["emulator-5556"], None),
+            on_device(2, false, &["emulator-5554", "emulator-5556"], None),
+        ];
+        let plan = schedule_leased(&jobs, &[]);
+        assert_eq!(plan.admitted, vec![1, 2]);
+        assert_eq!(picked(&plan, 1), Some("emulator-5556"));
+        assert_eq!(picked(&plan, 2), Some("emulator-5554"));
+        // No ready instance: its own reason, and it never holds later jobs back.
+        let mut lonely = on_device(1, false, &[], None);
+        lonely.queued_ms = 0;
+        let jobs = vec![lonely, job(2, 1, false)];
+        let lim = Limits {
+            pass_limit_ms: 1,
+            ..LIM
+        };
+        let caps = BTreeMap::new();
+        let plan = schedule(
+            &jobs,
+            &Inputs {
+                now_ms: 100_000,
+                free_ram: 16 * GB,
+                limits: lim,
+                caps: &caps,
+                leases: &[],
+                foreign: &[],
+            },
+        );
+        assert_eq!(plan.reason(1), Block::NoInstance("android".into()));
+        assert_eq!(plan.admitted, vec![2], "past the pass limit, yet passed");
+    }
+
+    #[test]
+    fn count_only_holders_and_lease_users() {
+        let both = ["a", "b"];
+        // A running holder without an instance (an older calmrun, or no instances in its
+        // config) takes one of the two: one waiter starts.
+        let jobs = vec![
+            on_device(1, true, &[], None),
+            on_device(2, false, &both, None),
+            on_device(3, false, &both, None),
+        ];
+        assert_eq!(schedule_leased(&jobs, &[]).admitted, vec![2]);
+        // A count-only waiter counts instance holders as slots (1 by default).
+        let mut count_only = job(2, 1, false);
+        count_only.needs = vec!["android".into()];
+        let jobs = vec![on_device(1, true, &[], Some("a")), count_only];
+        assert_eq!(
+            schedule_leased(&jobs, &[]).reason(2),
+            Block::Resource("android".into())
+        );
+        // A job that uses a lease gets the lease's instance and takes none of its own.
+        let lease = Lease {
+            id: "abc123".into(),
+            resources: vec!["android".into()],
+            instances: BTreeMap::from([("android".to_string(), "b".to_string())]),
+            until_ms: u64::MAX,
+            ..Lease::default()
+        };
+        let mut user = on_device(1, false, &["a"], None);
+        user.use_leases = vec!["abc123".into()];
+        let other = on_device(2, false, &["a"], None);
+        let jobs = vec![user.clone(), other];
+        let plan = schedule_leased(&jobs, std::slice::from_ref(&lease));
+        assert_eq!(plan.admitted, vec![1, 2], "the lease user leaves `a` free");
+        assert_eq!(picked(&plan, 1), None);
+        assert_eq!(picked(&plan, 2), Some("a"));
+        assert_eq!(lease_instances(&user, &[lease])["android"], "b");
     }
 
     #[test]

@@ -243,9 +243,58 @@ A job starts when **all** of these hold:
   emulator, one GPU. Waiters say who holds it:
   `calmrun: waiting for resource "db" (1 of 1 slot(s) held by npm test), 2nd in line`.
   A resource name uses letters, digits, `-`, `_` and `.` (not first); anything else exits 2.
-  A [lease](#leases-holding-a-resource-without-a-command) also holds a slot.
+  A [lease](#leases-holding-a-resource-without-a-command) also holds a slot. A resource can
+  also list its [instances](#resources-with-instances-devices) (two emulators, three
+  simulators): each job then gets its own free one.
 
 Points, keys and resource slots are taken all-or-nothing.
+
+### Resources with instances (devices)
+
+When a resource is a set of things that each serve one job at a time, such as emulators,
+devices or simulators, list them. Each job that needs the resource gets one free instance, and
+calmrun tells it which:
+
+```toml
+[resources]
+android = ["emulator-5554", "emulator-5556"]     # a fixed list
+
+[resources.emulator]                             # or a table
+discover = "adb devices"                         # list them with a command
+health = "adb -s {instance} get-state"           # skip an instance whose check fails
+env = "ANDROID_SERIAL"                           # the variable to set (default below)
+```
+
+```sh
+calmrun --needs android -- ./gradlew connectedAndroidTest   # ANDROID_SERIAL=emulator-5554
+calmrun --needs android -- ./gradlew connectedAndroidTest   # at the same time: emulator-5556
+```
+
+- The job gets the instance in `CALMRUN_<NAME>` (`CALMRUN_ANDROID`; characters other than
+  letters and digits become `_`) and in the variable named by `env`. For `android` and
+  `emulator` that variable is `ANDROID_SERIAL` by default, which `adb` and Gradle's
+  `connected*` tasks follow. Gradle's `connected*` tasks need `emulator` by themselves, so
+  `[resources.emulator]` gives them a device each without `--needs`.
+- `calmrun` prints `calmrun: using android emulator-5554 (CALMRUN_ANDROID, ANDROID_SERIAL)`
+  when the job starts. `status` shows it under the job (`uses: android=emulator-5554`);
+  `status --json`, MCP `run_task`, `task_status` and `queue_status` carry `instances`.
+- `discover` is a command whose output lists instances, one per line: the first word of each
+  line counts. Blank lines, `#` comments, `*` notes, the `List of devices attached` header of
+  `adb devices`, and devices that are `offline`, `unauthorized` or otherwise not ready are
+  skipped. The fixed `instances` come first, then the discovered ones.
+- `health` runs for each instance with `{instance}` replaced (also in `CALMRUN_INSTANCE`); an
+  instance whose check does not exit 0 within 10 s is skipped. An instance name may only use
+  letters, digits and `- _ . : @ / +`, so it is safe in a command line.
+- The waiting job runs these commands itself, outside every lock, and looks again every 5 s
+  while it waits. When no instance is ready, it waits with
+  `calmrun: waiting for a ready instance of "android" (…)`, and it never holds back the jobs
+  behind it. When every ready instance is in use, it waits like any resource:
+  `waiting for resource "android" (all 2 ready instance(s) in use by …)`.
+- A [lease](#leases-holding-a-resource-without-a-command) holds one instance; jobs that use
+  the lease get that instance. A resource without instances (`db = 1`) works as before.
+
+Instances need calmrun 0.6 or newer in every process that shares the queue: an older calmrun
+counts the resource as one slot and drops the instance records when it rewrites the state.
 
 ### Order and passing
 
@@ -327,6 +376,12 @@ calmrun release "$lease"
   `connected*` task there, which needs the emulator by itself, just runs). A job started with
   `CALMRUN_LEASE=<id>[,<id>…]` may use those leases' resources from any folder. Another
   `hold` always takes slots of its own.
+- For a [resource with instances](#resources-with-instances-devices), the lease holds one free
+  instance and its jobs get that one (`ANDROID_SERIAL`, `CALMRUN_ANDROID`). `hold` names it on
+  stderr (`calmrun: holding android=emulator-5556 for 4h00m (lease 3fa2c1) …`), and `status`
+  shows it. `hold --print-env` prints `NAME=VALUE` lines on stdout instead of the bare id, for
+  a script: `CALMRUN_LEASE=3fa2c1`, then `CALMRUN_ANDROID=emulator-5556` and
+  `ANDROID_SERIAL=emulator-5556`.
 - `release` exits 0 when the lease is released and also when it is already gone (a note on
   stderr). An id of the wrong shape exits 2.
 - Jobs with `--needs emulator` wait while a lease holds the emulator's only slot. Such a job
@@ -569,7 +624,7 @@ log = false             # true: every run keeps a log, as with --log
 
 [resources]                      # named resources for --needs, with their slots
 db = 1
-emulator = 1
+android = ["emulator-5554", "emulator-5556"]   # or instances: one each per job
 
 [kinds.vitest]
 cost = 3                         # override a built-in cost
@@ -591,7 +646,7 @@ patterns = ["make", "bazel build"]
 | `critical_free_gb` | `CALMRUN_CRITICAL_FREE_GB` | 5% of RAM, at most 1 GB | Free-RAM floor that stops the biggest job; `0` = off |
 | `max_run_min` | `CALMRUN_MAX_RUN_MIN` | 60 for test, vitest, jest, pytest, typecheck, tsc, lint, eslint; none for other kinds | Run time limit in minutes for every kind without its own; `0` = no limit (exit 124 when it passes) |
 | `log` | `CALMRUN_LOG` | false | `true` (variable `1`) gives every CLI run a log, as `--log` does; `--no-log` or `CALMRUN_LOG=0` turns it off |
-| `[resources]` | `CALMRUN_RESOURCES` | none (1 slot each) | Named resource slots, e.g. `db=1,gpu=2`; the variable adds to the table |
+| `[resources]` | `CALMRUN_RESOURCES` | none (1 slot each) | Named resource slots, e.g. `db=1,gpu=2`, or [instances](#resources-with-instances-devices) (a list, or a table with `instances`, `discover`, `health`, `env`); the variable adds to the table, and a resource it names has slots, not instances |
 | `[kinds.<name>]` | | built-in costs | `cost`, `patterns` (command's first words) and `max_run_min` (wins over the global one) |
 | | `CALMRUN_LOW_CPU` | on | `0`, `false`, `no` or `off` keeps normal priority |
 | | `CALMRUN_HOOK_MODE` | deny | `rewrite` makes the agent hooks wrap commands themselves |

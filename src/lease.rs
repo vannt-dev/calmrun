@@ -45,6 +45,10 @@ pub struct HoldArgs {
     /// Extend this lease by --ttl from now instead of taking a new one.
     #[arg(long, value_name = "LEASE")]
     pub renew: Option<String>,
+    /// Print NAME=VALUE lines instead of the bare id: CALMRUN_LEASE, then the variables
+    /// for the instances it holds (ANDROID_SERIAL=emulator-5554, CALMRUN_ANDROID=...).
+    #[arg(long, conflicts_with = "renew")]
+    pub print_env: bool,
 }
 
 /// `calmrun release`.
@@ -120,7 +124,7 @@ pub fn renew(ctx: &mut Ctx, id: &str, ttl: Option<Duration>) -> Result<Option<Le
 pub fn line(l: &Lease, now: u64) -> String {
     format!(
         "{}  \"{}\"  (lease {}, held {}, expires in {}{})",
-        l.resources.join(","),
+        crate::pools::describe(&l.resources, &l.instances),
         l.label,
         l.id,
         crate::history::human_ms(now.saturating_sub(l.granted_ms)),

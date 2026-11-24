@@ -10,8 +10,8 @@ use crate::messages::{self, WaitContext};
 use crate::scheduler::{self, Inputs, Limits};
 use crate::state::{self, Job, Lease, OtherQueue, Settings, State, Store};
 use crate::sys::{DiskCheck, Sys};
-use crate::{history, joblog, runner};
-use std::collections::HashMap;
+use crate::{history, joblog, pools, runner};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -318,6 +318,9 @@ pub struct Outcome {
     /// The job's id in its queue and its log, once it ran (for `calmrun logs` afterwards).
     pub job_id: Option<u64>,
     pub log: Option<String>,
+    /// The instance the job got of each resource that has instances (`android` ->
+    /// `emulator-5554`).
+    pub instances: BTreeMap<String, String>,
 }
 
 impl Outcome {
@@ -404,6 +407,8 @@ struct Prepared {
     cwd_key: String,
     /// The run time limit and where it comes from.
     limit: Option<(Duration, LimitFrom)>,
+    /// The instances it got when admitted (resources that have instances).
+    instances: BTreeMap<String, String>,
 }
 
 impl Prepared {
@@ -457,8 +462,16 @@ pub fn run(ctx: &mut Ctx, req: Request, notify: &mut dyn Notify) -> Outcome {
     };
     notify.queued(entry.id);
     let started_ms = match wait_turn(ctx, &store, &p, &entry, notify) {
-        Ok(Admitted::Started(t)) => t,
-        Ok(Admitted::Leased(_)) => return p.outcome(),
+        Ok(Admitted::Started(t, instances)) => {
+            if !instances.is_empty() {
+                let env = pools::env_for(&instances, &ctx.cfg.pools);
+                notify.note(&messages::instances_line(&instances, &env));
+                p.req.env.extend(env);
+                p.instances = instances;
+            }
+            t
+        }
+        Ok(Admitted::Leased(..)) => return p.outcome(),
         Err(out) => {
             // Ctrl+C, a cancelled MCP task or `calmrun stop` while waiting: it never started.
             if matches!(out.status.as_str(), "cancelled" | "stopped") {
@@ -546,6 +559,7 @@ fn prepare(ctx: &Ctx, mut req: Request) -> std::result::Result<Prepared, Box<Out
         hold_ttl: None,
         hold_for: None,
         limit,
+        instances: BTreeMap::new(),
     })
 }
 
@@ -707,10 +721,10 @@ fn enqueue(ctx: &mut Ctx, store: &Store, p: &Prepared, notify: &mut dyn Notify) 
 
 /// How a wait ended well.
 enum Admitted {
-    /// The command may start; the start time.
-    Started(u64),
-    /// A hold was granted: the lease id.
-    Leased(String),
+    /// The command may start: the start time and the instances it got.
+    Started(u64, BTreeMap<String, String>),
+    /// A hold was granted: the lease id and the instances it holds.
+    Leased(String, BTreeMap<String, String>),
 }
 
 /// What one poll found.
@@ -748,6 +762,8 @@ fn wait_turn(
     let mut last_fp = None;
     // Read outside every lock, and only when a line is wanted.
     let mut usual: Option<(Instant, history::Usual)> = None;
+    // Discover and health commands also run outside every lock, refreshed every few seconds.
+    let mut probe = pools::Probe::default();
     loop {
         if p.cancelled() {
             let _ = store.with_lock(|s| s.jobs.retain(|j| j.id != entry.id));
@@ -764,11 +780,13 @@ fn wait_turn(
             usual = Some((Instant::now(), history::Usual::load(store.history_path())));
         }
         let short = disk.short();
+        let ready = probe.ready(&entry.needs, &ctx.cfg.pools);
         let input = TickInput {
             store,
             entry,
             disk: &disk,
             short,
+            ready,
             want_line,
             hold_for: p.hold_for.as_ref(),
             usual: usual.as_ref().map(|u| &u.1),
@@ -826,6 +844,8 @@ struct TickInput<'a> {
     entry: &'a Job,
     disk: &'a DiskCheck,
     short: bool,
+    /// The ready instances of our needs that have instances, to publish in our entry.
+    ready: BTreeMap<String, Vec<String>>,
     want_line: bool,
     hold_for: Option<&'a (String, String)>,
     usual: Option<&'a history::Usual>,
@@ -857,10 +877,14 @@ fn tick(ctx: &mut Ctx, t: &TickInput) -> Result<Tick> {
                     s.jobs.retain(|j| j.id != entry.id);
                     return Tick::Stopped;
                 }
-                Some(j) => j.disk_short = t.short,
+                Some(j) => {
+                    j.disk_short = t.short;
+                    j.ready.clone_from(&t.ready);
+                }
                 // Our entry vanished (state file removed by hand); put it back.
                 None => s.jobs.push(Job {
                     disk_short: t.short,
+                    ready: t.ready.clone(),
                     ..entry.clone()
                 }),
             }
@@ -877,25 +901,34 @@ fn tick(ctx: &mut Ctx, t: &TickInput) -> Result<Tick> {
                 },
             );
             if plan.admits(entry.id) {
+                // Our own picks, then the instances of the leases we use for the other needs.
+                let mut instances = plan.instances.get(&entry.id).cloned().unwrap_or_default();
+                let me = s.jobs.iter().find(|j| j.id == entry.id).unwrap_or(entry);
+                for (n, i) in scheduler::lease_instances(me, &s.leases) {
+                    instances.entry(n).or_insert(i);
+                }
                 if let Some(ttl) = entry.hold_ttl_ms {
                     // Granted in the same locked step, so the slots are never free between.
-                    let lease = grant(s, entry, ttl, now, t.hold_for);
-                    return Tick::Admitted(Admitted::Leased(lease));
+                    let lease = grant(s, entry, ttl, now, t.hold_for, &instances);
+                    return Tick::Admitted(Admitted::Leased(lease, instances));
                 }
                 if let Some(j) = s.jobs.iter_mut().find(|j| j.id == entry.id) {
                     j.started_ms = Some(now);
                     j.disk_short = false;
+                    j.ready.clear();
+                    j.instances.clone_from(&instances);
                     // Again here: a 0.3 calmrun that rewrote the state meanwhile dropped it.
                     j.timeout_ms = entry.timeout_ms;
                 }
-                return Tick::Admitted(Admitted::Started(now));
+                return Tick::Admitted(Admitted::Started(now, instances));
             }
             let waiting = scheduler::waiting_in_order(&s.jobs);
             let place = waiting.iter().position(|j| j.id == entry.id).unwrap_or(0);
             let running = s.jobs.len() - waiting.len();
             let line = t.want_line.then(|| {
                 let c = WaitContext {
-                    me: entry,
+                    // As published (its ready instances), not as it joined.
+                    me: s.jobs.iter().find(|j| j.id == entry.id).unwrap_or(entry),
                     budget: limits.budget,
                     disk: Some(t.disk),
                     caps,
@@ -924,7 +957,14 @@ fn tick(ctx: &mut Ctx, t: &TickInput) -> Result<Tick> {
 }
 
 /// Turn an admitted hold entry into a lease. Returns the new lease id.
-fn grant(s: &mut State, entry: &Job, ttl_ms: u64, now: u64, owner: Option<&(String, String)>) -> String {
+fn grant(
+    s: &mut State,
+    entry: &Job,
+    ttl_ms: u64,
+    now: u64,
+    owner: Option<&(String, String)>,
+    instances: &BTreeMap<String, String>,
+) -> String {
     let id = crate::lease::new_id(|id| s.leases.iter().any(|l| l.id == id));
     s.jobs.retain(|j| j.id != entry.id);
     s.leases.push(Lease {
@@ -939,6 +979,7 @@ fn grant(s: &mut State, entry: &Job, ttl_ms: u64, now: u64, owner: Option<&(Stri
         ttl_ms,
         for_dir: owner.map(|o| o.0.clone()),
         for_key: owner.map(|o| o.1.clone()),
+        instances: instances.clone(),
     });
     id
 }
@@ -1018,12 +1059,13 @@ pub struct HoldRequest {
 }
 
 /// Wait in the queue like a job with `--needs`, then record a lease instead of running
-/// anything. Returns the lease id, or the outcome when it was not granted.
+/// anything. Returns the lease id and the instances it holds (resources that have
+/// instances), or the outcome when it was not granted.
 pub fn hold(
     ctx: &mut Ctx,
     h: HoldRequest,
     notify: &mut dyn Notify,
-) -> std::result::Result<String, Box<Outcome>> {
+) -> std::result::Result<(String, BTreeMap<String, String>), Box<Outcome>> {
     let needs = normalized(&h.resources);
     let bad = match needs.is_empty() {
         true => Some(Error::InvalidResource(h.resources.join(","))),
@@ -1057,14 +1099,15 @@ pub fn hold(
             (shown.to_string_lossy().to_string(), crate::sys::path_key(d))
         }),
         limit: None,
+        instances: BTreeMap::new(),
     };
     let store = ctx.store().map_err(|e| Box::new(p.outcome().error(&e)))?;
     let entry = enqueue(ctx, &store, &p, notify).map_err(|e| Box::new(p.outcome().error(&e)))?;
     notify.queued(entry.id);
     match wait_turn(ctx, &store, &p, &entry, notify)? {
-        Admitted::Leased(id) => Ok(id),
+        Admitted::Leased(id, instances) => Ok((id, instances)),
         // Not reachable for a hold entry; leave the line rather than hold nothing.
-        Admitted::Started(_) => {
+        Admitted::Started(..) => {
             let _ = store.with_lock(|s| s.jobs.retain(|j| j.id != entry.id));
             Err(Box::new(p.outcome().ended(
                 1,
@@ -1111,6 +1154,8 @@ struct Watcher<'a> {
     reason: Option<StopReason>,
     /// The job's log, watched for new output (`output_ms`).
     output: Option<joblog::Output>,
+    /// The instances the job got, published again with each sample.
+    instances: &'a BTreeMap<String, String>,
 }
 
 impl<'a> Watcher<'a> {
@@ -1127,6 +1172,7 @@ impl<'a> Watcher<'a> {
             stop_checked: None,
             reason: None,
             output: job_log(&p.req).map(joblog::Output::new),
+            instances: &p.instances,
         }
     }
 
@@ -1188,6 +1234,7 @@ impl<'a> Watcher<'a> {
             }
             if self.samples % MEM_PUBLISH_EVERY == 1 {
                 let (used, cpu_ms, cpu_pct, busy_ms) = (mem.used, mem.cpu_ms, mem.cpu_pct, self.busy_ms);
+                let instances = self.instances;
                 // The limit too: a 0.3 calmrun that rewrote the state dropped it.
                 let timeout_ms = self.limit.as_ref().map(|l| l.0.as_millis() as u64);
                 // New output rides along with the memory sample.
@@ -1201,6 +1248,10 @@ impl<'a> Watcher<'a> {
                             j.busy_ms = busy_ms;
                             j.timeout_ms = timeout_ms;
                             j.output_ms = output.or(j.output_ms);
+                            // So are the instances: without them another job could get ours.
+                            if j.instances.is_empty() {
+                                j.instances.clone_from(instances);
+                            }
                         }
                     })
                 });
@@ -1268,6 +1319,7 @@ fn execute(
     let _ = store.with_lock(|s| s.jobs.retain(|j| j.id != id));
     out.job_id = Some(id);
     out.log = log;
+    out.instances = p.instances.clone();
     out.wait_ms = wait_ms;
     out.run_ms = now_ms().saturating_sub(started_ms);
     out

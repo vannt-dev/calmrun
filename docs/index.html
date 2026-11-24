@@ -610,7 +610,7 @@ Do not wrap light commands (git, ls, cat, package installs).</pre>
             <tr><th><code>calmrun init</code></th><td data-i18n="cmd.init">Write a commented <code>config.toml</code> with this machine's defaults (<code>--force</code> overwrites).</td></tr>
             <tr><th><code>calmrun guide</code></th><td data-i18n="cmd.guide">Short instructions for coding agents.</td></tr>
             <tr><th><code>calmrun setup</code></th><td data-i18n="cmd.setup">Write or remove the calmrun block in agents' global instruction files: <code>--write</code>, <code>--remove</code>, <code>--hook</code>, <code>--agents</code>.</td></tr>
-            <tr><th><code>calmrun hold</code> / <code>release</code></th><td data-i18n="cmd.hold">Hold a resource slot (an emulator, a database) without a command and print a lease; <code>release &lt;lease&gt;</code> gives it back, <code>release --ticket &lt;id&gt;</code> gives up a kept place.</td></tr>
+            <tr><th><code>calmrun hold</code> / <code>release</code></th><td data-i18n="cmd.hold">Hold a resource slot (an emulator, a database) without a command and print a lease (with the instance it holds, if the resource lists instances); <code>release &lt;lease&gt;</code> gives it back, <code>release --ticket &lt;id&gt;</code> gives up a kept place.</td></tr>
             <tr><th><code>calmrun hook &lt;agent&gt;</code></th><td data-i18n="cmd.hook">The PreToolUse hook of <code>claude</code>, <code>codex</code>, <code>opencode</code>, <code>pi</code> or <code>antigravity</code> (experimental); reads the hook JSON on stdin.</td></tr>
             <tr><th><code>calmrun mcp</code></th><td data-i18n="cmd.mcp">The MCP server on stdio: <code>run_task</code>, <code>task_status</code>, <code>cancel_task</code>, <code>queue_status</code>, <code>bump</code>.</td></tr>
           </table>
@@ -647,7 +647,7 @@ Do not wrap light commands (git, ls, cat, package installs).</pre>
             <tr><th><code>vitest_workers</code><br /><code>CALMRUN_VITEST_WORKERS</code></th><td data-i18n="cfg.vitest">1 up to 4 cores, 2 below 12, else 3. The <code>--maxWorkers</code> given to direct vitest calls.</td></tr>
             <tr><th><code>ceiling_gb</code><br /><code>CALMRUN_CEILING_GB</code></th><td data-i18n="cfg.ceiling">Half the RAM. Memory one job's process tree may use; 0 turns it off.</td></tr>
             <tr><th><code>critical_free_gb</code><br /><code>CALMRUN_CRITICAL_FREE_GB</code></th><td data-i18n="cfg.critical">5% of RAM, at most 1 GB. Below this for 3 seconds, the biggest job is stopped; 0 turns it off.</td></tr>
-            <tr><th><code>[resources]</code><br /><code>CALMRUN_RESOURCES</code></th><td data-i18n="cfg.res">Slots per named resource, e.g. <code>db = 1</code> or <code>db=1,gpu=2</code>. Unlisted resources have 1 slot.</td></tr>
+            <tr><th><code>[resources]</code><br /><code>CALMRUN_RESOURCES</code></th><td data-i18n="cfg.res">Slots per named resource, e.g. <code>db = 1</code> or <code>db=1,gpu=2</code>. Unlisted resources have 1 slot. Or instances, one per job: <code>android = ["emulator-5554", "emulator-5556"]</code>, or a table with <code>discover</code> (<code>adb devices</code>), <code>health</code> (<code>adb -s {instance} get-state</code>) and <code>env</code>; the job gets its instance in <code>CALMRUN_ANDROID</code> and <code>ANDROID_SERIAL</code>.</td></tr>
             <tr><th><code>[kinds.&lt;name&gt;]</code></th><td data-i18n="cfg.kinds"><code>cost</code> overrides a kind's points; <code>patterns = ["make"]</code> adds a kind of your own; <code>max_run_min</code> sets its run time limit.</td></tr>
             <tr><th><code>max_run_min</code><br /><code>CALMRUN_MAX_RUN_MIN</code></th><td data-i18n="cfg.maxrun">60 for test, vitest, jest, pytest, typecheck, tsc, lint and eslint; no limit for builds and other kinds. Minutes a job may run before it is stopped (exit 124); 0 turns it off.</td></tr>
             <tr><th><code>log</code><br /><code>CALMRUN_LOG</code></th><td data-i18n="cfg.log">Off. Copy every run's output to a log file (as <code>--log</code>) for <code>calmrun logs</code>; tools then see a pipe, not a terminal, and may drop colours.</td></tr>
@@ -662,6 +662,7 @@ ceiling_gb = 8          <span class="dim"># 0 = off</span>
 
 [resources]
 db = 1
+android = ["emulator-5554", "emulator-5556"]  <span class="dim"># one each per job</span>
 
 [kinds.heavy]
 cost = 2
@@ -858,7 +859,7 @@ patterns = ["make", "bazel build"]</pre>
           'cmd.init': 'Ghi một <code>config.toml</code> có chú thích với giá trị mặc định của máy này (<code>--force</code> để ghi đè).',
           'cmd.guide': 'Hướng dẫn ngắn cho coding agent.',
           'cmd.setup': 'Ghi hoặc gỡ đoạn calmrun trong file hướng dẫn toàn cục của các agent: <code>--write</code>, <code>--remove</code>, <code>--hook</code>, <code>--agents</code>.',
-          'cmd.hold': 'Giữ một suất tài nguyên (emulator, database) mà không chạy lệnh và in ra một lease; <code>release &lt;lease&gt;</code> trả lại, <code>release --ticket &lt;id&gt;</code> bỏ chỗ đang được giữ.',
+          'cmd.hold': 'Giữ một suất tài nguyên (emulator, database) mà không chạy lệnh và in ra một lease (kèm instance đang giữ, nếu tài nguyên có liệt kê instance); <code>release &lt;lease&gt;</code> trả lại, <code>release --ticket &lt;id&gt;</code> bỏ chỗ đang được giữ.',
           'cmd.hook': 'PreToolUse hook của <code>claude</code>, <code>codex</code>, <code>opencode</code>, <code>pi</code> hoặc <code>antigravity</code> (thử nghiệm); đọc JSON của hook từ stdin.',
           'cmd.mcp': 'MCP server qua stdio: <code>run_task</code>, <code>task_status</code>, <code>cancel_task</code>, <code>queue_status</code>, <code>bump</code>.',
           'exit.h': 'Mã thoát',
@@ -882,7 +883,7 @@ patterns = ["make", "bazel build"]</pre>
           'cfg.vitest': '1 khi tới 4 lõi, 2 khi dưới 12 lõi, còn lại 3. Giá trị <code>--maxWorkers</code> cho các lần gọi vitest trực tiếp.',
           'cfg.ceiling': 'Một nửa RAM. Bộ nhớ tối đa cho cây tiến trình của một việc; 0 để tắt.',
           'cfg.critical': '5% RAM, tối đa 1 GB. Thấp hơn mức này trong 3 giây thì việc lớn nhất bị dừng; 0 để tắt.',
-          'cfg.res': 'Số slot cho mỗi tài nguyên có tên, ví dụ <code>db = 1</code> hoặc <code>db=1,gpu=2</code>. Tài nguyên không khai báo có 1 slot.',
+          'cfg.res': 'Số slot cho mỗi tài nguyên có tên, ví dụ <code>db = 1</code> hoặc <code>db=1,gpu=2</code>. Tài nguyên không khai báo có 1 slot. Hoặc liệt kê các instance, mỗi job một cái: <code>android = ["emulator-5554", "emulator-5556"]</code>, hoặc một bảng với <code>discover</code> (<code>adb devices</code>), <code>health</code> (<code>adb -s {instance} get-state</code>) và <code>env</code>; job nhận instance của nó qua <code>CALMRUN_ANDROID</code> và <code>ANDROID_SERIAL</code>.',
           'cfg.kinds': '<code>cost</code> ghi đè số điểm của một loại; <code>patterns = ["make"]</code> thêm một loại của riêng bạn; <code>max_run_min</code> đặt giới hạn thời gian chạy của nó.',
           'cfg.maxrun': '60 cho test, vitest, jest, pytest, typecheck, tsc, lint và eslint; build và các loại khác không giới hạn. Số phút một việc được chạy trước khi bị dừng (mã thoát 124); 0 để tắt.',
           'cfg.log': 'Tắt. Chép output của mọi lần chạy vào file log (như <code>--log</code>) cho <code>calmrun logs</code>; khi đó công cụ thấy pipe chứ không phải terminal và có thể tắt màu.',
