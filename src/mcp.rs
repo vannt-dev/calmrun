@@ -153,7 +153,7 @@ fn run_task_schema() -> Value {
                 "kind": {"type": "string", "description": "Job kind; detected from the command when omitted"},
                 "cost": {"type": "integer", "minimum": 1, "description": "Budget points; default by kind"},
                 "label": {"type": "string", "description": "Name shown in the queue"},
-                "timeout_s": {"type": "number", "exclusiveMinimum": 0, "description": "Stop the command after this many seconds (exit 124)"},
+                "timeout_s": {"type": "number", "exclusiveMinimum": 0, "description": "Stop the command after this many seconds (exit 124). Default: the config's max_run_min (60 min for test-like kinds, else no limit)"},
                 "prio": {"type": "string", "enum": ["normal", "high", "low"], "description": "high goes before every normal job, low after every normal one (default normal)"},
                 "wait_timeout_s": {"type": "number", "exclusiveMinimum": 0, "description": "Give up waiting after this many seconds; the result carries a ticket that keeps the place in line for 10 minutes"},
                 "ticket": {"type": "integer", "description": "Ticket from an earlier wait timeout: resume that place in line"},
@@ -170,10 +170,12 @@ fn task_status_schema() -> Value {
     json!({
         "name": "task_status",
         "title": "Follow a run_task task",
-        "description": "State of a task started by run_task: waiting (with place in line and points), \
-            running, or done (with exit code and status); wait and run time; and the output written since \
-            output_offset (at most the newest 32 KB) with next_offset to pass next time. With \
-            wait_seconds it waits up to that long for the task to finish first.",
+        "description": "State of a task started by run_task: waiting (with place in line and points, \
+            and how the running jobs ahead are doing), running (with CPU use, idle time, usual run time \
+            and run time limit), or done (with exit code and status); wait and run time; and the output \
+            written since output_offset (at most the newest 32 KB) with next_offset to pass next time. \
+            With wait_seconds it waits up to that long for the task to finish first. Idle is a hint only: \
+            a job waiting for docker or the network uses no CPU and may still be working.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -205,8 +207,9 @@ fn queue_status_schema() -> Value {
     json!({
         "name": "queue_status",
         "title": "Show the calmrun queue",
-        "description": "Running and waiting jobs (label, kind, cost, pid, cwd, time), the point \
-            budget, free RAM and warnings about jobs that have waited a long time.",
+        "description": "Running and waiting jobs (id, label, kind, cost, pid, cwd, time; for running \
+            jobs CPU use, idle time, usual run time and run time limit), the point budget, free RAM and \
+            warnings about jobs that have waited a long time or look stuck.",
         "inputSchema": {"type": "object", "properties": {"queue": {"type": "string", "description": QUEUE_PROP}}}
     })
 }
@@ -541,13 +544,32 @@ fn pending_result(task: &Task, snap: &tasks::Snapshot, offset: u64) -> Value {
                 .trim_start_matches("calmrun: "),
             history::human_ms(snap.wait_ms(now))
         ),
-        _ => format!(
-            "task {} is running (waited {}, running for {})",
-            task.id,
-            history::human_ms(snap.wait_ms(now)),
-            history::human_ms(snap.run_ms(now))
-        ),
+        _ => {
+            let hint = place
+                .as_ref()
+                .and_then(|p| p["hint"].as_str())
+                .filter(|h| !h.is_empty())
+                .map(|h| format!("; {h}"))
+                .unwrap_or_default();
+            format!(
+                "task {} is running (waited {}, running for {}{hint})",
+                task.id,
+                history::human_ms(snap.wait_ms(now)),
+                history::human_ms(snap.run_ms(now))
+            )
+        }
     };
+    // The running jobs that look stuck (idle, or much longer than usual), with what to do.
+    for n in place
+        .as_ref()
+        .and_then(|p| p["next"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        text.push('\n');
+        text.push_str(n);
+    }
     text.push_str(&format!(
         "\nIt keeps its place and goes on in the background: call task_status with \
          {{\"task_id\": \"{}\", \"output_offset\": {next}}} to follow it, or cancel_task to stop it.\n",
@@ -570,13 +592,18 @@ fn pending_result(task: &Task, snap: &tasks::Snapshot, offset: u64) -> Value {
     });
     if let Some(p) = place {
         for (k, v) in p.as_object().into_iter().flatten() {
-            structured[k] = v.clone();
+            // The task's own times win over the queue's view of them.
+            if structured.get(k).is_none() {
+                structured[k] = v.clone();
+            }
         }
     }
     text_result(text, false, Some(structured))
 }
 
-/// Place in line and points of the task's job, read from its queue.
+/// Place in line and points of the task's job, read from its queue; with the hints about
+/// it (CPU, idle, usual run time, limit) once it runs, and about the running jobs while it
+/// waits.
 fn queue_place(task: &Task, job_id: Option<u64>) -> Option<Value> {
     let id = job_id?;
     let mut ctx = Ctx::load().and_then(|c| c.with_queue(task.queue.clone())).ok()?;
@@ -584,7 +611,24 @@ fn queue_place(task: &Task, job_id: Option<u64>) -> Option<Value> {
     let budget = crate::queue::effective_limits(ctx.limits(), &s).budget;
     let waiting = scheduler::waiting_in_order(&s.jobs);
     let me = s.jobs.iter().find(|j| j.id == id)?;
-    Some(json!({
+    let now = queue::now_ms();
+    let usual = status::usual(&ctx);
+    let flag = ctx
+        .queue
+        .as_ref()
+        .map(|q| format!(" --id {q}"))
+        .unwrap_or_default();
+    let mut running = Vec::new();
+    for j in s.jobs.iter().filter(|j| j.running() && j.id != id) {
+        let mut v = json!({"job_id": j.id, "label": j.label, "cwd": j.cwd});
+        status::add_hints(&mut v, j, now, &usual);
+        running.push(v);
+    }
+    let next = match me.running() {
+        true => Vec::new(),
+        false => crate::messages::stuck_running_next(&s, now, Some(&usual), &flag),
+    };
+    let mut v = json!({
         "job_id": id,
         "label": me.label,
         "kind": me.kind,
@@ -594,7 +638,11 @@ fn queue_place(task: &Task, job_id: Option<u64>) -> Option<Value> {
         "running": s.jobs.iter().filter(|j| j.running()).count(),
         "used": scheduler::used_points(&s.jobs, budget) + scheduler::leased_points(&s.leases, budget),
         "budget": budget,
-    }))
+        "running_jobs": running,
+        "next": next,
+    });
+    status::add_hints(&mut v, me, now, &usual);
+    Some(v)
 }
 
 fn task_arg(c: &Call) -> Result<Arc<Task>, Value> {

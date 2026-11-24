@@ -21,8 +21,10 @@ mod setup;
 mod shell;
 mod state;
 mod status;
+mod stop;
 mod sys;
 mod tasks;
+mod watch;
 
 use clap::Parser;
 use cli::{Cli, Sub};
@@ -47,6 +49,7 @@ fn dispatch(cli: Cli) -> i32 {
         Some(Sub::Status { json }) => with_ctx(&|c| commands::status(c, json)),
         Some(Sub::Stats { days, json }) => commands::stats(days, json),
         Some(Sub::Bump(ref a)) => with_ctx(&|c| commands::bump(c, a)),
+        Some(Sub::Stop(ref a)) => with_ctx(&|c| commands::stop(c, a)),
         Some(Sub::Hold(ref a)) => with_ctx(&|c| commands::hold(c, a)),
         Some(Sub::Release(ref a)) => with_ctx(&|c| commands::release(c, a)),
         Some(Sub::Doctor) => with_ctx(&commands::doctor),

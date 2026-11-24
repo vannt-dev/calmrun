@@ -54,6 +54,18 @@ pub fn report(
         "  critical_free_gb = {:.2}\n",
         bytes_to_gb(cfg.critical_free_bytes)
     );
+    s += &format!(
+        "  max_run_min     = {}\n",
+        match cfg.max_run_min {
+            Some(m) if m > 0.0 => format!("{m} (every kind without its own)"),
+            Some(_) => "0 (no limit)".to_string(),
+            None => format!(
+                "{} for {}; none for other kinds",
+                crate::kinds::DEFAULT_MAX_RUN_MIN,
+                crate::kinds::LIMITED_KINDS.join(", ")
+            ),
+        }
+    );
     s += &format!("  low cpu         = {}\n", if cfg.low_cpu { "on" } else { "off" });
     s += &format!(
         "\nWorkers calmrun passes to each tool (unless you set them; at the tool's default cost, budget {}):\n",

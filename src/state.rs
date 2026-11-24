@@ -79,6 +79,10 @@ pub struct Job {
     /// Last time the running command wrote output to that log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_ms: Option<u64>,
+    /// CPU the running tree used over the last sample, in percent of one core (`cpu_ms`
+    /// alone gives no recent rate).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_pct: Option<u32>,
 }
 
 impl Job {
@@ -627,12 +631,17 @@ mod tests {
             assert!(written.get(k).is_none(), "{k} written at its default");
         }
         assert!(written.get("output_ms").is_none());
+        assert!(written.get("cpu_pct").is_none());
         // Set fields survive a round trip.
         let set = Job {
             low: true,
             bumped: true,
             stop_ms: Some(5),
             log_path: Some("l".into()),
+            timeout_ms: Some(60_000),
+            cpu_ms: Some(1_500),
+            busy_ms: Some(9),
+            cpu_pct: Some(40),
             ..job
         };
         let back: Job = serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();

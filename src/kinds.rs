@@ -235,6 +235,27 @@ pub const KINDS: &[KindSpec] = &[
 /// Cost of a kind nobody knows (and of `other`).
 pub const UNKNOWN_COST: u32 = 1;
 
+/// Kinds that get a run time limit by default: a test run, type check or lint still going
+/// after an hour is almost always stuck. Builds, monorepo runs, docker, captures and unknown
+/// kinds may rightly run for hours, so they get none.
+pub const LIMITED_KINDS: &[&str] = &[
+    "test",
+    "vitest",
+    "jest",
+    "pytest",
+    "typecheck",
+    "tsc",
+    "lint",
+    "eslint",
+];
+/// That default limit, in minutes.
+pub const DEFAULT_MAX_RUN_MIN: f64 = 60.0;
+
+/// The built-in run time limit of a kind, in minutes (`None`: no limit).
+pub fn default_max_run_min(kind: &str) -> Option<f64> {
+    LIMITED_KINDS.contains(&kind).then_some(DEFAULT_MAX_RUN_MIN)
+}
+
 const COMPOSE_HEAVY: &[&str] = &["up", "build", "run", "create"];
 /// Stand-alone compose programs, and container CLIs with a `compose` subcommand.
 pub const COMPOSE: &[&str] = &["docker-compose", "podman-compose"];
@@ -1491,6 +1512,7 @@ mod tests {
             KindConfig {
                 cost: Some(4),
                 patterns: vec![],
+                ..KindConfig::default()
             },
         );
         assert_eq!(cost("vitest", &kinds), 4);
@@ -1518,6 +1540,7 @@ mod tests {
             KindConfig {
                 cost: Some(5),
                 patterns: vec![],
+                ..KindConfig::default()
             },
         );
         assert_eq!(

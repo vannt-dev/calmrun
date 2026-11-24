@@ -20,6 +20,108 @@ pub struct Record {
     /// The separate queue (`--id`) it ran in, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue: Option<String>,
+    /// The folder it ran in, as a path key (absent in lines written before 0.4), so the usual
+    /// run time of `npx vitest` is not mixed across projects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+/// The newest successful runs kept per label (and per label and folder) for a median.
+const USUAL_KEEP: usize = 20;
+/// Successful runs of the same label in the same folder needed for a usual run time.
+pub const USUAL_MIN_IN_FOLDER: usize = 3;
+/// Successful runs of the same label anywhere needed when the folder has too few.
+pub const USUAL_MIN_ANYWHERE: usize = 5;
+/// How much of the newest history the medians are read from.
+const USUAL_READ_BYTES: u64 = 1 << 20;
+
+/// Usual run times from the history: the median of the newest successful runs (status "0")
+/// of a label, in the same folder when there are enough, else anywhere.
+#[derive(Debug, Default, Clone)]
+pub struct Usual {
+    in_folder: std::collections::HashMap<(String, String), Vec<u64>>,
+    anywhere: std::collections::HashMap<String, Vec<u64>>,
+}
+
+impl Usual {
+    /// The newest part of the history at `path` (both files), read once.
+    pub fn load(path: &Path) -> Usual {
+        Usual::from_text(&read_tail(path, USUAL_READ_BYTES))
+    }
+
+    /// From history lines, oldest first.
+    pub fn from_text(text: &str) -> Usual {
+        let mut u = Usual::default();
+        let keep = |v: &mut Vec<u64>, ms: u64| {
+            v.push(ms);
+            if v.len() > USUAL_KEEP {
+                v.remove(0);
+            }
+        };
+        for r in text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Record>(l).ok())
+        {
+            if r.status != "0" {
+                continue;
+            }
+            keep(u.anywhere.entry(r.label.clone()).or_default(), r.run_ms);
+            if let Some(cwd) = r.cwd {
+                keep(u.in_folder.entry((r.label, cwd)).or_default(), r.run_ms);
+            }
+        }
+        u
+    }
+
+    /// The usual run time of `label` in the folder with path key `cwd_key`, if the history
+    /// has enough successful runs.
+    pub fn median(&self, label: &str, cwd_key: &str) -> Option<u64> {
+        let here = self.in_folder.get(&(label.to_string(), cwd_key.to_string()));
+        match (here, self.anywhere.get(label)) {
+            (Some(v), _) if v.len() >= USUAL_MIN_IN_FOLDER => Some(median(v)),
+            (_, Some(v)) if v.len() >= USUAL_MIN_ANYWHERE => Some(median(v)),
+            _ => None,
+        }
+    }
+}
+
+fn median(v: &[u64]) -> u64 {
+    let mut s = v.to_vec();
+    s.sort_unstable();
+    let n = s.len();
+    match n {
+        0 => 0,
+        _ if n % 2 == 1 => s[n / 2],
+        _ => (s[n / 2 - 1] + s[n / 2]) / 2,
+    }
+}
+
+/// The last `max` bytes of the history (the rotated file first when the current one is
+/// shorter), starting at a whole line.
+pub fn read_tail(path: &Path, max: u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let tail = |p: &Path, want: u64| -> Vec<u8> {
+        let Ok(mut f) = std::fs::File::open(p) else {
+            return Vec::new();
+        };
+        let len = f.metadata().map_or(0, |m| m.len());
+        let from = len.saturating_sub(want);
+        let mut buf = Vec::new();
+        if f.seek(SeekFrom::Start(from)).is_ok() && f.read_to_end(&mut buf).is_ok() && from > 0 {
+            // Drop the partial first line.
+            let cut = buf.iter().position(|b| *b == b'\n').map_or(buf.len(), |i| i + 1);
+            buf.drain(..cut);
+        }
+        buf
+    };
+    let mut now = tail(path, max);
+    let room = max.saturating_sub(std::fs::metadata(path).map_or(0, |m| m.len()));
+    if room > 0 {
+        let mut old = tail(&previous(path), room);
+        old.append(&mut now);
+        now = old;
+    }
+    String::from_utf8_lossy(&now).into_owned()
 }
 
 /// Past this size `history.jsonl` becomes `history.1.jsonl` (replacing the older one), so
@@ -121,7 +223,7 @@ pub struct Row {
 
 /// Whether a record is a wait that never started its command.
 fn never_started(r: &Record) -> bool {
-    r.status == "abandoned" || (r.status == "cancelled" && r.run_ms == 0)
+    r.status == "abandoned" || (matches!(r.status.as_str(), "cancelled" | "stopped") && r.run_ms == 0)
 }
 
 /// Group the history since `since_ms` by label and kind.
@@ -206,6 +308,7 @@ mod tests {
                 run_ms: run,
                 status: st.into(),
                 queue: None,
+                cwd: None,
             })
             .unwrap()
         };
@@ -251,6 +354,7 @@ mod tests {
             run_ms: 1,
             status: "0".into(),
             queue: None,
+            cwd: None,
         };
         for i in 0..5 {
             append_rotating(&path, &rec(&format!("r{i}")), 200).unwrap();
@@ -264,6 +368,56 @@ mod tests {
         // The oldest lines went with an earlier rotated file; the newest are all there.
         assert_eq!(labels.last().map(String::as_str), Some("r4"));
         assert!(labels.windows(2).all(|w| w[0] < w[1]), "{labels:?}");
+    }
+
+    #[test]
+    fn usual_run_time_prefers_the_same_folder() {
+        let rec = |label: &str, cwd: Option<&str>, run: u64, st: &str| {
+            serde_json::to_string(&Record {
+                at: "2026-11-20T10:00:00Z".into(),
+                label: label.into(),
+                kind: "vitest".into(),
+                cost: 2,
+                wait_ms: 0,
+                run_ms: run,
+                status: st.into(),
+                queue: None,
+                cwd: cwd.map(String::from),
+            })
+            .unwrap()
+        };
+        let mut lines = vec![
+            rec("npx vitest", Some("/a"), 10_000, "0"),
+            rec("npx vitest", Some("/a"), 30_000, "0"),
+            rec("npx vitest", Some("/a"), 20_000, "0"),
+            // Failures do not count.
+            rec("npx vitest", Some("/a"), 900_000, "1"),
+            rec("npx vitest", Some("/b"), 300_000, "0"),
+            rec("npx vitest", None, 400_000, "0"),
+        ];
+        let u = Usual::from_text(&lines.join("\n"));
+        // Three runs in /a: their median. /b has one, so the five successful runs anywhere.
+        assert_eq!(u.median("npx vitest", "/a"), Some(20_000));
+        assert_eq!(u.median("npx vitest", "/b"), Some(30_000));
+        assert_eq!(u.median("cargo test", "/a"), None);
+        // Too few anywhere: no hint.
+        lines.truncate(2);
+        assert_eq!(
+            Usual::from_text(&lines.join("\n")).median("npx vitest", "/a"),
+            None
+        );
+        assert_eq!(median(&[4, 1, 3, 2]), 2);
+    }
+
+    #[test]
+    fn history_tail_starts_at_a_whole_line_and_reaches_the_rotated_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("history.jsonl");
+        std::fs::write(previous(&path), "old1\nold2\n").unwrap();
+        std::fs::write(&path, "new1\nnew2\n").unwrap();
+        assert_eq!(read_tail(&path, 1 << 20), "old1\nold2\nnew1\nnew2\n");
+        assert_eq!(read_tail(&path, 7), "new2\n");
+        assert_eq!(read_tail(&tmp.path().join("none").join("history.jsonl"), 100), "");
     }
 
     #[test]

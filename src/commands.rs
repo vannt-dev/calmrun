@@ -1,6 +1,6 @@
 //! The CLI subcommands. Each returns the process exit code.
 
-use crate::cli::{Cli, HookTarget, Prio, ProbeArgs};
+use crate::cli::{Cli, HookTarget, Prio, ProbeArgs, StopArgs};
 use crate::config::{self, bytes_to_gb};
 use crate::error::Error;
 use crate::lease::{self, HoldArgs, ReleaseArgs};
@@ -29,10 +29,17 @@ the same place in line (calmrun --ticket <id> -- ...). The place is kept for 10 
 See the queue:        calmrun status          (calmrun status --json for tools)
 Move a job forward:   calmrun bump <label>      (or --pos N, the # in calmrun status)
 Let others go first:  calmrun bump --back <label>, or run with --prio low
+A running job shows its CPU use, `idle 5m` when its processes have used no CPU for a while,
+and `usually 40s` from earlier runs. Idle is only a hint: a job waiting for docker or the
+network uses no CPU and may still be working. Stop a hung job (yours, or one you were asked
+to stop) with `calmrun stop <id>` (the id column of `calmrun status`).
+Run time limit: test-like kinds stop after 60 min (exit 124); --timeout SECS sets one run
+(--timeout 0 = no limit), max_run_min in the config sets the default.
 Hold a device/resource without running anything (prints a lease id; default 4 h):
     calmrun hold emulator --label \"my task\"   ...   calmrun release <lease>
 Exit codes: the command's own; 75 = not started in time (place kept); 2 = refused;
-127 = command not found; 130 = Ctrl+C; 137 = stopped by the memory ceiling.
+124 = run time limit; 127 = command not found; 130 = Ctrl+C or `calmrun stop`;
+137 = stopped by the memory ceiling.
 MCP: `calmrun mcp` offers run_task (returns a task_id when still busy after wait_seconds),
 task_status, cancel_task, queue_status and bump to agents that speak MCP.
 ";
@@ -63,6 +70,8 @@ pub fn run_queued(mut ctx: Ctx, cli: Cli) -> i32 {
             std::env::args().skip(1).collect(),
         )),
         wait_timeout: cli.wait_timeout.filter(|t| *t > 0.0).map(Duration::from_secs_f64),
+        // Zero (or less) means no limit for this run; absent takes the config's.
+        timeout: cli.timeout.map(|t| Duration::from_secs_f64(t.clamp(0.0, 1e9))),
         ticket: cli.ticket,
         needs: cli.needs,
         argv: cli.command,
@@ -126,16 +135,19 @@ pub fn status(mut ctx: Ctx, as_json: bool) -> i32 {
         bytes_to_gb(num("free_ram_bytes")),
         bytes_to_gb(num("min_free_bytes"))
     );
-    let why = |id: u64| {
-        v["waiting"]
+    let field = |list: &str, id: u64, key: &str| {
+        v[list]
             .as_array()
             .into_iter()
             .flatten()
             .find(|w| w["id"].as_u64() == Some(id))
-            .and_then(|w| w["why"].as_str())
+            .and_then(|w| w[key].as_str())
+            .filter(|t| !t.is_empty())
             .map(str::to_string)
     };
-    print_jobs(&state, now_ms(), &why);
+    let why = |id: u64| field("waiting", id, "why");
+    let hint = |id: u64| field("running", id, "hint");
+    print_jobs(&state, now_ms(), &why, &hint);
     for w in v["warnings"].as_array().into_iter().flatten() {
         println!("warning: {}", w.as_str().unwrap_or_default());
     }
@@ -154,17 +166,23 @@ fn place_marker(j: &Job) -> &'static str {
     }
 }
 
-fn print_jobs(state: &State, now: u64, why: &dyn Fn(u64) -> Option<String>) {
+fn print_jobs(
+    state: &State,
+    now: u64,
+    why: &dyn Fn(u64) -> Option<String>,
+    hint: &dyn Fn(u64) -> Option<String>,
+) {
     let header = |first: &str, time: &str| {
         println!(
-            "  {first:<4} {:<24} {:<8} {:>4} {:>7}  {time:>7}  cwd",
-            "label", "kind", "cost", "pid"
+            "  {first:<4} {:>5} {:<24} {:<8} {:>4} {:>7}  {time:>7}  cwd",
+            "id", "label", "kind", "cost", "pid"
         );
     };
     let row = |j: &Job, first: String| {
         let since = now.saturating_sub(j.started_ms.unwrap_or(j.queued_ms));
         println!(
-            "  {first:<4} {:<24} {:<8} {:>4} {:>7}  {:>7}  {}",
+            "  {first:<4} {:>5} {:<24} {:<8} {:>4} {:>7}  {:>7}  {}",
+            j.id,
             j.label,
             j.kind,
             j.cost,
@@ -179,7 +197,12 @@ fn print_jobs(state: &State, now: u64, why: &dyn Fn(u64) -> Option<String>) {
     if !running.is_empty() {
         header("", "for");
     }
-    running.iter().for_each(|j| row(j, String::new()));
+    for j in &running {
+        row(j, String::new());
+        if let Some(h) = hint(j.id) {
+            println!("       now: {h}");
+        }
+    }
     println!("waiting ({}):", waiting.len());
     if !waiting.is_empty() {
         header("#", "waited");
@@ -352,6 +375,52 @@ pub fn bump(mut ctx: Ctx, a: &crate::cli::BumpArgs) -> i32 {
     }
 }
 
+/// `calmrun stop <id>` / `calmrun stop --label TEXT`.
+pub fn stop(mut ctx: Ctx, a: &StopArgs) -> i32 {
+    let sel = match (&a.job, &a.label) {
+        (Some(id), _) => crate::stop::Selector::Id(*id),
+        (None, Some(l)) => crate::stop::Selector::Label(l.clone()),
+        (None, None) => {
+            eprintln!("calmrun: stop needs a job id (see `calmrun status`) or --label TEXT");
+            return 2;
+        }
+    };
+    let wait = Duration::from_secs_f64(a.wait.clamp(0.0, 3600.0));
+    let mut say = |l: &str| eprintln!("{l}");
+    let (job, how) = match crate::stop::stop(&mut ctx, &sel, wait, &mut say) {
+        Ok(Ok(done)) => done,
+        Ok(Err(no)) => {
+            eprintln!("{}", no.0);
+            return 2;
+        }
+        Err(e) => return fail(&e),
+    };
+    let what = format!("job {} ({})", job.id, job.label);
+    match how {
+        crate::stop::Stopped::ByOwner => eprintln!(
+            "calmrun: stopped {what}: its calmrun stopped {} and exited",
+            if job.running() {
+                "the command and its process tree"
+            } else {
+                "waiting"
+            }
+        ),
+        crate::stop::Stopped::Killed { processes } => eprintln!(
+            "calmrun: stopped {what}: its calmrun (pid {}) did not react within {}s, so it was \
+             killed directly with {processes} process(es) of its tree, and the entry removed",
+            job.pid,
+            wait.as_secs()
+        ),
+        crate::stop::Stopped::OwnerGone => {
+            eprintln!("calmrun: stopped {what}: its calmrun was already gone; removed the entry")
+        }
+        crate::stop::Stopped::Ticket => {
+            eprintln!("calmrun: {what} was only a place kept for a ticket; dropped it")
+        }
+    }
+    0
+}
+
 /// `calmrun doctor`.
 pub fn doctor(mut ctx: Ctx) -> i32 {
     let free_now = ctx.sys.free_ram();
@@ -518,6 +587,10 @@ pub fn probe(a: &ProbeArgs) -> i32 {
         }
     };
     mark("start");
+    let burn = std::time::Instant::now();
+    while burn.elapsed() < Duration::from_millis(a.burn_ms) {
+        std::hint::black_box((0..10_000u64).sum::<u64>());
+    }
     // Touch every page so the memory is really resident.
     let hog: Vec<u8> = vec![1u8; a.alloc_mb * 1024 * 1024];
     std::thread::sleep(Duration::from_millis(a.sleep_ms));

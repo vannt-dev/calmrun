@@ -50,6 +50,11 @@ pub struct Cli {
     #[arg(long, value_name = "ID")]
     pub ticket: Option<u64>,
 
+    /// Stop the command once it has run this many seconds (exit 124). 0 = no limit for this
+    /// run. Default: max_run_min from the config (60 min for test-like kinds, else none).
+    #[arg(long, value_name = "SECS")]
+    pub timeout: Option<f64>,
+
     /// The command to run. Separate words run directly; one quoted string runs in the shell.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "COMMAND")]
     pub command: Vec<String>,
@@ -156,6 +161,9 @@ pub enum Sub {
     Hold(crate::lease::HoldArgs),
     /// Give back a lease taken with `calmrun hold`.
     Release(crate::lease::ReleaseArgs),
+    /// Stop a running or waiting job (by its id from `calmrun status`, or --label): its
+    /// calmrun stops the command tree and exits 130. An owner that does not react is killed.
+    Stop(StopArgs),
     /// Move waiting jobs to the front of the queue (or with --back, to the end).
     Bump(BumpArgs),
     /// Show cores, RAM, disk, battery and the suggested config.
@@ -220,6 +228,25 @@ pub enum HookTarget {
     Opencode,
 }
 
+/// Arguments of `calmrun stop`.
+#[derive(Debug, clap::Args)]
+pub struct StopArgs {
+    /// The job's id (the `id` column of `calmrun status`).
+    #[arg(
+        value_name = "JOB",
+        required_unless_present = "label",
+        conflicts_with = "label"
+    )]
+    pub job: Option<u64>,
+    /// The job's exact label instead; it must match exactly one job.
+    #[arg(long, value_name = "TEXT")]
+    pub label: Option<String>,
+    /// Seconds to wait for the job's calmrun to stop it before killing that calmrun and its
+    /// process tree directly.
+    #[arg(long, value_name = "SECS", default_value_t = 10.0)]
+    pub wait: f64,
+}
+
 /// Arguments of the hidden test helper `__probe`.
 #[derive(Debug, clap::Args)]
 pub struct ProbeArgs {
@@ -240,6 +267,9 @@ pub struct ProbeArgs {
     /// Allocate and touch this many MB before sleeping.
     #[arg(long, default_value_t = 0)]
     pub alloc_mb: usize,
+    /// Keep one core busy for this many ms before sleeping.
+    #[arg(long, default_value_t = 0)]
+    pub burn_ms: u64,
     /// Start a detached helper that outlives this process and write its pid here.
     #[arg(long)]
     pub spawn_daemon: Option<std::path::PathBuf>,
@@ -315,5 +345,26 @@ mod tests {
             assert!(try_bump(bad).is_err(), "{bad}");
         }
         assert_eq!(parse("calmrun --prio low -- npm test").prio, Some(Prio::Low));
+    }
+
+    #[test]
+    fn stop_takes_an_id_or_a_label_and_timeout_a_number() {
+        let c = parse("calmrun --id q stop 12");
+        assert!(matches!(c.sub, Some(Sub::Stop(StopArgs { job: Some(12), .. }))));
+        assert_eq!(c.id.as_deref(), Some("q"));
+        let c = parse("calmrun stop --label e2e --wait 2");
+        let Some(Sub::Stop(a)) = c.sub else {
+            panic!("not a stop")
+        };
+        assert_eq!((a.job, a.label.as_deref(), a.wait), (None, Some("e2e"), 2.0));
+        let bad = |line: &str| {
+            let args = line.split(' ').map(std::ffi::OsString::from).collect();
+            Cli::try_parse_from(id_flag_first(args)).is_err()
+        };
+        assert!(bad("calmrun stop"));
+        assert!(bad("calmrun stop 3 --label x"));
+        let c = parse("calmrun --timeout 600 -- npx vitest run");
+        assert_eq!(c.timeout, Some(600.0));
+        assert_eq!(c.command, vec!["npx", "vitest", "run"]);
     }
 }

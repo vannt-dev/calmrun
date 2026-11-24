@@ -1,6 +1,7 @@
 //! Reading and nudging the queue: `status`, `queue_status`, `bump`.
 
 use crate::error::Result;
+use crate::history::Usual;
 use crate::messages::{self, WaitContext};
 use crate::queue::{self, locked, now_ms, Ctx, Liveness};
 use crate::scheduler::{self, Inputs, Limits};
@@ -61,6 +62,7 @@ pub fn reasons(
                 disk: None,
                 caps,
                 now_ms: now,
+                usual: None,
             };
             (
                 j.id,
@@ -71,9 +73,22 @@ pub fn reasons(
         .collect()
 }
 
-fn job_json(j: &Job, now: u64, place: Option<usize>) -> Value {
+/// The usual run times for the jobs of this state directory's queues.
+pub fn usual(ctx: &Ctx) -> Usual {
+    Usual::load(&ctx.home.join("history.jsonl"))
+}
+
+/// Add the working-or-hung hints of `j` (CPU, idle, usual run time, limit) to `v`.
+pub fn add_hints(v: &mut Value, j: &Job, now: u64, usual: &Usual) {
+    let h = crate::watch::hints(j, now, Some(usual)).json();
+    for (k, x) in h.as_object().into_iter().flatten() {
+        v[k] = x.clone();
+    }
+}
+
+fn job_json(j: &Job, now: u64, place: Option<usize>, usual: &Usual) -> Value {
     let since = j.started_ms.unwrap_or(j.queued_ms);
-    json!({
+    let mut v = json!({
         "id": j.id,
         "label": j.label,
         "kind": j.kind,
@@ -89,7 +104,9 @@ fn job_json(j: &Job, now: u64, place: Option<usize>) -> Value {
         "since_ms": since,
         "for_ms": now.saturating_sub(since),
         "place": place,
-    })
+    });
+    add_hints(&mut v, j, now, usual);
+    v
 }
 
 fn parked_json(j: &Job, now: u64) -> Value {
@@ -129,17 +146,18 @@ pub fn status_json(ctx: &mut Ctx, state: &State) -> Value {
     let budget = limits.budget;
     let free_ram = ctx.sys.free_ram();
     let why = reasons(ctx, state, limits, free_ram);
+    let usual = usual(ctx);
     let running: Vec<Value> = state
         .jobs
         .iter()
         .filter(|j| j.running())
-        .map(|j| job_json(j, now, None))
+        .map(|j| job_json(j, now, None, &usual))
         .collect();
     let waiting: Vec<Value> = scheduler::waiting_in_order(&state.jobs)
         .iter()
         .enumerate()
         .map(|(i, j)| {
-            let mut v = job_json(j, now, Some(i + 1));
+            let mut v = job_json(j, now, Some(i + 1), &usual);
             if let Some((_, code, text)) = why.iter().find(|w| w.0 == j.id) {
                 v["why"] = json!(text);
                 v["why_code"] = json!(code);
@@ -148,6 +166,16 @@ pub fn status_json(ctx: &mut Ctx, state: &State) -> Value {
         })
         .collect();
     let mut warnings = messages::stuck_warnings(state, now, STUCK_MS);
+    let flag = ctx
+        .queue
+        .as_ref()
+        .map(|q| format!(" --id {q}"))
+        .unwrap_or_default();
+    warnings.extend(
+        messages::stuck_running_next(state, now, Some(&usual), &flag)
+            .into_iter()
+            .map(|l| l.trim_start_matches("calmrun: next: ").to_string()),
+    );
     let mine = ctx.settings();
     if let Some(rec) = state.settings.filter(|r| !r.same_limits(&mine)) {
         let text = messages::settings_mismatch(&rec, &mine);
