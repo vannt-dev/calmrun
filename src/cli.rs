@@ -82,8 +82,55 @@ pub fn id_flag_first(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
 /// Queue priority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Prio {
+    /// First come, first served (the default).
     Normal,
+    /// Before every normal and low job.
     High,
+    /// After every normal and high job, also ones that come later.
+    Low,
+}
+
+/// `calmrun bump`: which waiting jobs to move, and where.
+#[derive(Debug, clap::Args)]
+#[command(
+    group(clap::ArgGroup::new("select").required(true).multiple(false)
+        .args(["label", "pos", "ticket", "dir"])),
+    after_help = "Pick the jobs with exactly one of: a label substring, --pos, --ticket, --dir.\n\
+        To the front, they go before every other waiter, and later jobs may not pass them while\n\
+        they wait for points or RAM (they may while they wait for a dependency folder, a\n\
+        resource or disk space). With --back they go to the end, with prio low.\n\n\
+        Examples:\n  calmrun bump e2e\n  calmrun bump --pos 3\n  calmrun bump --dir ../web\n  \
+        calmrun bump --back --ticket 42"
+)]
+pub struct BumpArgs {
+    /// Part of the label to match (case-insensitive).
+    pub label: Option<String>,
+    /// The job at this place in the waiting line (the # column of `calmrun status`).
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+    pub pos: Option<u64>,
+    /// The job with this id (`status --json`, or the ticket a --wait-timeout run printed).
+    #[arg(long, value_name = "ID")]
+    pub ticket: Option<u64>,
+    /// Jobs whose folder is this one or inside it.
+    #[arg(long, value_name = "PATH")]
+    pub dir: Option<std::path::PathBuf>,
+    /// Move them to the end of the line instead, with prio low.
+    #[arg(long)]
+    pub back: bool,
+}
+
+impl BumpArgs {
+    /// The one selector given (clap makes sure there is exactly one).
+    pub fn selector(&self) -> crate::status::Selector {
+        use crate::status::Selector;
+        match (&self.label, self.pos, self.ticket, &self.dir) {
+            (Some(l), ..) => Selector::Label(l.clone()),
+            (_, Some(p), ..) => Selector::Pos(p as usize),
+            (_, _, Some(t), _) => Selector::Ticket(t),
+            (_, _, _, Some(d)) => Selector::dir(d),
+            _ => Selector::Label(String::new()),
+        }
+    }
 }
 
 /// Subcommands.
@@ -109,11 +156,8 @@ pub enum Sub {
     Hold(crate::lease::HoldArgs),
     /// Give back a lease taken with `calmrun hold`.
     Release(crate::lease::ReleaseArgs),
-    /// Move waiting jobs whose label contains the text to the front of the queue.
-    Bump {
-        /// Part of the label to match (case-insensitive).
-        label: String,
-    },
+    /// Move waiting jobs to the front of the queue (or with --back, to the end).
+    Bump(BumpArgs),
     /// Show cores, RAM, disk, battery and the suggested config.
     Doctor,
     /// Hooks for coding agents.
@@ -232,5 +276,44 @@ mod tests {
         let c = parse("calmrun --id q --cost 2 -- npm test");
         assert_eq!((c.id.as_deref(), c.cost), (Some("q"), Some(2)));
         assert_eq!(c.command, vec!["npm", "test"]);
+    }
+
+    fn try_bump(line: &str) -> Result<(crate::status::Selector, bool), clap::Error> {
+        let args = line.split(' ').map(std::ffi::OsString::from).collect();
+        match Cli::try_parse_from(id_flag_first(args))?.sub {
+            Some(Sub::Bump(b)) => Ok((b.selector(), b.back)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn bump_takes_exactly_one_selector() {
+        use crate::status::Selector;
+        assert_eq!(
+            try_bump("calmrun bump e2e").unwrap(),
+            (Selector::Label("e2e".into()), false)
+        );
+        assert_eq!(
+            try_bump("calmrun bump --pos 3").unwrap(),
+            (Selector::Pos(3), false)
+        );
+        assert_eq!(
+            try_bump("calmrun --id q bump --back --ticket 42").unwrap(),
+            (Selector::Ticket(42), true)
+        );
+        assert!(matches!(
+            try_bump("calmrun bump --dir .").unwrap().0,
+            Selector::Dir(_)
+        ));
+        for bad in [
+            "calmrun bump",
+            "calmrun bump --back",
+            "calmrun bump e2e --pos 1",
+            "calmrun bump --pos 1 --ticket 2",
+            "calmrun bump --pos 0",
+        ] {
+            assert!(try_bump(bad).is_err(), "{bad}");
+        }
+        assert_eq!(parse("calmrun --prio low -- npm test").prio, Some(Prio::Low));
     }
 }

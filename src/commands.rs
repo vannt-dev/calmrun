@@ -27,7 +27,8 @@ If it has not started in 120 s it exits 75 and prints the exact command that res
 the same place in line (calmrun --ticket <id> -- ...). The place is kept for 10 minutes.
 
 See the queue:        calmrun status          (calmrun status --json for tools)
-Move a job forward:   calmrun bump <label>
+Move a job forward:   calmrun bump <label>      (or --pos N, the # in calmrun status)
+Let others go first:  calmrun bump --back <label>, or run with --prio low
 Hold a device/resource without running anything (prints a lease id; default 4 h):
     calmrun hold emulator --label \"my task\"   ...   calmrun release <lease>
 Exit codes: the command's own; 75 = not started in time (place kept); 2 = refused;
@@ -68,6 +69,7 @@ pub fn run_queued(mut ctx: Ctx, cli: Cli) -> i32 {
         kind: cli.kind,
         cost: cli.cost,
         high: cli.prio == Some(Prio::High),
+        low: cli.prio == Some(Prio::Low),
         label: cli.label,
         ..Default::default()
     };
@@ -140,6 +142,18 @@ pub fn status(mut ctx: Ctx, as_json: bool) -> i32 {
     0
 }
 
+/// Marker after a waiter's place in `calmrun status`: `!` prio high, `^` bumped (later jobs
+/// may not pass it while it waits for points or RAM), `-` prio low.
+fn place_marker(j: &Job) -> &'static str {
+    match (j.high, j.bumped, j.low) {
+        (true, true, _) => "!^",
+        (true, false, _) => "!",
+        (false, true, _) => "^",
+        (false, false, true) => "-",
+        (false, false, false) => "",
+    }
+}
+
 fn print_jobs(state: &State, now: u64, why: &dyn Fn(u64) -> Option<String>) {
     let header = |first: &str, time: &str| {
         println!(
@@ -171,7 +185,7 @@ fn print_jobs(state: &State, now: u64, why: &dyn Fn(u64) -> Option<String>) {
         header("#", "waited");
     }
     for (i, j) in waiting.iter().enumerate() {
-        row(j, format!("{}{}", i + 1, if j.high { "!" } else { "" }));
+        row(j, format!("{}{}", i + 1, place_marker(j)));
         if let Some(w) = why(j.id) {
             println!("       waits for: {w}");
         }
@@ -317,15 +331,21 @@ fn queue_flag(ctx: &Ctx) -> String {
         .unwrap_or_default()
 }
 
-/// `calmrun bump <label>`.
-pub fn bump(mut ctx: Ctx, needle: &str) -> i32 {
-    match status::bump(&mut ctx, needle) {
+/// `calmrun bump <label> | --pos N | --ticket ID | --dir PATH [--back]`.
+pub fn bump(mut ctx: Ctx, a: &crate::cli::BumpArgs) -> i32 {
+    let sel = a.selector();
+    match status::bump(&mut ctx, &sel, a.back) {
         Ok(0) => {
-            eprintln!("calmrun: no waiting job matches \"{needle}\"; see `calmrun status`");
+            eprintln!(
+                "calmrun: no waiting job matches {}; see `calmrun status{}`",
+                sel.describe(),
+                queue_flag(&ctx)
+            );
             1
         }
         Ok(n) => {
-            println!("moved {n} waiting job(s) to the front");
+            let to = if a.back { "the end (prio low)" } else { "the front" };
+            println!("moved {n} waiting job(s) to {to}");
             0
         }
         Err(e) => fail(&e),

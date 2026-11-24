@@ -262,6 +262,8 @@ pub struct Request {
     pub kind: Option<String>,
     pub cost: Option<u32>,
     pub high: bool,
+    /// `--prio low`: after every normal and high waiter (`high` wins if both are set).
+    pub low: bool,
     pub label: Option<String>,
     /// Stop the command after this long (exit 124).
     pub timeout: Option<Duration>,
@@ -599,6 +601,7 @@ fn enqueue(ctx: &mut Ctx, store: &Store, p: &Prepared, notify: &mut dyn Notify) 
         },
         cwd: p.cwd.to_string_lossy().to_string(),
         high: p.req.high,
+        low: p.req.low && !p.req.high,
         queued_ms: now_ms(),
         needs: p.req.needs.clone(),
         hold_ttl_ms: p.hold_ttl.map(|t| t.as_millis() as u64),
@@ -625,6 +628,9 @@ fn enqueue(ctx: &mut Ctx, store: &Store, p: &Prepared, notify: &mut dyn Notify) 
             entry.order = j.order;
             entry.queued_ms = j.queued_ms;
             entry.high |= j.high;
+            entry.bumped |= j.bumped;
+            // A place pushed back stays at the back unless this run asks for prio high.
+            entry.low = (entry.low || j.low) && !entry.high;
             *j = entry.clone();
             return (true, recorded);
         }

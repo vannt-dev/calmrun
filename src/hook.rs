@@ -932,6 +932,14 @@ mod tests {
             "npx calmrun -- npx vitest",
             "lane with npx vitest",
             "cd x && calmrun -- npm test",
+            // Queue commands whose arguments name heavy tools are left alone too.
+            "calmrun bump vitest",
+            "calmrun bump \"npx vitest\"",
+            "calmrun bump --back \"cargo test\"",
+            "calmrun --id q bump --pos 2",
+            "calmrun bump --ticket 7 && calmrun status",
+            "calmrun bump --dir ../web --back",
+            "calmrun --prio low -- cargo test",
         ] {
             assert!(run("Bash", c, Mode::Deny).is_none(), "{c}");
         }

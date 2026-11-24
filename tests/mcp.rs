@@ -162,6 +162,15 @@ fn lists_tools_and_runs_a_task() {
     // Nothing matching is a normal answer, not a tool error.
     assert_eq!(r["result"]["structuredContent"]["matched"], 0);
     assert_eq!(r["result"]["isError"], false);
+    // No selector, or two: a tool error that says what to pass.
+    for (id, args) in [(51, json!({})), (52, json!({"label": "a", "pos": 1}))] {
+        let r = c.call(id, "bump", args, None);
+        assert_eq!(r["result"]["isError"], true, "{r}");
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("exactly one of"), "{text}");
+    }
+    let r = c.call(53, "bump", json!({"pos": 1, "back": true}), None);
+    assert_eq!(r["result"]["structuredContent"]["back"], true, "{r}");
 
     c.send(json!({"jsonrpc": "2.0", "id": 6, "method": "no/such"}));
     assert_eq!(c.response(6, Duration::from_secs(10))["error"]["code"], -32601);

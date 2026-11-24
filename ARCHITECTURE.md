@@ -12,7 +12,7 @@ process evaluates the same way, admits it. Only then does it run the command.
 | `cli.rs` | The clap definition of flags and subcommands. |
 | `commands.rs` | One function per CLI subcommand. Each returns the exit code. |
 | `queue.rs` | **The service.** `queue::run(ctx, Request, Notify) -> Outcome` submits, waits, runs and records a job. The CLI and the MCP server both call it. |
-| `scheduler.rs` | **Pure.** `schedule(jobs, inputs) -> Plan` handles queue order, prio, passing and the pass limit. |
+| `scheduler.rs` | **Pure.** `schedule(jobs, inputs) -> Plan` handles queue order, prio, passing, the pass limit and bumped jobs holding the front. |
 | `gates.rs` | Start conditions: points, exclusive keys, named resources, disk, RAM. These are the `Gate` trait and its implementations. |
 | `kinds.rs` | **The tool table.** Kinds with default costs and key rules, detection rules, and worker hints. |
 | `detect.rs` | Finds the program in a command line (wrappers, launchers), the label, hint application, exclusive keys and refusals. |

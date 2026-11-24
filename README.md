@@ -98,6 +98,7 @@ calmrun "npm ci && npm test"     # one quoted string runs through the shell
 calmrun status                   # what runs, what waits, and why
 calmrun stats --days 30          # how long jobs waited and ran
 calmrun bump e2e                 # move a waiting job to the front
+calmrun bump --back --pos 2      # or to the end of the line
 calmrun init                     # write a commented config file
 calmrun setup --write --hook     # tell your coding agents to use calmrun
 ```
@@ -232,10 +233,27 @@ Points, keys and resource slots are taken all-or-nothing.
 
 ### Order and passing
 
-`--prio high` first, then first come. A later job may pass earlier ones only if it fits right
-now and no job ahead of it has waited longer than `pass_limit_min` (default 10; `0` = strict
-order). Running jobs are never stopped to make room. `calmrun bump <label>` moves matching
-waiting jobs to the front.
+`--prio high` first, then normal, then `--prio low`; within each, first come. A later job may
+pass earlier ones only if it fits right now and no job ahead of it has waited longer than
+`pass_limit_min` (default 10; `0` = strict order). Running jobs are never stopped to make room.
+
+`calmrun bump` moves waiting jobs to the front: before every other waiter, with prio high.
+Pick them with exactly one of a label substring (`calmrun bump e2e`), `--pos N` (the place in
+the `#` column of `calmrun status`), `--ticket ID` (the job id from `status --json`, or a
+ticket kept by `--wait-timeout`) or `--dir PATH` (jobs whose folder is that one or inside it).
+A bumped job also holds the front: while it waits for budget points or free RAM, no later job
+may pass it, since that would take the room it waits for (the others wait with
+`bumped job "npx vitest" ahead (1st in line) to start`). While it waits for an exclusive key,
+a resource slot or disk space, later jobs may still pass it (until it has waited past the pass
+limit, as for any job): those can last long, and passing does not delay it.
+
+`calmrun bump --back <selector>` moves jobs to the very end instead: prio low, after every
+other waiter, in their order. A low job waits behind every normal job, also ones that come
+later, so a steady stream of normal jobs can keep it waiting; that is what low is for. The
+pass limit does not change that: normal jobs are ahead of a low one in line, they do not pass it.
+
+In `calmrun status` the place is marked: `!` prio high, `^` bumped (holds the front), `-` prio
+low; for example `1!^` or `4-`.
 
 ### Separate queues
 
@@ -372,11 +390,11 @@ calmrun release "$lease"
 ## Commands
 
 ```
-calmrun [--kind K] [--cost N] [--prio normal|high] [--label L] [--needs NAME,…] [--id QUEUE]
+calmrun [--kind K] [--cost N] [--prio normal|high|low] [--label L] [--needs NAME,…] [--id QUEUE]
         [--wait-timeout SECS] [--ticket ID] -- <command...>
 calmrun status [--json] [--id QUEUE]
 calmrun stats [--days N] [--json]
-calmrun bump <label-substring> [--id QUEUE]
+calmrun bump <label-substring> | --pos N | --ticket ID | --dir PATH [--back] [--id QUEUE]
 calmrun hold <resource>[,<resource>…] [--ttl SECS] [--label TEXT] [--for DIR] [--cost N] [--wait-timeout SECS] [--id QUEUE]
 calmrun hold --renew <lease> [--ttl SECS] [--id QUEUE]
 calmrun release <lease> [--id QUEUE]
@@ -395,7 +413,7 @@ calmrun mcp
 | --- | --- |
 | `--kind K` | Kind of job (a built-in kind or one from the config); detected when omitted |
 | `--cost N` | Points this job takes (clamped to the budget) |
-| `--prio normal\|high` | Queue priority; `high` goes before every `normal` job |
+| `--prio normal\|high\|low` | Queue priority; `high` goes before every `normal` job, `low` after every one (see [Order and passing](#order-and-passing)) |
 | `--label L` | Name in `status` and `stats` (default: tool + subcommand) |
 | `--needs NAME` | Also take a slot of this named resource; repeat or comma-separate (`--needs db,gpu`) |
 | `--id QUEUE` | Use a separate queue instead of the machine-wide one |
@@ -417,7 +435,7 @@ calmrun mcp
 | --- | --- |
 | `status [--json]` | Running and waiting jobs with the reason each one waits (`waits for: RAM: ...`; in JSON `why` and `why_code`: `budget`, `order`, `ram`, `disk`, `key`, `resource`, or `starting`), the queue's budget, free RAM, kept tickets and leases. `--json` (with `mem_bytes` per running job) for tools. |
 | `stats [--days N] [--json]` | Runs, failures, average and maximum wait, average run time per label and kind, and waits that gave up before starting, over the last N days (default 7). |
-| `bump <text>` | Move waiting jobs whose label contains the text (case-insensitive) to the front. |
+| `bump <text>` | Move waiting jobs whose label contains the text (case-insensitive) to the front, where later jobs may not pass them while they wait for points or RAM. Instead of the text: `--pos N`, `--ticket ID` or `--dir PATH` (exactly one). `--back` moves them to the end with prio low. See [Order and passing](#order-and-passing). |
 | `hold <resource>[,…]` | Wait for a slot of each resource, record a lease, print its id and exit; `--ttl`, `--label`, `--for`, `--cost`, `--wait-timeout`, `--renew <id>`. See [Leases](#leases-holding-a-resource-without-a-command). |
 | `release <lease>` | Give a lease back (exit 0 also when it is already gone). `release --ticket <id>` gives up a place kept by `--wait-timeout`. |
 | `doctor` | Cores, RAM, disk type, battery, the state directory and config file, the settings in effect and the suggested ones. |
@@ -685,7 +703,7 @@ MCP can queue work without a shell wrapper. It offers five tools:
 | `task_status` | `task_id`, optionally `output_offset`, `wait_seconds` | Where the task is: `waiting` (place in line, waiting count, points in use and budget, the waiting line), `running`, or `done` (exit code and status as `run_task` gives them); wait and run time; the output written since `output_offset` (at most the newest 32 KB) and `next_offset` for the next call. With `wait_seconds` it first waits up to that long for the end. |
 | `cancel_task` | `task_id` | A waiting task leaves the queue; a running one is stopped with its whole process tree. Answers with how it ended. A finished task is left alone. |
 | `queue_status` | `queue` | The same data as `calmrun status --json`, leases included. |
-| `bump` | `label`, `queue` | Move matching waiting jobs to the front. |
+| `bump` | exactly one of `label`, `pos`, `ticket`, `dir`; optionally `back`, `queue` | Move matching waiting jobs to the front (or with `back`, to the end with prio low), as `calmrun bump` does. |
 
 **Long jobs and tool timeouts.** Agents give an MCP call a few minutes at most; a job that waits
 behind others or runs long would be cut off with its place lost. So `run_task` returns within
@@ -869,8 +887,9 @@ falls back to calmrun's absolute path in its suggestions.
 busy machine the RAM gate is the usual reason (`waiting for RAM: … free, needs …`): lower
 `min_free_gb`, or set it to `0`. Entries of dead processes are removed automatically.
 
-**A job I need now is stuck behind others.** `calmrun bump <label>`, or run it with
-`--prio high`.
+**A job I need now is stuck behind others.** `calmrun bump <label>` (or `--pos N` from
+`calmrun status`), or run it with `--prio high`. A job that can wait: `calmrun bump --back
+<label>`, or run it with `--prio low`.
 
 **My agent's tool call timed out while waiting.** Use `--wait-timeout` (CLI) or
 `wait_timeout_s` (MCP) and resume with the ticket, or raise the client's tool timeout (see the
