@@ -1,5 +1,6 @@
 //! Memory guard for a running job: the whole process tree's memory against a ceiling, and the
-//! system's free RAM against a critical floor.
+//! system's free RAM against a critical floor. The same sample also adds up the tree's CPU
+//! time, which `status` turns into a hint (busy or idle), never into a stop.
 
 use crate::config::bytes_to_gb;
 use std::collections::{HashMap, HashSet};
@@ -9,6 +10,10 @@ use sysinfo::{MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, Sys
 /// How long free RAM must stay below the floor before the biggest job is stopped.
 pub const CRITICAL_FOR: Duration = Duration::from_secs(3);
 const SAMPLE_EVERY: Duration = Duration::from_secs(1);
+/// A tree that used at least this share of one core over a sample counts as busy. A process
+/// waiting on a socket or a lock stays far below it; a compiler, a test runner or anything
+/// that prints is above.
+pub const BUSY_PCT: u32 = 2;
 
 /// Why a running job was stopped.
 #[derive(Debug, Clone, PartialEq)]
@@ -105,58 +110,105 @@ pub fn min_stop_bytes(total_ram: u64) -> u64 {
     (total_ram / 10).max(ONE_GB)
 }
 
-/// Sum of memory over `root` and all its descendants, from (pid, parent, bytes) rows.
-pub fn tree_bytes(rows: &[(u32, Option<u32>, u64)], root: u32) -> u64 {
+/// `root` and all its descendants, from (pid, parent) links.
+pub fn tree_members(links: &[(u32, Option<u32>)], root: u32) -> HashSet<u32> {
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-    let mut mem: HashMap<u32, u64> = HashMap::new();
-    for &(pid, parent, bytes) in rows {
-        mem.insert(pid, bytes);
-        if let Some(pp) = parent {
-            if pp != pid {
-                children.entry(pp).or_default().push(pid);
-            }
+    for &(pid, parent) in links {
+        if let Some(pp) = parent.filter(|pp| *pp != pid) {
+            children.entry(pp).or_default().push(pid);
         }
     }
     let mut seen = HashSet::new();
     let mut stack = vec![root];
-    let mut total = 0;
     while let Some(p) = stack.pop() {
-        if !seen.insert(p) {
-            continue;
-        }
-        total += mem.get(&p).copied().unwrap_or(0);
-        if let Some(c) = children.get(&p) {
-            stack.extend(c.iter().copied());
+        if seen.insert(p) {
+            if let Some(c) = children.get(&p) {
+                stack.extend(c.iter().copied());
+            }
         }
     }
-    total
+    seen
 }
 
-/// Samples one job's process tree and the free RAM.
+/// Sum of memory over `root` and all its descendants, from (pid, parent, bytes) rows.
+#[cfg(test)]
+pub fn tree_bytes(rows: &[(u32, Option<u32>, u64)], root: u32) -> u64 {
+    let links: Vec<(u32, Option<u32>)> = rows.iter().map(|r| (r.0, r.1)).collect();
+    let tree = tree_members(&links, root);
+    rows.iter().filter(|r| tree.contains(&r.0)).map(|r| r.2).sum()
+}
+
+/// CPU time of a process tree across samples. A process that exits takes its CPU time with
+/// it, so the total keeps what every (pid, start time) had at its last sample and adds only
+/// what each one used since; a process new to the tree counts with all its time.
+#[derive(Debug, Default)]
+pub struct CpuTrack {
+    seen: HashMap<(u32, u64), u64>,
+    /// CPU milliseconds used by the tree so far, exited processes included.
+    pub total_ms: u64,
+}
+
+impl CpuTrack {
+    /// Take one sample of the tree's processes (pid, start time, CPU ms so far); returns the
+    /// CPU milliseconds used since the last sample.
+    pub fn step(&mut self, rows: &[(u32, u64, u64)]) -> u64 {
+        let mut next = HashMap::with_capacity(rows.len());
+        let mut used = 0;
+        for &(pid, start, cpu) in rows {
+            let before = self.seen.get(&(pid, start)).copied().unwrap_or(0);
+            used += cpu.saturating_sub(before);
+            next.insert((pid, start), cpu.max(before));
+        }
+        self.seen = next;
+        self.total_ms += used;
+        used
+    }
+}
+
+/// CPU used over an interval as a percentage of one core.
+pub fn cpu_percent(used_ms: u64, interval: Duration) -> u32 {
+    let ms = (interval.as_millis() as u64).max(1);
+    (used_ms.saturating_mul(100) / ms).min(u64::from(u32::MAX)) as u32
+}
+
+/// Samples one job's process tree (memory and CPU) and the free RAM.
 pub struct MemWatch {
     sys: System,
     lim: Limits,
     warned: bool,
+    born: Instant,
     last: Option<Instant>,
     low_since: Option<Instant>,
+    cpu: CpuTrack,
     /// Latest tree size.
     pub used: u64,
+    /// CPU milliseconds the tree used so far.
+    pub cpu_ms: u64,
+    /// CPU over the latest sample, in percent of one core.
+    pub cpu_pct: u32,
 }
 
 impl MemWatch {
-    /// A watcher, or `None` when both limits are off.
+    /// A watcher (it samples even with both limits off: the CPU hint needs it), or `None`
+    /// when the OS gives no process information.
     pub fn new(lim: Limits) -> Option<MemWatch> {
-        if lim.ceiling == 0 && lim.floor == 0 {
-            return None;
-        }
         Some(MemWatch {
             sys: System::new().ok()?,
             lim,
             warned: false,
+            born: Instant::now(),
             last: None,
             low_since: None,
+            cpu: CpuTrack::default(),
             used: 0,
+            cpu_ms: 0,
+            cpu_pct: 0,
         })
+    }
+
+    /// Whether the latest sample counts as busy (see [`BUSY_PCT`]).
+    pub fn busy(&self) -> bool {
+        self.cpu_pct >= BUSY_PCT
     }
 
     /// Sample at most once a second. `biggest` is asked only when free RAM is critical.
@@ -165,19 +217,36 @@ impl MemWatch {
         if self.last.is_some_and(|t| t.elapsed() < SAMPLE_EVERY) {
             return (false, None);
         }
+        let interval = self.last.unwrap_or(self.born).elapsed();
         self.last = Some(Instant::now());
+        // Without tasks: on Linux every thread is listed as a process of its own otherwise,
+        // with the whole process's memory and its own CPU time, so a tree sum counts twice.
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            ProcessRefreshKind::nothing().with_memory(),
+            ProcessRefreshKind::nothing()
+                .with_memory()
+                .with_cpu()
+                .without_tasks(),
         );
-        let rows: Vec<(u32, Option<u32>, u64)> = self
+        let links: Vec<(u32, Option<u32>)> = self
             .sys
             .processes()
             .iter()
-            .map(|(pid, p)| (pid.as_u32(), p.parent().map(Pid::as_u32), p.memory()))
+            .map(|(pid, p)| (pid.as_u32(), p.parent().map(Pid::as_u32)))
             .collect();
-        self.used = tree_bytes(&rows, root);
+        let tree = tree_members(&links, root);
+        let (mut used, mut cpu_rows) = (0, Vec::with_capacity(tree.len()));
+        for (pid, p) in self.sys.processes() {
+            if tree.contains(&pid.as_u32()) {
+                used += p.memory();
+                cpu_rows.push((pid.as_u32(), p.start_time(), p.accumulated_cpu_time()));
+            }
+        }
+        self.used = used;
+        let spent = self.cpu.step(&cpu_rows);
+        self.cpu_ms = self.cpu.total_ms;
+        self.cpu_pct = cpu_percent(spent, interval);
         self.sys
             .refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
         let free = self.sys.available_memory();
@@ -278,6 +347,49 @@ mod tests {
         assert_eq!(tree_bytes(&rows, 10), 15);
         assert_eq!(tree_bytes(&rows, 12), 3);
         assert_eq!(tree_bytes(&rows, 99), 0);
+    }
+
+    /// On Linux sysinfo lists threads as processes unless told not to: a tree sum would count
+    /// the process's memory once per thread.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn threads_are_not_counted_as_processes() {
+        let threads: Vec<_> = (0..6)
+            .map(|_| std::thread::spawn(|| std::thread::sleep(Duration::from_secs(3))))
+            .collect();
+        let me = std::process::id();
+        let lim = Limits {
+            ceiling: 0,
+            floor: 0,
+            min_stop: 0,
+        };
+        let mut w = MemWatch::new(lim).unwrap();
+        w.check(me, &mut |_| false);
+        let mut sys = System::new().unwrap();
+        let pid = Pid::from_u32(me);
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing().with_memory(),
+        );
+        let own = sys.process(pid).unwrap().memory();
+        assert!(w.used < own * 2, "tree {} vs process {own}", w.used);
+        threads.into_iter().for_each(|t| t.join().unwrap());
+    }
+
+    #[test]
+    fn cpu_total_keeps_the_time_of_exited_processes() {
+        let mut t = CpuTrack::default();
+        assert_eq!(t.step(&[(1, 10, 100), (2, 10, 50)]), 150);
+        // pid 2 exits; pid 1 used 20 ms more; pid 3 is new with 5 ms.
+        assert_eq!(t.step(&[(1, 10, 120), (3, 11, 5)]), 25);
+        assert_eq!(t.total_ms, 175);
+        // A reused pid (other start time) is a new process; a reading that goes back adds 0.
+        assert_eq!(t.step(&[(1, 10, 110), (3, 12, 7)]), 7);
+        assert_eq!(t.total_ms, 182);
+        assert_eq!(cpu_percent(20, Duration::from_secs(1)), 2);
+        assert_eq!(cpu_percent(1_500, Duration::from_secs(1)), 150);
+        assert_eq!(cpu_percent(5, Duration::ZERO), 500);
     }
 
     #[test]

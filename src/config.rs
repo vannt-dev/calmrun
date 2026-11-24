@@ -22,6 +22,8 @@ pub struct KindConfig {
     /// Extra command patterns ("make", "bazel build") that select this kind.
     #[serde(default)]
     pub patterns: Vec<String>,
+    /// Run time limit for this kind in minutes (0 = none); wins over the global one.
+    pub max_run_min: Option<f64>,
 }
 
 /// The raw config file.
@@ -35,6 +37,7 @@ pub struct FileConfig {
     pub ceiling_gb: Option<f64>,
     pub min_free_disk_gb: Option<f64>,
     pub critical_free_gb: Option<f64>,
+    pub max_run_min: Option<f64>,
     #[serde(default)]
     pub kinds: BTreeMap<String, KindConfig>,
     /// Named resources and their slots (`[resources] db = 1`).
@@ -56,8 +59,59 @@ pub struct Config {
     pub critical_free_bytes: u64,
     /// A job waits while its cwd's drive has less free space than this (0 = off).
     pub min_free_disk_bytes: u64,
+    /// Run time limit in minutes for every kind without its own (`None`: the built-in
+    /// per-kind defaults; 0 = no limit).
+    pub max_run_min: Option<f64>,
     pub kinds: BTreeMap<String, KindConfig>,
     pub resources: BTreeMap<String, u32>,
+}
+
+/// Where a run's time limit comes from, named when it stops the run.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LimitFrom {
+    /// `--timeout` (CLI) or `timeout_s` (MCP).
+    Asked,
+    /// `[kinds.<kind>] max_run_min`.
+    Kind(String),
+    /// `max_run_min` or `CALMRUN_MAX_RUN_MIN`.
+    Global,
+    /// The built-in default of the kind.
+    Builtin(String),
+}
+
+impl LimitFrom {
+    /// How to change the limit, for the message after a stop.
+    pub fn how_to_change(&self) -> String {
+        let one_run = "--timeout SECS for one run (--timeout 0 = no limit)";
+        match self {
+            LimitFrom::Asked => format!("pass a larger {one_run}, or a larger timeout_s (MCP run_task)"),
+            LimitFrom::Kind(k) => format!("raise [kinds.{k}] max_run_min in the config, or {one_run}"),
+            LimitFrom::Global => {
+                format!("raise max_run_min in the config (or CALMRUN_MAX_RUN_MIN), or {one_run}")
+            }
+            LimitFrom::Builtin(k) => format!(
+                "set [kinds.{k}] max_run_min (or max_run_min for every kind, or CALMRUN_MAX_RUN_MIN) \
+                 in the config; 0 = no limit; or {one_run}"
+            ),
+        }
+    }
+}
+
+/// The run time limit the config gives a job of `kind`: `[kinds.<kind>] max_run_min`, then the
+/// global `max_run_min` (env over file), then the kind's built-in default. `None`: no limit;
+/// 0 at any level means no limit.
+pub fn run_limit(cfg: &Config, kind: &str) -> Option<(std::time::Duration, LimitFrom)> {
+    let (min, from) = if let Some(m) = cfg.kinds.get(kind).and_then(|k| k.max_run_min) {
+        (m, LimitFrom::Kind(kind.to_string()))
+    } else if let Some(m) = cfg.max_run_min {
+        (m, LimitFrom::Global)
+    } else {
+        (
+            crate::kinds::default_max_run_min(kind)?,
+            LimitFrom::Builtin(kind.to_string()),
+        )
+    };
+    (min.is_finite() && min > 0.0).then(|| (std::time::Duration::from_secs_f64(min * 60.0), from))
 }
 
 /// `db=1,gpu=2` -> map.
@@ -187,6 +241,9 @@ pub fn resolve(m: Machine, file: FileConfig, env: &dyn Fn(&str) -> Option<String
         .or(file.min_free_disk_gb)
         .unwrap_or(DEFAULT_MIN_FREE_DISK_GB)
         .max(0.0);
+    let max_run_min = num("CALMRUN_MAX_RUN_MIN")
+        .or(file.max_run_min)
+        .map(|v| v.max(0.0));
     let low_cpu = !matches!(
         env("CALMRUN_LOW_CPU").as_deref().map(str::trim),
         Some("0" | "false" | "no" | "off")
@@ -200,6 +257,7 @@ pub fn resolve(m: Machine, file: FileConfig, env: &dyn Fn(&str) -> Option<String
         ceiling_bytes: (ceiling_gb * GB) as u64,
         critical_free_bytes: (critical_gb * GB) as u64,
         min_free_disk_bytes: (disk_gb * GB) as u64,
+        max_run_min,
         kinds: file.kinds,
         resources: {
             let mut r = file.resources;
@@ -249,6 +307,12 @@ pub fn default_config_text(m: Machine) -> String {
 # --maxWorkers value appended to direct vitest calls (env CALMRUN_VITEST_WORKERS).
 # vitest_workers = {workers}
 
+# Run time limit in minutes: a job still running after it is stopped (exit 124). This sets
+# it for every kind (env CALMRUN_MAX_RUN_MIN); [kinds.<name>] max_run_min sets one kind.
+# 0 = no limit. Default: 60 for test, vitest, jest, pytest, typecheck, tsc, lint and eslint;
+# none for build, monorepo, docker, capture and other kinds. `--timeout SECS` sets one run.
+# max_run_min = 60
+
 # Named resources and how many jobs may hold each at once (env CALMRUN_RESOURCES="db=1").
 # A job takes a slot with --needs db. A resource that is not listed has 1 slot.
 # [resources]
@@ -258,6 +322,7 @@ pub fn default_config_text(m: Machine) -> String {
 # A pattern is the command's first words, e.g. "make" or "bazel build".
 # [kinds.vitest]
 # cost = 3
+# max_run_min = 90
 #
 # [kinds.heavy]
 # cost = 2
@@ -338,6 +403,55 @@ mod tests {
         assert_eq!(c.resources["gpu"], 4);
         assert_eq!(c.resources["cache"], 3);
         assert_eq!(c.resources.len(), 3);
+    }
+
+    #[test]
+    fn run_limits_by_kind_global_and_default() {
+        let limit = |file: &str, env: Option<&str>, kind: &str| {
+            let env = |k: &str| {
+                (k == "CALMRUN_MAX_RUN_MIN")
+                    .then(|| env.map(String::from))
+                    .flatten()
+            };
+            let c = resolve(m(8, 16), toml::from_str(file).unwrap(), &env);
+            run_limit(&c, kind).map(|(d, from)| (d.as_secs(), from))
+        };
+        // Built-in: an hour for test-like kinds, nothing for builds and unknown kinds.
+        assert_eq!(
+            limit("", None, "vitest"),
+            Some((3600, LimitFrom::Builtin("vitest".into())))
+        );
+        assert_eq!(limit("", None, "build"), None);
+        assert_eq!(limit("", None, "other"), None);
+        // The global value covers every kind; the env wins over the file; 0 turns it off.
+        assert_eq!(
+            limit("max_run_min = 5", None, "build"),
+            Some((300, LimitFrom::Global))
+        );
+        assert_eq!(
+            limit("max_run_min = 5", Some("2"), "test"),
+            Some((120, LimitFrom::Global))
+        );
+        assert_eq!(limit("max_run_min = 0", None, "test"), None);
+        // A kind's own value wins over both.
+        let file = "max_run_min = 5\n[kinds.test]\nmax_run_min = 90\n[kinds.lint]\nmax_run_min = 0\n";
+        assert_eq!(
+            limit(file, Some("2"), "test"),
+            Some((5400, LimitFrom::Kind("test".into())))
+        );
+        assert_eq!(limit(file, None, "lint"), None);
+        for from in [
+            LimitFrom::Asked,
+            LimitFrom::Kind("test".into()),
+            LimitFrom::Global,
+            LimitFrom::Builtin("vitest".into()),
+        ] {
+            let text = from.how_to_change();
+            assert!(text.contains("--timeout") && text.is_ascii(), "{text}");
+        }
+        assert!(LimitFrom::Builtin("vitest".into())
+            .how_to_change()
+            .contains("[kinds.vitest] max_run_min"));
     }
 
     #[test]

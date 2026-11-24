@@ -929,6 +929,9 @@ mod tests {
         for c in [
             "calmrun -- npx vitest run",
             "calmrun --cost 3 -- cargo build",
+            "calmrun --timeout 600 -- npx vitest run",
+            "calmrun stop 12",
+            "calmrun --id e2e stop --label \"npx playwright test\"",
             "npx calmrun -- npx vitest",
             "lane with npx vitest",
             "cd x && calmrun -- npm test",

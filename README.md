@@ -99,6 +99,8 @@ calmrun status                   # what runs, what waits, and why
 calmrun stats --days 30          # how long jobs waited and ran
 calmrun bump e2e                 # move a waiting job to the front
 calmrun bump --back --pos 2      # or to the end of the line
+calmrun stop 12                  # stop a hung job (id from `calmrun status`)
+calmrun --timeout 600 -- npm test  # stop it if it runs longer than 10 minutes
 calmrun init                     # write a commented config file
 calmrun setup --write --hook     # tell your coding agents to use calmrun
 ```
@@ -108,6 +110,14 @@ While waiting, calmrun prints one line to stderr, then one every 30 seconds:
 ```
 calmrun: waiting — 4 of 6 points in use, 2nd in line (needs 2); running: npx vitest in web (3m10s), cargo build in api (1m02s)
 calmrun: waiting for RAM: 2.1 GB free, needs 3.0 GB; running: npx playwright in e2e (4m55s)
+```
+
+The running jobs carry hints about whether they are working (see
+[Working or hung?](#working-or-hung)). When one looks stuck, a next step follows:
+
+```
+calmrun: waiting - 6 of 6 points in use (needs 2), 1st in line; running: npx vitest in lane (12m00s, usually 40s, longer than usual, idle 5m)
+calmrun: next: "npx vitest" (job 12) has used no CPU for 5m; check it with `calmrun status`, and if it hangs stop it with `calmrun stop 12`
 ```
 
 ## How it decides
@@ -376,25 +386,87 @@ calmrun release "$lease"
   calmrun: stopped npx vitest run: its processes used 9.1 GB, above the 8.0 GB ceiling
   ```
 
+- **Run time limit.** A job of a test-like kind (`test`, `vitest`, `jest`, `pytest`,
+  `typecheck`, `tsc`, `lint`, `eslint`) still running after 60 minutes is stopped (its tree,
+  like a memory stop) and calmrun exits **124**; builds, monorepo runs, docker, captures and
+  other kinds have no limit. `max_run_min` in the config sets it for every kind,
+  `[kinds.<name>] max_run_min` for one (0 = no limit), `--timeout SECS` for one run
+  (`--timeout 0` = no limit). The message names the setting to change. A lease or a waiting
+  job is never limited, and a command that runs outside the queue (a dev server, a nested
+  calmrun) only gets an explicit `--timeout`.
+
+  ```
+  calmrun: stopped npx vitest run: still running after its 1h run time limit (the default for kind vitest)
+  calmrun: next: if it was still working, set [kinds.vitest] max_run_min (or max_run_min for every kind, or CALMRUN_MAX_RUN_MIN) in the config; 0 = no limit; or --timeout SECS for one run (--timeout 0 = no limit)
+  ```
+
 - **Process tree.** When the command exits normally, processes it deliberately left running (a
   Gradle or Kotlin daemon, a dev server started in the background) are left alone. When the run
   ends abnormally (Ctrl+C, or calmrun itself being killed) the whole tree is ended.
 - **History.** Each run appends one JSON line to `history.jsonl`: `at`, `label`, `kind`, `cost`,
-  `wait_ms`, `run_ms`, `status` (`ceiling` or `low-memory` for memory stops, `cancelled` for
-  Ctrl+C while waiting). A calmrun killed hard (`taskkill /F`, `kill -9`) is recorded by the next
-  calmrun that finds it gone: `killed` if its command was running, `abandoned` if it was still
-  waiting. Past 4 MB the file becomes `history.1.jsonl`; `stats` reads both. The label is
-  `--label` or the tool and subcommand only (`npx vitest run`, `cargo build`), never the
-  arguments, which may contain secrets.
+  `wait_ms`, `run_ms`, `status` (`ceiling` or `low-memory` for memory stops, `timeout` for the
+  run time limit, `stopped` for `calmrun stop`, `cancelled` for Ctrl+C while waiting), and `cwd`
+  (the folder as a path key, so usual run times are per project). A calmrun killed hard
+  (`taskkill /F`, `kill -9`) is recorded by the next calmrun that finds it gone: `killed` if its
+  command was running, `abandoned` if it was still waiting. Past 4 MB the file becomes
+  `history.1.jsonl`; `stats` reads both. The label is `--label` or the tool and subcommand only
+  (`npx vitest run`, `cargo build`), never the arguments, which may contain secrets.
+
+### Working or hung?
+
+A long job looks the same whether it works or hangs, so `calmrun status` (and the waiting
+line of every job behind it) says what can be measured:
+
+- **CPU.** With the memory sample (about once a second) calmrun adds up the CPU time of the
+  job's whole process tree, on Windows, Linux and macOS. `status` shows the recent CPU use in
+  percent of one core (`cpu 85%`; above 100% means several cores) and, once the tree has used
+  less than 2% of one core for 2 minutes, `idle 5m`. Idle is only a hint and never stops a job:
+  a tree that waits for docker, an emulator capture or the network does its work outside the
+  tree and uses no CPU itself.
+- **Usual run time.** From the history: the median run time of the newest successful runs of
+  the same label in the same folder (at least 3), else of the label anywhere (at least 5),
+  else nothing. `usually 40s`, and `longer than usual` once the job has run more than
+  max(3 x usual, usual + 2 min).
+- **Limit.** The run time limit in force (`limit 60m`), see [While it runs](#while-it-runs).
+
+```
+running (1):
+          id label                    kind     cost     pid      for  cwd
+          12 npx vitest run           vitest      2   20412   12m03s  F:\src\lane
+       now: cpu 0%, usually 40s, longer than usual, idle 5m, limit 60m
+```
+
+When a running job looks stuck (idle, or longer than usual), the jobs waiting behind it print
+a `calmrun: next:` line that names `calmrun status` and `calmrun stop <id>`, and `status`
+lists it under `warning:`. `status --json`, MCP `queue_status` and `task_status` carry the
+same data: `cpu_pct`, `cpu_ms`, `idle_ms`, `usual_ms`, `longer_than_usual`, `timeout_ms`,
+`stop_requested` and the `hint` text.
+
+**Stopping a job.** `calmrun stop <id>` (the `id` column of `status`) or
+`calmrun stop --label TEXT` (the exact label; it must match one job, else calmrun lists the
+candidates and exits 2) asks the calmrun that owns the job to stop it: a running command's
+tree is stopped the way a timeout stops it, a waiting job leaves the line, and that calmrun
+prints `calmrun: stopped by calmrun stop` and exits **130** (history status `stopped`). If
+the owner does not react within 10 seconds (`--wait SECS`), for example a calmrun older than
+0.4 or a wedged process, `stop` kills the owner and its process tree itself, after checking
+that the pid still belongs to that owner (same start time, as the cleanup of dead entries
+does), removes the entry and says which way it went. A child process only counts as part of
+the tree when it started after its parent (Windows keeps a dead parent's pid, which may be
+reused). An owner that also runs other jobs (an MCP server runs every task under its own
+pid) is never killed: for a running job only its command tree is, and a waiting job of such
+an owner is refused with exit 1. An owner that cannot be killed leaves the entry as it is
+(exit 1). A place kept for a ticket is just dropped. `stop` is a CLI command only: the MCP server has no such tool, so an agent cannot
+clear other agents' jobs out of its way (`cancel_task` stops its own tasks).
 
 ## Commands
 
 ```
 calmrun [--kind K] [--cost N] [--prio normal|high|low] [--label L] [--needs NAME,…] [--id QUEUE]
-        [--wait-timeout SECS] [--ticket ID] -- <command...>
+        [--wait-timeout SECS] [--ticket ID] [--timeout SECS] -- <command...>
 calmrun status [--json] [--id QUEUE]
 calmrun stats [--days N] [--json]
 calmrun bump <label-substring> | --pos N | --ticket ID | --dir PATH [--back] [--id QUEUE]
+calmrun stop <id> | --label TEXT [--wait SECS] [--id QUEUE]
 calmrun hold <resource>[,<resource>…] [--ttl SECS] [--label TEXT] [--for DIR] [--cost N] [--wait-timeout SECS] [--id QUEUE]
 calmrun hold --renew <lease> [--ttl SECS] [--id QUEUE]
 calmrun release <lease> [--id QUEUE]
@@ -419,6 +491,7 @@ calmrun mcp
 | `--id QUEUE` | Use a separate queue instead of the machine-wide one |
 | `--wait-timeout SECS` | Give up waiting after this long: exit 75, place kept for 10 minutes |
 | `--ticket ID` | Resume the place kept by an earlier `--wait-timeout` run |
+| `--timeout SECS` | Stop the command once it has run this long: exit 124. `0` = no limit for this run. Default: `max_run_min` from the config (60 min for test-like kinds, else none) |
 
 - Separate words (`calmrun -- npx vitest run`) run the program directly. On Windows calmrun
   looks the name up on `PATH` with `PATHEXT`, so `npm`, `npx` and other `.cmd` shims work, and
@@ -433,9 +506,10 @@ calmrun mcp
 
 | Command | What it does |
 | --- | --- |
-| `status [--json]` | Running and waiting jobs with the reason each one waits (`waits for: RAM: ...`; in JSON `why` and `why_code`: `budget`, `order`, `ram`, `disk`, `key`, `resource`, or `starting`), the queue's budget, free RAM, kept tickets and leases. `--json` (with `mem_bytes` per running job) for tools. |
+| `status [--json]` | Running and waiting jobs (with their `id`) with the reason each one waits (`waits for: RAM: ...`; in JSON `why` and `why_code`: `budget`, `order`, `ram`, `disk`, `key`, `resource`, or `starting`), the queue's budget, free RAM, kept tickets and leases. Running jobs show CPU use, `idle`, their usual run time and limit (see [Working or hung?](#working-or-hung)). `--json` (with `mem_bytes`, `cpu_pct`, `idle_ms`, `usual_ms`, `timeout_ms` per running job) for tools. |
 | `stats [--days N] [--json]` | Runs, failures, average and maximum wait, average run time per label and kind, and waits that gave up before starting, over the last N days (default 7). |
 | `bump <text>` | Move waiting jobs whose label contains the text (case-insensitive) to the front, where later jobs may not pass them while they wait for points or RAM. Instead of the text: `--pos N`, `--ticket ID` or `--dir PATH` (exactly one). `--back` moves them to the end with prio low. See [Order and passing](#order-and-passing). |
+| `stop <id>` | Stop a running or waiting job, or `--label TEXT` (exact, one job); its calmrun exits 130. An owner that does not react within `--wait SECS` (default 10) is killed with its tree. CLI only. See [Stopping a job](#working-or-hung). |
 | `hold <resource>[,…]` | Wait for a slot of each resource, record a lease, print its id and exit; `--ttl`, `--label`, `--for`, `--cost`, `--wait-timeout`, `--renew <id>`. See [Leases](#leases-holding-a-resource-without-a-command). |
 | `release <lease>` | Give a lease back (exit 0 also when it is already gone). `release --ticket <id>` gives up a place kept by `--wait-timeout`. |
 | `doctor` | Cores, RAM, disk type, battery, the state directory and config file, the settings in effect and the suggested ones. |
@@ -446,7 +520,7 @@ calmrun mcp
 | `mcp` | An MCP server on stdin/stdout with `run_task`, `task_status`, `cancel_task`, `queue_status` and `bump`. |
 
 `--id QUEUE` is accepted by every subcommand, before or after its name; it matters for running,
-`status`, `bump`, `hold` and `release`.
+`status`, `bump`, `stop`, `hold` and `release`.
 
 ## Config
 
@@ -461,6 +535,7 @@ vitest_workers = 2
 ceiling_gb = 8          # 0 = off
 min_free_disk_gb = 5    # 0 = off
 critical_free_gb = 0.8  # 0 = off
+max_run_min = 120       # run time limit for every kind; 0 = no limit
 
 [resources]                      # named resources for --needs, with their slots
 db = 1
@@ -468,6 +543,7 @@ emulator = 1
 
 [kinds.vitest]
 cost = 3                         # override a built-in cost
+max_run_min = 90                 # and its run time limit (0 = none)
 
 [kinds.heavy]                    # add a kind with command patterns (first words)
 cost = 2
@@ -483,8 +559,9 @@ patterns = ["make", "bazel build"]
 | `vitest_workers` | `CALMRUN_VITEST_WORKERS` | 1 (≤ 4 cores), 2 (< 12), else 3 | `--maxWorkers` for direct vitest calls |
 | `ceiling_gb` | `CALMRUN_CEILING_GB` | half the RAM | Memory ceiling for one job's process tree; `0` = off |
 | `critical_free_gb` | `CALMRUN_CRITICAL_FREE_GB` | 5% of RAM, at most 1 GB | Free-RAM floor that stops the biggest job; `0` = off |
+| `max_run_min` | `CALMRUN_MAX_RUN_MIN` | 60 for test, vitest, jest, pytest, typecheck, tsc, lint, eslint; none for other kinds | Run time limit in minutes for every kind without its own; `0` = no limit (exit 124 when it passes) |
 | `[resources]` | `CALMRUN_RESOURCES` | none (1 slot each) | Named resource slots, e.g. `db=1,gpu=2`; the variable adds to the table |
-| `[kinds.<name>]` | | built-in costs | `cost` and `patterns` (command's first words) |
+| `[kinds.<name>]` | | built-in costs | `cost`, `patterns` (command's first words) and `max_run_min` (wins over the global one) |
 | | `CALMRUN_LOW_CPU` | on | `0`, `false`, `no` or `off` keeps normal priority |
 | | `CALMRUN_HOOK_MODE` | deny | `rewrite` makes the agent hooks wrap commands themselves |
 | | `CALMRUN_HOME` | see below | State directory |
@@ -493,7 +570,9 @@ patterns = ["make", "bazel build"]
 
 An unknown key or a syntax error makes calmrun ignore the whole file with a warning
 (`calmrun: ignoring config file: …`) and use the defaults; `calmrun doctor` shows what is in
-effect.
+effect. A config with `max_run_min` is such an unknown key for calmrun 0.3.x: a long-lived
+0.3 process (a `calmrun mcp` server started before the upgrade) uses its defaults until it is
+restarted.
 
 ### Where state lives
 
@@ -700,7 +779,7 @@ MCP can queue work without a shell wrapper. It offers five tools:
 | Tool | Arguments | What it does |
 | --- | --- | --- |
 | `run_task` | `command`, and optionally `cwd`, `kind`, `cost`, `label`, `timeout_s`, `prio`, `wait_timeout_s`, `ticket`, `needs`, `wait_seconds`, `queue` | Waits in the same queue as the CLI, runs the command at low priority and returns the exit code, wait and run time, the last 200 lines of output and the path of the full log. When the job has not ended within `wait_seconds` (default 25), it answers at once with a `task_id` instead (see below). |
-| `task_status` | `task_id`, optionally `output_offset`, `wait_seconds` | Where the task is: `waiting` (place in line, waiting count, points in use and budget, the waiting line), `running`, or `done` (exit code and status as `run_task` gives them); wait and run time; the output written since `output_offset` (at most the newest 32 KB) and `next_offset` for the next call. With `wait_seconds` it first waits up to that long for the end. |
+| `task_status` | `task_id`, optionally `output_offset`, `wait_seconds` | Where the task is: `waiting` (place in line, waiting count, points in use and budget, the waiting line, `running_jobs` with their hints, and `next` steps for one that looks stuck), `running` (with `cpu_pct`, `idle_ms`, `usual_ms`, `timeout_ms`), or `done` (exit code and status as `run_task` gives them); wait and run time; the output written since `output_offset` (at most the newest 32 KB) and `next_offset` for the next call. With `wait_seconds` it first waits up to that long for the end. |
 | `cancel_task` | `task_id` | A waiting task leaves the queue; a running one is stopped with its whole process tree. Answers with how it ended. A finished task is left alone. |
 | `queue_status` | `queue` | The same data as `calmrun status --json`, leases included. |
 | `bump` | exactly one of `label`, `pos`, `ticket`, `dir`; optionally `back`, `queue` | Move matching waiting jobs to the front (or with `back`, to the end with prio low), as `calmrun bump` does. |
@@ -717,7 +796,8 @@ server process; the last 100 finished ones stay queryable.
 
 - While a task waits, the server sends progress notifications if the client passed a
   `progressToken`.
-- `timeout_s` stops the command (exit 124). `wait_timeout_s` gives up waiting (exit 75) and
+- `timeout_s` stops the command (exit 124); without it the config's `max_run_min` applies, as
+  for the CLI. `wait_timeout_s` gives up waiting (exit 75) and
   returns a `ticket`; pass it back as `ticket` to resume the same place in line.
 - Cancelling a `run_task` request (`notifications/cancelled`) while it still waits for its
   answer leaves the queue or stops the command, and, as the MCP spec asks, the cancelled
@@ -838,10 +918,10 @@ example after a refused `docker compose up` or a command that is not on `PATH`.
 | 1 | calmrun itself failed (state directory, lock, a file `setup` could not change) |
 | 2 | Refused (watch mode, attached `docker compose up`, interactive `docker run`), bad arguments, or an invalid `--id` |
 | 75 | Not started within `--wait-timeout`; place kept, see the `next:` line |
-| 124 | Stopped by the MCP `timeout_s` |
+| 124 | Stopped by its run time limit (`--timeout`, MCP `timeout_s`, `max_run_min`) |
 | 126 | The command was found but could not be started |
 | 127 | Command not found |
-| 130 | Ctrl+C (while waiting or running) |
+| 130 | Ctrl+C (while waiting or running), or stopped by `calmrun stop` |
 | 137 | Stopped by the memory ceiling or the critical free-RAM floor |
 
 ## Platform notes
@@ -901,6 +981,15 @@ prints, or run the watcher outside calmrun.
 **A job was stopped with exit 137.** Its process tree passed `ceiling_gb`, or free RAM stayed
 below `critical_free_gb` and it was the biggest job. Raise or disable the limit
 (`CALMRUN_CEILING_GB=0`), or give the job fewer workers.
+
+**A job runs for ages; is it hung?** `calmrun status` shows its CPU use, `idle` once its
+processes have used no CPU for 2 minutes, and its usual run time. Idle with no output for a
+long time usually means it hangs (unless it waits for docker or the network); stop it with
+`calmrun stop <id>`.
+
+**A job was stopped with exit 124.** It ran past its run time limit: 60 minutes for test-like
+kinds by default. The message names the setting; raise `max_run_min` (globally or in
+`[kinds.<name>]`), or pass `--timeout SECS` (`--timeout 0` = no limit) for that run.
 
 **My config seems ignored.** An unknown key or a TOML error makes calmrun skip the whole file
 with a warning on stderr. `calmrun doctor` shows the path it reads and the values in effect.

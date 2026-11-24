@@ -848,6 +848,7 @@ mod tests {
             KindConfig {
                 cost: Some(3),
                 patterns: vec!["make".into(), "bazel build".into()],
+                ..KindConfig::default()
             },
         );
         assert_eq!(

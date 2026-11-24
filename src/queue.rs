@@ -1,7 +1,7 @@
 //! The service every agent entry point uses (CLI, MCP): submit a job, wait for its turn, run
 //! it, record it. [`run`] is the whole flow; each phase is its own function below.
 
-use crate::config::{self, bytes_to_gb, Config};
+use crate::config::{self, bytes_to_gb, Config, LimitFrom};
 use crate::detect::{self, Detected};
 use crate::error::{Error, Result};
 use crate::kinds::Workers;
@@ -32,8 +32,12 @@ const RAM_SAMPLE_TTL_MS: u64 = 1_000;
 const RAM_RESERVE_PER_POINT: u64 = 1 << 30;
 /// How long that assumption fades out over.
 const RAM_RESERVE_WINDOW_MS: u64 = 20_000;
-/// Publish the tree's memory to the state every this many samples.
+/// Publish the tree's memory and CPU to the state every this many samples.
 const MEM_PUBLISH_EVERY: u64 = 2;
+/// A running owner looks for a `calmrun stop` request this often.
+const STOP_CHECK_EVERY: Duration = Duration::from_secs(1);
+/// A waiter re-reads the usual run times from the history this often.
+const USUAL_REFRESH: Duration = Duration::from_secs(300);
 
 /// A separate queue (`--id`) left empty and unused this long is removed.
 const IDLE_QUEUE_MS: u64 = 7 * 24 * 3_600_000;
@@ -44,7 +48,7 @@ pub const TICKET_TTL_MS: u64 = 10 * 60_000;
 pub const EXIT_WAIT_TIMEOUT: i32 = 75;
 /// Refused (attached `docker compose up`).
 pub const EXIT_REFUSED: i32 = 2;
-/// Stopped by the MCP `timeout_s`.
+/// Stopped by its run time limit (`--timeout`, MCP `timeout_s`, `max_run_min`).
 pub const EXIT_TIMEOUT: i32 = 124;
 
 /// Milliseconds since the Unix epoch.
@@ -246,6 +250,7 @@ pub fn record_dead(store: &Store, dead: &[Job]) {
             cost: j.cost,
             wait_ms,
             run_ms,
+            cwd: crate::watch::folder_key(j),
             ..Outcome::default()
         };
         record(store, store.queue(), &out);
@@ -265,7 +270,8 @@ pub struct Request {
     /// `--prio low`: after every normal and high waiter (`high` wins if both are set).
     pub low: bool,
     pub label: Option<String>,
-    /// Stop the command after this long (exit 124).
+    /// Stop the command after this long (exit 124); zero: no limit for this run. `None`
+    /// takes the config's limit for the kind (queued runs only).
     pub timeout: Option<Duration>,
     /// Write stdout and stderr to this file (stdin is closed) instead of inheriting them.
     pub log: Option<PathBuf>,
@@ -302,6 +308,8 @@ pub struct Outcome {
     pub message: Option<String>,
     /// Ticket id when the wait timed out and the place is kept.
     pub ticket: Option<u64>,
+    /// The folder as a path key (for the history).
+    pub cwd: String,
 }
 
 impl Outcome {
@@ -333,12 +341,16 @@ pub trait Notify {
     fn note(&mut self, line: &str) {
         eprintln!("{line}");
     }
+    /// A next step that goes with the waiting line just given (a running job looks stuck).
+    fn advice(&mut self, _line: &str) {}
 }
 
 /// Prints the waiting line at once (with a hint) and then every 30 s.
 #[derive(Default)]
 pub struct StderrNotify {
     last: Option<Instant>,
+    /// The waiting line was just printed, so its advice goes with it.
+    printed: bool,
 }
 
 impl Notify for StderrNotify {
@@ -347,6 +359,7 @@ impl Notify for StderrNotify {
     }
 
     fn waiting(&mut self, line: &str) {
+        self.printed = false;
         if !self.wants_line() {
             return;
         }
@@ -355,6 +368,13 @@ impl Notify for StderrNotify {
             eprintln!("{}", messages::STARTS_BY_ITSELF);
         }
         self.last = Some(Instant::now());
+        self.printed = true;
+    }
+
+    fn advice(&mut self, line: &str) {
+        if self.printed {
+            eprintln!("{line}");
+        }
     }
 }
 
@@ -372,6 +392,10 @@ struct Prepared {
     hold_ttl: Option<Duration>,
     /// The folder owning that lease (`hold --for`): as given, and as a path key.
     hold_for: Option<(String, String)>,
+    /// `cwd` as a path key.
+    cwd_key: String,
+    /// The run time limit and where it comes from.
+    limit: Option<(Duration, LimitFrom)>,
 }
 
 impl Prepared {
@@ -380,6 +404,7 @@ impl Prepared {
             label: self.label.clone(),
             kind: self.kind.clone(),
             cost: self.cost,
+            cwd: self.cwd_key.clone(),
             ..Outcome::default()
         }
     }
@@ -409,6 +434,11 @@ pub fn run(ctx: &mut Ctx, req: Request, notify: &mut dyn Notify) -> Outcome {
     if held_by_outer(ctx) {
         return run_nested(&p);
     }
+    // Only a queued run gets the config's limit; a dev server or a nested run never does.
+    let mut p = p;
+    if p.req.timeout.is_none() {
+        p.limit = config::run_limit(&ctx.cfg, &p.kind);
+    }
     let store = match ctx.store() {
         Ok(s) => s,
         Err(e) => return p.outcome().error(&e),
@@ -422,8 +452,8 @@ pub fn run(ctx: &mut Ctx, req: Request, notify: &mut dyn Notify) -> Outcome {
         Ok(Admitted::Started(t)) => t,
         Ok(Admitted::Leased(_)) => return p.outcome(),
         Err(out) => {
-            // Ctrl+C or a cancelled MCP task while waiting: the run never started.
-            if out.status == "cancelled" {
+            // Ctrl+C, a cancelled MCP task or `calmrun stop` while waiting: it never started.
+            if matches!(out.status.as_str(), "cancelled" | "stopped") {
                 record(&store, ctx.queue.as_deref(), &out);
             }
             return *out;
@@ -492,6 +522,10 @@ fn prepare(ctx: &Ctx, mut req: Request) -> std::result::Result<Prepared, Box<Out
     if let Some(bad) = invalid_resource(&req.needs) {
         return Err(Box::new(Outcome::default().error(&bad)));
     }
+    let limit = req
+        .timeout
+        .filter(|t| !t.is_zero())
+        .map(|t| (t, LimitFrom::Asked));
     Ok(Prepared {
         req,
         light,
@@ -499,9 +533,11 @@ fn prepare(ctx: &Ctx, mut req: Request) -> std::result::Result<Prepared, Box<Out
         kind,
         cost,
         label,
+        cwd_key: crate::sys::path_key(&cwd),
         cwd,
         hold_ttl: None,
         hold_for: None,
+        limit,
     })
 }
 
@@ -605,7 +641,8 @@ fn enqueue(ctx: &mut Ctx, store: &Store, p: &Prepared, notify: &mut dyn Notify) 
         queued_ms: now_ms(),
         needs: p.req.needs.clone(),
         hold_ttl_ms: p.hold_ttl.map(|t| t.as_millis() as u64),
-        cwd_key: crate::sys::path_key(&p.cwd),
+        cwd_key: p.cwd_key.clone(),
+        timeout_ms: p.limit.as_ref().map(|l| l.0.as_millis() as u64),
         use_leases: std::env::var("CALMRUN_LEASE")
             .unwrap_or_default()
             .split(',')
@@ -664,8 +701,12 @@ enum Tick {
     Admitted(Admitted),
     Waiting {
         line: Option<String>,
+        /// Next steps for running jobs that look stuck (with the line).
+        advice: Vec<String>,
         fingerprint: (usize, usize, usize),
     },
+    /// `calmrun stop` asked for this entry: it has left the queue.
+    Stopped,
 }
 
 /// Poll until the scheduler admits us. Returns the start time (or a hold's lease), or the
@@ -688,6 +729,8 @@ fn wait_turn(
     let mut last_line = String::from("waiting");
     let mut poll = POLL_MIN;
     let mut last_fp = None;
+    // Read outside every lock, and only when a line is wanted.
+    let mut usual: Option<(Instant, history::Usual)> = None;
     loop {
         if p.cancelled() {
             let _ = store.with_lock(|s| s.jobs.retain(|j| j.id != entry.id));
@@ -700,6 +743,9 @@ fn wait_turn(
         }
         let timed_out = p.req.wait_timeout.is_some_and(|t| wait_started.elapsed() >= t);
         let want_line = timed_out || notify.wants_line();
+        if want_line && usual.as_ref().is_none_or(|u| u.0.elapsed() >= USUAL_REFRESH) {
+            usual = Some((Instant::now(), history::Usual::load(store.history_path())));
+        }
         let short = disk.short();
         let input = TickInput {
             store,
@@ -708,6 +754,8 @@ fn wait_turn(
             short,
             want_line,
             hold_for: p.hold_for.as_ref(),
+            usual: usual.as_ref().map(|u| &u.1),
+            queue: ctx.queue.clone(),
         };
         let tick = tick(ctx, &input).map_err(|e| Box::new(p.outcome().error(&e)))?;
         match tick {
@@ -717,9 +765,24 @@ fn wait_turn(
                 }
                 return Ok(a);
             }
-            Tick::Waiting { line, fingerprint } => {
+            Tick::Stopped => {
+                let msg = "calmrun: stopped by calmrun stop while waiting; left the queue".to_string();
+                return Err(Box::new(waited(p, entry).ended(
+                    runner::EXIT_INTERRUPTED,
+                    "stopped",
+                    Some(msg),
+                )));
+            }
+            Tick::Waiting {
+                line,
+                advice,
+                fingerprint,
+            } => {
                 if let Some(l) = line {
                     notify.waiting(&l);
+                    for a in &advice {
+                        notify.advice(a);
+                    }
                     last_line = l;
                 }
                 if timed_out && p.hold_ttl.is_some() {
@@ -748,6 +811,9 @@ struct TickInput<'a> {
     short: bool,
     want_line: bool,
     hold_for: Option<&'a (String, String)>,
+    usual: Option<&'a history::Usual>,
+    /// The separate queue, for the commands in the advice.
+    queue: Option<String>,
 }
 
 /// One locked look at the queue: prune, publish our disk state, read (or reuse) the shared
@@ -769,6 +835,11 @@ fn tick(ctx: &mut Ctx, t: &TickInput) -> Result<Tick> {
             dead = live.prune(s);
             let limits = effective_limits(own, s);
             match s.jobs.iter_mut().find(|j| j.id == entry.id) {
+                // `calmrun stop` asked for it: leave before the scheduler can admit it.
+                Some(j) if j.stop_ms.is_some() => {
+                    s.jobs.retain(|j| j.id != entry.id);
+                    return Tick::Stopped;
+                }
                 Some(j) => j.disk_short = t.short,
                 // Our entry vanished (state file removed by hand); put it back.
                 None => s.jobs.push(Job {
@@ -797,6 +868,8 @@ fn tick(ctx: &mut Ctx, t: &TickInput) -> Result<Tick> {
                 if let Some(j) = s.jobs.iter_mut().find(|j| j.id == entry.id) {
                     j.started_ms = Some(now);
                     j.disk_short = false;
+                    // Again here: a 0.3 calmrun that rewrote the state meanwhile dropped it.
+                    j.timeout_ms = entry.timeout_ms;
                 }
                 return Tick::Admitted(Admitted::Started(now));
             }
@@ -810,11 +883,20 @@ fn tick(ctx: &mut Ctx, t: &TickInput) -> Result<Tick> {
                     disk: Some(t.disk),
                     caps,
                     now_ms: now,
+                    usual: t.usual,
                 };
                 messages::waiting_line(s, &plan.reason(entry.id), &c)
             });
+            let advice = match t.want_line {
+                true => {
+                    let flag = t.queue.as_ref().map(|q| format!(" --id {q}")).unwrap_or_default();
+                    messages::stuck_running_next(s, now, t.usual, &flag)
+                }
+                false => Vec::new(),
+            };
             Tick::Waiting {
                 line,
+                advice,
                 fingerprint: (s.jobs.len(), running + foreign.len(), place),
             }
         })
@@ -937,6 +1019,7 @@ pub fn hold(
         _ => format!("hold {}", needs.join(",")),
     };
     let cost = h.cost.unwrap_or(0).min(ctx.cfg.budget.max(1));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let p = Prepared {
         req: Request {
             needs,
@@ -948,12 +1031,14 @@ pub fn hold(
         kind: "hold".into(),
         cost,
         label,
-        cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        cwd_key: crate::sys::path_key(&cwd),
+        cwd,
         hold_ttl: Some(h.ttl),
         hold_for: h.for_dir.as_deref().map(|d| {
             let shown = std::path::absolute(d).unwrap_or_else(|_| d.to_path_buf());
             (shown.to_string_lossy().to_string(), crate::sys::path_key(d))
         }),
+        limit: None,
     };
     let store = ctx.store().map_err(|e| Box::new(p.outcome().error(&e)))?;
     let entry = enqueue(ctx, &store, &p, notify).map_err(|e| Box::new(p.outcome().error(&e)))?;
@@ -985,20 +1070,26 @@ fn disk_warning(disk: &DiskCheck) -> String {
 /// Why the watcher stopped the command.
 enum StopReason {
     Cancelled,
-    Timeout(Duration),
+    Timeout(Duration, LimitFrom),
     Memory(memwatch::Stop),
+    /// `calmrun stop` asked for it.
+    Stopped,
 }
 
-/// Asked every 250 ms while the command runs: cancel, timeout, memory.
+/// Asked every 250 ms while the command runs: cancel, run time limit, `calmrun stop`,
+/// memory. It also publishes the tree's memory and CPU for `status`.
 struct Watcher<'a> {
     cancel: Option<&'a AtomicBool>,
-    timeout: Option<Duration>,
+    limit: Option<(Duration, LimitFrom)>,
     started: Instant,
     mem: Option<MemWatch>,
-    /// Where to publish the tree's memory (not for nested runs).
+    /// Where to publish the tree's memory and CPU (not for nested runs).
     store: Option<&'a Store>,
     id: u64,
     samples: u64,
+    /// The last sample in which the tree used a noticeable share of CPU.
+    busy_ms: Option<u64>,
+    stop_checked: Option<Instant>,
     reason: Option<StopReason>,
 }
 
@@ -1006,28 +1097,53 @@ impl<'a> Watcher<'a> {
     fn new(p: &'a Prepared, mem: Option<MemWatch>, store: Option<&'a Store>, id: u64) -> Watcher<'a> {
         Watcher {
             cancel: p.req.cancel.as_deref(),
-            timeout: p.req.timeout,
+            limit: p.limit.clone(),
             started: Instant::now(),
             mem,
             store,
             id,
             samples: 0,
+            busy_ms: None,
+            stop_checked: None,
             reason: None,
         }
     }
 
     fn check(&mut self, pid: u32) -> bool {
+        let over = self
+            .limit
+            .as_ref()
+            .filter(|l| self.started.elapsed() > l.0)
+            .cloned();
         if self.cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
             self.reason = Some(StopReason::Cancelled);
-        } else if let Some(t) = self.timeout.filter(|t| self.started.elapsed() > *t) {
-            self.reason = Some(StopReason::Timeout(t));
-        } else if let Some(stop) = self.check_memory(pid) {
+        } else if let Some((t, from)) = over {
+            self.reason = Some(StopReason::Timeout(t, from));
+        } else if self.stop_requested() {
+            self.reason = Some(StopReason::Stopped);
+        } else if let Some(stop) = self.check_tree(pid) {
             self.reason = Some(StopReason::Memory(stop));
         }
         self.reason.is_some()
     }
 
-    fn check_memory(&mut self, pid: u32) -> Option<memwatch::Stop> {
+    /// Whether `calmrun stop` marked our entry (an unlocked read, once a second).
+    fn stop_requested(&mut self) -> bool {
+        let Some(store) = self.store else {
+            return false;
+        };
+        if self.stop_checked.is_some_and(|t| t.elapsed() < STOP_CHECK_EVERY) {
+            return false;
+        }
+        self.stop_checked = Some(Instant::now());
+        store
+            .peek()
+            .jobs
+            .iter()
+            .any(|j| j.id == self.id && j.stop_ms.is_some())
+    }
+
+    fn check_tree(&mut self, pid: u32) -> Option<memwatch::Stop> {
         let mem = self.mem.as_mut()?;
         let (store, id) = (self.store, self.id);
         // Only the biggest running job is stopped when free RAM is critical.
@@ -1045,12 +1161,21 @@ impl<'a> Watcher<'a> {
         let (fresh, stop) = mem.check(pid, &mut biggest);
         if fresh {
             self.samples += 1;
+            if mem.busy() {
+                self.busy_ms = Some(now_ms());
+            }
             if self.samples % MEM_PUBLISH_EVERY == 1 {
-                let used = mem.used;
+                let (used, cpu_ms, cpu_pct, busy_ms) = (mem.used, mem.cpu_ms, mem.cpu_pct, self.busy_ms);
+                // The limit too: a 0.3 calmrun that rewrote the state dropped it.
+                let timeout_ms = self.limit.as_ref().map(|l| l.0.as_millis() as u64);
                 let _ = store.map(|st| {
                     st.with_lock(|s| {
                         if let Some(j) = s.jobs.iter_mut().find(|j| j.id == id) {
                             j.mem_bytes = Some(used);
+                            j.cpu_ms = Some(cpu_ms);
+                            j.cpu_pct = Some(cpu_pct);
+                            j.busy_ms = busy_ms;
+                            j.timeout_ms = timeout_ms;
                         }
                     })
                 });
@@ -1116,12 +1241,14 @@ fn finish(p: &Prepared, result: std::io::Result<runner::Ended>, reason: Option<S
             "cancelled",
             Some(format!("calmrun: stopped {label}: the request was cancelled")),
         ),
-        (Ok(e), Some(StopReason::Timeout(t))) if e.stopped => out.ended(
-            EXIT_TIMEOUT,
-            "timeout",
+        (Ok(e), Some(StopReason::Timeout(t, from))) if e.stopped => {
+            out.ended(EXIT_TIMEOUT, "timeout", Some(timeout_message(label, t, &from)))
+        }
+        (Ok(e), Some(StopReason::Stopped)) if e.stopped => out.ended(
+            runner::EXIT_INTERRUPTED,
+            "stopped",
             Some(format!(
-                "calmrun: stopped {label}: still running after the {}s timeout",
-                t.as_secs()
+                "calmrun: stopped by calmrun stop: {label} and its process tree were stopped"
             )),
         ),
         (Ok(e), _) if runner::INTERRUPTED.load(Ordering::SeqCst) => out.ended(e.code, "interrupted", None),
@@ -1129,8 +1256,32 @@ fn finish(p: &Prepared, result: std::io::Result<runner::Ended>, reason: Option<S
     }
 }
 
+/// The message after a run time limit stopped `label`, with how to change the limit.
+fn timeout_message(label: &str, t: Duration, from: &LimitFrom) -> String {
+    let what = match from {
+        LimitFrom::Asked => format!("the {}s timeout", t.as_secs()),
+        LimitFrom::Kind(k) => format!(
+            "its {} run time limit ([kinds.{k}] max_run_min)",
+            crate::watch::short_ms(t.as_millis() as u64)
+        ),
+        LimitFrom::Global => format!(
+            "its {} run time limit (max_run_min)",
+            crate::watch::short_ms(t.as_millis() as u64)
+        ),
+        LimitFrom::Builtin(k) => format!(
+            "its {} run time limit (the default for kind {k})",
+            crate::watch::short_ms(t.as_millis() as u64)
+        ),
+    };
+    format!(
+        "calmrun: stopped {label}: still running after {what}\ncalmrun: next: if it was still \
+         working, {}",
+        from.how_to_change()
+    )
+}
+
 /// Append the run to `history.jsonl` (best effort: history is a convenience).
-fn record(store: &Store, queue: Option<&str>, out: &Outcome) {
+pub fn record(store: &Store, queue: Option<&str>, out: &Outcome) {
     let _ = history::append_rotating(
         store.history_path(),
         &history::Record {
@@ -1142,6 +1293,7 @@ fn record(store: &Store, queue: Option<&str>, out: &Outcome) {
             run_ms: out.run_ms,
             status: out.status.clone(),
             queue: queue.map(str::to_string),
+            cwd: (!out.cwd.is_empty()).then(|| out.cwd.clone()),
         },
         history::ROTATE_BYTES,
     );
@@ -1196,6 +1348,34 @@ mod tests {
         // A tie: the newer job (higher id) is the one to stop, never both.
         assert!(beats(5, 2, 5, 1));
         assert!(!beats(5, 1, 5, 2));
+    }
+
+    #[test]
+    fn timeout_messages_name_the_setting_to_change() {
+        let hour = Duration::from_secs(3600);
+        let m = timeout_message("npx vitest", hour, &LimitFrom::Builtin("vitest".into()));
+        assert!(
+            m.starts_with(
+                "calmrun: stopped npx vitest: still running after its 1h run time limit (the \
+                 default for kind vitest)\ncalmrun: next: "
+            ),
+            "{m}"
+        );
+        assert!(
+            m.contains("[kinds.vitest] max_run_min") && m.contains("--timeout"),
+            "{m}"
+        );
+        let m = timeout_message("x", Duration::from_secs(5), &LimitFrom::Asked);
+        assert!(
+            m.contains("after the 5s timeout") && m.contains("--timeout"),
+            "{m}"
+        );
+        let m = timeout_message("x", hour, &LimitFrom::Global);
+        assert!(
+            m.contains("(max_run_min)") && m.contains("CALMRUN_MAX_RUN_MIN"),
+            "{m}"
+        );
+        assert!(m.is_ascii());
     }
 
     #[test]

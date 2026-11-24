@@ -2,9 +2,11 @@
 //! where there is something to do, the exact next command.
 
 use crate::config::bytes_to_gb;
+use crate::history::Usual;
 use crate::scheduler::{self, Block};
 use crate::state::{Job, Settings, State};
 use crate::sys::DiskCheck;
+use crate::watch;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -34,6 +36,8 @@ pub struct WaitContext<'a> {
     pub disk: Option<&'a DiskCheck>,
     pub caps: &'a BTreeMap<String, u32>,
     pub now_ms: u64,
+    /// Usual run times from the history, for the hints about the running jobs.
+    pub usual: Option<&'a Usual>,
 }
 
 /// "calmrun: waiting - 4 of 6 points in use (needs 2), 2nd in line; running: ...".
@@ -50,7 +54,7 @@ pub fn waiting_line(s: &State, why: &Block, c: &WaitContext) -> String {
         }
         _ => format!("calmrun: waiting - {r}, {} in line", ordinal(place)),
     };
-    match running_summary(s, c.now_ms) {
+    match running_summary(s, c.now_ms, c.usual) {
         r if r.is_empty() => line,
         r => format!("{line}; running: {r}"),
     }
@@ -162,8 +166,8 @@ pub fn settings_mismatch(queue: &Settings, mine: &Settings) -> String {
     )
 }
 
-/// "npx vitest in web (3m10s), cargo build in api (1m02s)".
-pub fn running_summary(s: &State, now: u64) -> String {
+/// "npx vitest in web (3m10s), cargo build in api (1m02s, usually 40s, idle 5m)".
+pub fn running_summary(s: &State, now: u64, usual: Option<&Usual>) -> String {
     let mut running: Vec<&Job> = s.jobs.iter().filter(|j| j.running()).collect();
     running.sort_by_key(|j| j.started_ms);
     let mut out = running
@@ -174,7 +178,9 @@ pub fn running_summary(s: &State, now: u64) -> String {
                 .file_name()
                 .map_or_else(|| j.cwd.clone(), |n| n.to_string_lossy().to_string());
             let since = now.saturating_sub(j.started_ms.unwrap_or(now));
-            format!("{} in {dir} ({})", j.label, crate::history::human_ms(since))
+            let mut parts = vec![crate::history::human_ms(since)];
+            parts.extend(watch::hints(j, now, usual).brief());
+            format!("{} in {dir} ({})", j.label, parts.join(", "))
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -182,6 +188,20 @@ pub fn running_summary(s: &State, now: u64) -> String {
         out.push_str(&format!(", +{} more", running.len() - RUNNING_SHOWN));
     }
     out
+}
+
+/// The next-step lines for the running jobs that look stuck (idle, or much longer than
+/// usual), for a job waiting behind them. `queue_flag` is ` --id <queue>` or empty.
+pub fn stuck_running_next(s: &State, now: u64, usual: Option<&Usual>, queue_flag: &str) -> Vec<String> {
+    let mut running: Vec<&Job> = s.jobs.iter().filter(|j| j.running()).collect();
+    running.sort_by_key(|j| j.started_ms);
+    running
+        .into_iter()
+        .filter_map(|j| {
+            let h = watch::hints(j, now, usual);
+            h.worrying().then(|| watch::next_step(j, &h, queue_flag))
+        })
+        .collect()
 }
 
 /// The message after `--wait-timeout`, with the command that resumes the place.
@@ -284,9 +304,35 @@ mod tests {
             ],
         };
         assert_eq!(
-            running_summary(&s, 200_000),
+            running_summary(&s, 200_000, None),
             "npx vitest in web (3m10s), cargo build in api (2m20s)"
         );
+    }
+
+    #[test]
+    fn running_summary_says_when_a_job_looks_idle() {
+        let mut idle = job(4, "npx vitest", "/src/lane", 0);
+        idle.cpu_ms = Some(900);
+        idle.cpu_pct = Some(0);
+        idle.busy_ms = Some(420_000);
+        let s = State {
+            jobs: vec![idle, job(5, "cargo build", "/src/api", 600_000)],
+            ..State::default()
+        };
+        let now = 720_000;
+        assert_eq!(
+            running_summary(&s, now, None),
+            "npx vitest in lane (12m00s, idle 5m), cargo build in api (2m00s)"
+        );
+        let next = stuck_running_next(&s, now, None, "");
+        assert_eq!(
+            next,
+            [
+                "calmrun: next: \"npx vitest\" (job 4) has used no CPU for 5m; check it with \
+              `calmrun status`, and if it hangs stop it with `calmrun stop 4`"
+            ]
+        );
+        assert!(next[0].is_ascii());
     }
 
     #[test]
@@ -331,6 +377,7 @@ mod tests {
             disk: Some(&disk),
             caps: &caps,
             now_ms: 1_000,
+            usual: None,
         };
         assert_eq!(
             waiting_line(&s, &Block::Resource("emulator".into()), &c),
@@ -365,6 +412,7 @@ mod tests {
             disk: None,
             caps: &caps,
             now_ms: 0,
+            usual: None,
         };
         let why = Block::Bumped { id: 5 };
         assert_eq!(
@@ -409,6 +457,7 @@ mod tests {
             disk: Some(&disk),
             caps: &caps,
             now_ms: 1_000,
+            usual: None,
         };
         let s0 = State {
             jobs: vec![
@@ -438,6 +487,7 @@ mod tests {
             disk: None,
             caps: &caps,
             now_ms: 0,
+            usual: None,
         };
         let ram = |reserved| Block::Ram {
             free: 2 * GB,
@@ -472,6 +522,7 @@ mod tests {
             disk: None,
             caps: &caps,
             now_ms: 0,
+            usual: None,
         };
         let blocks = [
             Block::Points { used: 2, needs: 1 },

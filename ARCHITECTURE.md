@@ -21,7 +21,9 @@ process evaluates the same way, admits it. Only then does it run the command.
 | `status.rs` | Snapshot, `status --json` / MCP `queue_status`, and `bump`. |
 | `lease.rs` | `hold` / `release` arguments, lease ids, renew and release. Waiting for the slots is `queue::hold`. |
 | `messages.rs` | Every waiting, refusal and timeout line, each ending with a `next:` step where there is one. |
-| `memwatch.rs` | Process-tree memory and the critical free-RAM floor while a job runs. |
+| `memwatch.rs` | Process-tree memory and CPU time, and the critical free-RAM floor, while a job runs. |
+| `watch.rs` | Working or hung: CPU, idle and usual-run-time hints for `status`, the waiting line and MCP (hints only, never a stop). |
+| `stop.rs` | `calmrun stop`: mark the job for its owner, wait, then kill an owner that does not react (pid + start time checked). |
 | `runner.rs` | Spawns the command: name lookup, priority, Job Object or process group, signals, exit codes. |
 | `sys.rs` | Machine facts: RAM, cores, process liveness, disks, power, path normalisation. |
 | `mcp.rs` | The MCP server: newline-delimited JSON-RPC on stdio and the tool registry. |
@@ -132,10 +134,13 @@ pure. Integration tests in `tests/` drive the real binary against a temporary
 - `memory.rs`: the memory ceiling.
 - `mcp.rs`: the JSON-RPC protocol, and tasks: handles, offsets, cancel, server exit.
 - `lease.rs`: `hold` / `release`: lifecycle, expiry, contention with `--needs`, queues.
+- `watch.rs`: CPU and usual-time hints, the run time limit, `calmrun stop` (running, waiting,
+  and an owner that does not react).
 - `setup.rs`: setup against a temporary home.
 - `review.rs`: regression tests for review findings (watch refusal, setup backups, tickets in
   `status`, the hook's absolute path, `npm.cmd` shadowing, a hard-killed calmrun).
 
 The hidden `__probe` subcommand is the test workload. It sleeps, logs start and end times,
-allocates memory, prints its arguments or environment, and spawns a daemon.
+allocates memory, keeps a core busy (`--burn-ms`), prints its arguments or environment, and
+spawns a daemon.
 `__ctrl_c` delivers Ctrl+C. CI runs everything on Windows, macOS and Linux.
