@@ -10,7 +10,7 @@ use crate::messages::{self, WaitContext};
 use crate::scheduler::{self, Inputs, Limits};
 use crate::state::{self, Job, Lease, OtherQueue, Settings, State, Store};
 use crate::sys::{DiskCheck, Sys};
-use crate::{history, runner};
+use crate::{history, joblog, runner};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -251,6 +251,8 @@ pub fn record_dead(store: &Store, dead: &[Job]) {
             wait_ms,
             run_ms,
             cwd: crate::watch::folder_key(j),
+            job_id: Some(j.id),
+            log: j.log_path.clone(),
             ..Outcome::default()
         };
         record(store, store.queue(), &out);
@@ -275,6 +277,9 @@ pub struct Request {
     pub timeout: Option<Duration>,
     /// Write stdout and stderr to this file (stdin is closed) instead of inheriting them.
     pub log: Option<PathBuf>,
+    /// `calmrun --log`: copy stdout and stderr to the terminal and to this file (stdin stays).
+    /// Only for a queued run; a light or nested one keeps the terminal.
+    pub tee: Option<PathBuf>,
     /// Set by the caller to give up (waiting) or stop the command (running).
     pub cancel: Option<Arc<AtomicBool>>,
     /// Give up waiting after this long (exit 75) but keep the place for a ticket.
@@ -310,6 +315,9 @@ pub struct Outcome {
     pub ticket: Option<u64>,
     /// The folder as a path key (for the history).
     pub cwd: String,
+    /// The job's id in its queue and its log, once it ran (for `calmrun logs` afterwards).
+    pub job_id: Option<u64>,
+    pub log: Option<String>,
 }
 
 impl Outcome {
@@ -594,7 +602,16 @@ fn spawn_and_finish(
         if let Some(pid) = held_by {
             cmd.env("CALMRUN_HELD", pid.to_string());
         }
-        runner::run(cmd, low_cpu, on_spawn, &mut |pid| watch.check(pid))
+        // Only a queued run (held_by) copies its output; see `Request::tee`.
+        let tee = match p.req.tee.as_deref().filter(|_| held_by.is_some()) {
+            Some(log) => Some(joblog::Tee::attach(&mut cmd, log)?),
+            None => None,
+        };
+        let ended = runner::run(cmd, low_cpu, on_spawn, &mut |pid| watch.check(pid));
+        if let Some(t) = tee {
+            t.finish();
+        }
+        ended
     });
     finish(p, result, watch.reason)
 }
@@ -885,7 +902,8 @@ fn tick(ctx: &mut Ctx, t: &TickInput) -> Result<Tick> {
                     now_ms: now,
                     usual: t.usual,
                 };
-                messages::waiting_line(s, &plan.reason(entry.id), &c)
+                let line = messages::waiting_line(s, &plan.reason(entry.id), &c);
+                line + &crate::logs::waiting_hint(s, t.store.queue())
             });
             let advice = match t.want_line {
                 true => {
@@ -1091,6 +1109,8 @@ struct Watcher<'a> {
     busy_ms: Option<u64>,
     stop_checked: Option<Instant>,
     reason: Option<StopReason>,
+    /// The job's log, watched for new output (`output_ms`).
+    output: Option<joblog::Output>,
 }
 
 impl<'a> Watcher<'a> {
@@ -1106,6 +1126,7 @@ impl<'a> Watcher<'a> {
             busy_ms: None,
             stop_checked: None,
             reason: None,
+            output: job_log(&p.req).map(joblog::Output::new),
         }
     }
 
@@ -1124,6 +1145,7 @@ impl<'a> Watcher<'a> {
         } else if let Some(stop) = self.check_tree(pid) {
             self.reason = Some(StopReason::Memory(stop));
         }
+        self.check_output();
         self.reason.is_some()
     }
 
@@ -1168,6 +1190,8 @@ impl<'a> Watcher<'a> {
                 let (used, cpu_ms, cpu_pct, busy_ms) = (mem.used, mem.cpu_ms, mem.cpu_pct, self.busy_ms);
                 // The limit too: a 0.3 calmrun that rewrote the state dropped it.
                 let timeout_ms = self.limit.as_ref().map(|l| l.0.as_millis() as u64);
+                // New output rides along with the memory sample.
+                let output = self.output.as_mut().and_then(joblog::Output::poll);
                 let _ = store.map(|st| {
                     st.with_lock(|s| {
                         if let Some(j) = s.jobs.iter_mut().find(|j| j.id == id) {
@@ -1176,6 +1200,7 @@ impl<'a> Watcher<'a> {
                             j.cpu_pct = Some(cpu_pct);
                             j.busy_ms = busy_ms;
                             j.timeout_ms = timeout_ms;
+                            j.output_ms = output.or(j.output_ms);
                         }
                     })
                 });
@@ -1183,6 +1208,26 @@ impl<'a> Watcher<'a> {
         }
         stop
     }
+
+    /// Without memory sampling, publish new output by itself now and then.
+    fn check_output(&mut self) {
+        let (None, Some(store)) = (&self.mem, self.store) else {
+            return;
+        };
+        let id = self.id;
+        if let Some(t) = self.output.as_mut().and_then(joblog::Output::poll_now_and_then) {
+            let _ = store.with_lock(|s| {
+                if let Some(j) = s.jobs.iter_mut().find(|j| j.id == id) {
+                    j.output_ms = Some(t);
+                }
+            });
+        }
+    }
+}
+
+/// The file a run's output goes to, if any (MCP log or `--log`).
+fn job_log(req: &Request) -> Option<&Path> {
+    req.log.as_deref().or(req.tee.as_deref())
 }
 
 /// Whether a job (`mine`, `id`) is bigger than another one: only the single biggest job is
@@ -1210,15 +1255,19 @@ fn execute(
     });
     let watch = Watcher::new(p, mem, Some(store), entry.id);
     let id = entry.id;
+    let log = job_log(&p.req).map(|l| l.to_string_lossy().to_string());
     let set_child = |child: u32| {
         let _ = store.with_lock(|s| {
             if let Some(j) = s.jobs.iter_mut().find(|j| j.id == id) {
                 j.child_pid = Some(child);
+                j.log_path = log.clone();
             }
         });
     };
     let mut out = spawn_and_finish(p, watch, cfg.low_cpu, Some(std::process::id()), set_child);
     let _ = store.with_lock(|s| s.jobs.retain(|j| j.id != id));
+    out.job_id = Some(id);
+    out.log = log;
     out.wait_ms = wait_ms;
     out.run_ms = now_ms().saturating_sub(started_ms);
     out
@@ -1294,12 +1343,14 @@ pub fn record(store: &Store, queue: Option<&str>, out: &Outcome) {
             status: out.status.clone(),
             queue: queue.map(str::to_string),
             cwd: (!out.cwd.is_empty()).then(|| out.cwd.clone()),
+            id: out.job_id,
+            log: out.log.clone(),
         },
         history::ROTATE_BYTES,
     );
 }
 
-/// Directory for captured logs (MCP runs).
+/// Directory for captured logs (MCP runs, `--log`).
 pub fn log_dir(home: &Path) -> PathBuf {
     home.join("logs")
 }

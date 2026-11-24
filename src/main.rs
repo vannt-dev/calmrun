@@ -9,8 +9,10 @@ mod error;
 mod gates;
 mod history;
 mod hook;
+mod joblog;
 mod kinds;
 mod lease;
+mod logs;
 mod mcp;
 mod memwatch;
 mod messages;
@@ -50,6 +52,7 @@ fn dispatch(cli: Cli) -> i32 {
         Some(Sub::Stats { days, json }) => commands::stats(days, json),
         Some(Sub::Bump(ref a)) => with_ctx(&|c| commands::bump(c, a)),
         Some(Sub::Stop(ref a)) => with_ctx(&|c| commands::stop(c, a)),
+        Some(Sub::Logs(ref a)) => with_ctx(&|c| logs::run(c, a)),
         Some(Sub::Hold(ref a)) => with_ctx(&|c| commands::hold(c, a)),
         Some(Sub::Release(ref a)) => with_ctx(&|c| commands::release(c, a)),
         Some(Sub::Doctor) => with_ctx(&commands::doctor),

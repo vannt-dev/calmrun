@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -25,8 +25,6 @@ const SUPPORTED_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", 
 const DEFAULT_VERSION: &str = "2025-06-18";
 /// Lines of output returned by `run_task`.
 const TAIL_LINES: usize = 200;
-/// Log files kept in the state directory.
-const KEEP_LOGS: usize = 200;
 /// A progress notification is repeated at least this often while the line stays the same.
 const PROGRESS_EVERY: Duration = Duration::from_secs(10);
 /// How long `cancel_task` waits for the task to confirm it stopped.
@@ -405,8 +403,6 @@ fn string(args: &Value, key: &str) -> Option<String> {
     args.get(key).and_then(Value::as_str).map(String::from)
 }
 
-static LOG_SEQ: AtomicU64 = AtomicU64::new(0);
-
 fn request_for(args: &Value, command: &str, log: PathBuf, cancel: Arc<AtomicBool>) -> Request {
     let line = command_argv(command);
     Request {
@@ -420,6 +416,7 @@ fn request_for(args: &Value, command: &str, log: PathBuf, cancel: Arc<AtomicBool
         label: string(args, "label"),
         timeout: run_limit_secs(args),
         log: Some(log),
+        tee: None,
         cancel: Some(cancel),
         wait_timeout: secs(args, "wait_timeout_s"),
         ticket: args.get("ticket").and_then(Value::as_u64),
@@ -450,15 +447,7 @@ fn run_task(c: &Call) -> Value {
         Ok(ctx) => ctx,
         Err(e) => return e,
     };
-    let logs = queue::log_dir(&ctx.home);
-    queue::prune_logs(&logs, KEEP_LOGS);
-    let name = format!(
-        "{}-{}-{}.log",
-        queue::now_ms(),
-        std::process::id(),
-        LOG_SEQ.fetch_add(1, Ordering::SeqCst)
-    );
-    let log = logs.join(name);
+    let log = crate::joblog::new_log(&ctx.home);
     // Absent: the default; 0 (or less): answer with a task id at once.
     let wait = match c.args.get("wait_seconds").and_then(Value::as_f64) {
         Some(_) => secs(c.args, "wait_seconds").unwrap_or(Duration::ZERO),

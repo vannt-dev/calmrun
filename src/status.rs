@@ -109,6 +109,14 @@ fn job_json(j: &Job, now: u64, place: Option<usize>, usual: &Usual) -> Value {
     v
 }
 
+/// A running job's log and when it last wrote to it (`null` when unknown).
+fn with_log(mut v: Value, j: &Job, now: u64) -> Value {
+    v["log_path"] = json!(j.log_path);
+    v["output_ms"] = json!(j.output_ms);
+    v["output_ago_ms"] = json!(j.output_ms.map(|t| now.saturating_sub(t)));
+    v
+}
+
 fn parked_json(j: &Job, now: u64) -> Value {
     json!({
         "ticket": j.id,
@@ -151,7 +159,7 @@ pub fn status_json(ctx: &mut Ctx, state: &State) -> Value {
         .jobs
         .iter()
         .filter(|j| j.running())
-        .map(|j| job_json(j, now, None, &usual))
+        .map(|j| with_log(job_json(j, now, None, &usual), j, now))
         .collect();
     let waiting: Vec<Value> = scheduler::waiting_in_order(&state.jobs)
         .iter()

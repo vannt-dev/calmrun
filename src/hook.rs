@@ -943,8 +943,13 @@ mod tests {
             "calmrun bump --ticket 7 && calmrun status",
             "calmrun bump --dir ../web --back",
             "calmrun --prio low -- cargo test",
+            "calmrun --log -- npx vitest run",
+            "calmrun --no-log -- cargo test",
+            "calmrun logs 5 --follow",
+            "calmrun logs --label e2e --tail 20 --id web",
         ] {
             assert!(run("Bash", c, Mode::Deny).is_none(), "{c}");
+            assert!(run("PowerShell", c, Mode::Rewrite).is_none(), "{c}");
         }
     }
 
