@@ -42,9 +42,10 @@ pub struct FileConfig {
     pub log: Option<bool>,
     #[serde(default)]
     pub kinds: BTreeMap<String, KindConfig>,
-    /// Named resources and their slots (`[resources] db = 1`).
+    /// Named resources: slots (`[resources] db = 1`) or instances (`android = ["emulator-5554"]`,
+    /// or a table with `instances`, `discover`, `health`, `env`).
     #[serde(default)]
-    pub resources: BTreeMap<String, u32>,
+    pub resources: BTreeMap<String, crate::pools::Entry>,
 }
 
 /// Effective settings after defaults, file and env are merged.
@@ -67,7 +68,10 @@ pub struct Config {
     /// CLI runs copy their output to a log file unless `--no-log` (`log = true`).
     pub log: bool,
     pub kinds: BTreeMap<String, KindConfig>,
+    /// Slots per named resource (a fixed instance list counts its instances).
     pub resources: BTreeMap<String, u32>,
+    /// Resources with instances, handed out one per job.
+    pub pools: BTreeMap<String, crate::pools::Pool>,
 }
 
 /// Where a run's time limit comes from, named when it stops the run.
@@ -257,6 +261,27 @@ pub fn resolve(m: Machine, file: FileConfig, env: &dyn Fn(&str) -> Option<String
         Some("0" | "false" | "no" | "off") => false,
         _ => file.log.unwrap_or(false),
     };
+    let (mut resources, mut pools) = (BTreeMap::new(), BTreeMap::new());
+    for (name, entry) in file.resources {
+        match entry {
+            crate::pools::Entry::Slots(n) => {
+                resources.insert(name, n);
+            }
+            crate::pools::Entry::Pool(p) => {
+                if p.discover.is_none() {
+                    resources.insert(name.clone(), p.instances.len() as u32);
+                }
+                pools.insert(name, p);
+            }
+        }
+    }
+    // The env sets slots, and a resource it names is count-only again.
+    if let Some(v) = env("CALMRUN_RESOURCES") {
+        for (name, n) in parse_resources(&v) {
+            pools.remove(&name);
+            resources.insert(name, n);
+        }
+    }
     Config {
         budget,
         min_free_bytes: (min_free_gb * GB) as u64,
@@ -269,13 +294,8 @@ pub fn resolve(m: Machine, file: FileConfig, env: &dyn Fn(&str) -> Option<String
         max_run_min,
         log,
         kinds: file.kinds,
-        resources: {
-            let mut r = file.resources;
-            if let Some(v) = env("CALMRUN_RESOURCES") {
-                r.extend(parse_resources(&v));
-            }
-            r
-        },
+        resources,
+        pools,
     }
 }
 
@@ -330,8 +350,17 @@ pub fn default_config_text(m: Machine) -> String {
 
 # Named resources and how many jobs may hold each at once (env CALMRUN_RESOURCES="db=1").
 # A job takes a slot with --needs db. A resource that is not listed has 1 slot.
+# A resource can list its instances instead (devices, simulators): each job gets a free
+# one in CALMRUN_<NAME> (and ANDROID_SERIAL for android and emulator). `discover` lists
+# them with a command (first word of each output line); `health` skips an instance whose
+# check fails ({{instance}} is replaced by it); `env` names another variable to set.
 # [resources]
 # db = 1
+# android = ["emulator-5554", "emulator-5556"]
+#
+# [resources.emulator]
+# discover = "adb devices"
+# health = "adb -s {{instance}} get-state"
 
 # Override the cost of a built-in kind, or add your own kind with command patterns.
 # A pattern is the command's first words, e.g. "make" or "bazel build".
@@ -433,6 +462,38 @@ mod tests {
         assert_eq!(c.resources["gpu"], 4);
         assert_eq!(c.resources["cache"], 3);
         assert_eq!(c.resources.len(), 3);
+    }
+
+    #[test]
+    fn resources_with_instances() {
+        let file: FileConfig = toml::from_str(
+            "[resources]
+db = 1
+android = [\"emulator-5554\", \"emulator-5556\"]
+             [resources.ios]
+discover = \"xcrun simctl list\"
+env = \"UDID\"
+",
+        )
+        .unwrap();
+        let c = resolve(m(8, 16), file.clone(), &|_| None);
+        assert_eq!(c.resources["db"], 1);
+        assert_eq!(c.resources["android"], 2, "a fixed list counts its instances");
+        assert!(!c.resources.contains_key("ios"), "discovered: no fixed count");
+        assert_eq!(c.pools["android"].instances, ["emulator-5554", "emulator-5556"]);
+        assert_eq!(c.pools["ios"].env.as_deref(), Some("UDID"));
+        assert!(!c.pools.contains_key("db"));
+        let env = |k: &str| (k == "CALMRUN_RESOURCES").then(|| "android=1".to_string());
+        let c = resolve(m(8, 16), file, &env);
+        assert!(!c.pools.contains_key("android"), "the env makes it count-only");
+        assert_eq!(c.resources["android"], 1);
+        let bad = toml::from_str::<FileConfig>(
+            "[resources.android]
+colour = \"red\"
+",
+        );
+        let err = bad.unwrap_err().to_string();
+        assert!(err.contains("colour") && err.contains("android"), "{err}");
     }
 
     #[test]

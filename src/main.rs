@@ -16,6 +16,7 @@ mod logs;
 mod mcp;
 mod memwatch;
 mod messages;
+mod pools;
 mod queue;
 mod runner;
 mod scheduler;

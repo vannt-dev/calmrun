@@ -97,6 +97,7 @@ fn job_json(j: &Job, now: u64, place: Option<usize>, usual: &Usual) -> Value {
         "child_pid": j.child_pid,
         "mem_bytes": j.mem_bytes,
         "needs": j.needs,
+        "instances": j.instances,
         "cwd": j.cwd,
         "high": j.high,
         "low": j.low,
@@ -133,6 +134,7 @@ fn lease_json(l: &Lease, now: u64) -> Value {
     json!({
         "lease": l.id,
         "resources": l.resources,
+        "instances": l.instances,
         "label": l.label,
         "cost": l.cost,
         "pid": l.pid,

@@ -721,6 +721,9 @@ fn summary_line(o: &queue::Outcome) -> String {
         parts.push(format!("waited {}", history::human_ms(o.wait_ms)));
         parts.push(format!("ran {}", history::human_ms(o.run_ms)));
     }
+    for (res, inst) in &o.instances {
+        parts.push(format!("{res} {inst}"));
+    }
     parts.join(", ")
 }
 
@@ -747,6 +750,8 @@ fn task_result(o: &queue::Outcome, log: Option<PathBuf>) -> Value {
         "log_path": log.map(|l| l.to_string_lossy().to_string()),
         "message": o.message,
         "ticket": o.ticket,
+        // The instance it got of each resource that has instances (android -> emulator-5554).
+        "instances": o.instances,
         // Clients that show structured content instead of the text still get the output.
         "output_tail": tail,
     });

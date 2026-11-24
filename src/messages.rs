@@ -16,6 +16,26 @@ const RUNNING_SHOWN: usize = 3;
 pub const STARTS_BY_ITSELF: &str =
     "calmrun: it starts by itself when there is room; `calmrun status` shows the queue";
 
+/// "calmrun: using android emulator-5554 (ANDROID_SERIAL, CALMRUN_ANDROID)" for a job that got
+/// instances; `env` is what it gets for them.
+pub fn instances_line(instances: &BTreeMap<String, String>, env: &[(String, String)]) -> String {
+    let parts: Vec<String> = instances
+        .iter()
+        .map(|(res, inst)| {
+            let vars: Vec<&str> = env
+                .iter()
+                .filter(|(_, v)| v == inst)
+                .map(|(k, _)| k.as_str())
+                .collect();
+            match vars.is_empty() {
+                true => format!("{res} {inst}"),
+                false => format!("{res} {inst} ({})", vars.join(", ")),
+            }
+        })
+        .collect();
+    format!("calmrun: using {}", parts.join("; "))
+}
+
 /// `1st`, `2nd`, `3rd`, `4th`, `11th`, …
 pub fn ordinal(n: usize) -> String {
     let suffix = match (n % 10, n % 100) {
@@ -49,7 +69,7 @@ pub fn waiting_line(s: &State, why: &Block, c: &WaitContext) -> String {
     let r = reason(s, why, c);
     let line = match why {
         Block::Ram { .. } | Block::Disk => format!("calmrun: waiting for {r}"),
-        Block::Resource(_) | Block::Bumped { .. } => {
+        Block::Resource(_) | Block::NoInstance(_) | Block::Bumped { .. } => {
             format!("calmrun: waiting for {r}, {} in line", ordinal(place))
         }
         _ => format!("calmrun: waiting - {r}, {} in line", ordinal(place)),
@@ -68,7 +88,7 @@ pub fn reason_code(why: &Block) -> &'static str {
         Block::Ram { .. } => "ram",
         Block::Disk => "disk",
         Block::Key { .. } => "key",
-        Block::Resource(_) => "resource",
+        Block::Resource(_) | Block::NoInstance(_) => "resource",
     }
 }
 
@@ -98,21 +118,35 @@ pub fn reason(s: &State, why: &Block, c: &WaitContext) -> String {
                 .jobs
                 .iter()
                 .filter(|j| j.running() && j.needs.contains(name))
-                .map(|j| j.label.clone())
-                .chain(
-                    s.leases
-                        .iter()
-                        .filter(|l| l.resources.contains(name))
-                        .map(|l| format!("{} (lease {})", l.label, l.id)),
-                )
+                .map(|j| match j.instances.get(name) {
+                    Some(i) => format!("{} ({i})", j.label),
+                    None => j.label.clone(),
+                })
+                .chain(s.leases.iter().filter(|l| l.resources.contains(name)).map(|l| {
+                    match l.instances.get(name) {
+                        Some(i) => format!("{} (lease {}, {i})", l.label, l.id),
+                        None => format!("{} (lease {})", l.label, l.id),
+                    }
+                }))
                 .collect();
-            format!(
-                "resource \"{name}\" ({} of {} slot(s) held by {})",
-                holders.len(),
-                scheduler::capacity(c.caps, name),
-                holders.join(", ")
-            )
+            match c.me.ready.get(name) {
+                Some(ready) => format!(
+                    "resource \"{name}\" (all {} ready instance(s) in use by {})",
+                    ready.len(),
+                    holders.join(", ")
+                ),
+                None => format!(
+                    "resource \"{name}\" ({} of {} slot(s) held by {})",
+                    holders.len(),
+                    scheduler::capacity(c.caps, name),
+                    holders.join(", ")
+                ),
+            }
         }
+        Block::NoInstance(name) => format!(
+            "a ready instance of \"{name}\" (none is listed or found, or none passed its health \
+             check; next: start one, or check [resources.{name}] in the config)"
+        ),
         Block::Disk => match c.disk {
             Some(d) => format!(
                 "disk space: {:.1} GB free on {}, needs {:.1} GB",

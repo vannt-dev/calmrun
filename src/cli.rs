@@ -310,6 +310,12 @@ pub struct ProbeArgs {
     /// Print the value of this environment variable (empty if unset).
     #[arg(long)]
     pub print_env: Option<String>,
+    /// Print this file's contents (a fake `discover` command).
+    #[arg(long)]
+    pub print_file: Option<std::path::PathBuf>,
+    /// Exit 1 at once unless this path exists (a fake `health` command).
+    #[arg(long)]
+    pub exists: Option<std::path::PathBuf>,
     /// Allocate and touch this many MB before sleeping.
     #[arg(long, default_value_t = 0)]
     pub alloc_mb: usize,

@@ -700,3 +700,51 @@ fn a_running_task_shows_its_log_in_the_queue() {
     let r = c.call(4, "task_status", json!({"task_id": id, "wait_seconds": 30}), None);
     assert_eq!(structured(&r)["log_path"], log, "{r}");
 }
+
+#[test]
+fn a_task_gets_an_instance_and_says_which() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[resources]\nandroid = [\"emulator-5554\", \"emulator-5556\"]\n",
+    )
+    .unwrap();
+    let mut c = Client::start(home.path());
+    init(&mut c);
+    let r = c.call(
+        2,
+        "run_task",
+        json!({"command": probe_cmd("--print-env ANDROID_SERIAL"), "needs": ["android"]}),
+        None,
+    );
+    let s = structured(&r);
+    assert_eq!(s["exit_code"], 0, "{r}");
+    assert_eq!(s["instances"]["android"], "emulator-5554", "{r}");
+    assert!(
+        s["output_tail"].as_str().unwrap().contains("emulator-5554"),
+        "{r}"
+    );
+    let text = r["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("android emulator-5554"), "{text}");
+    // While a task runs, queue_status shows its instance.
+    let r = c.call(
+        3,
+        "run_task",
+        json!({"command": probe_cmd("--sleep-ms 3000"), "needs": ["android"], "wait_seconds": 0}),
+        None,
+    );
+    let id = structured(&r)["task_id"].as_str().unwrap().to_string();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let r = c.call(4, "queue_status", json!({}), None);
+        let job = &structured(&r)["running"][0];
+        if job.is_object() {
+            assert_eq!(job["instances"]["android"], "emulator-5554", "{r}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "never ran: {r}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let r = c.call(5, "task_status", json!({"task_id": id, "wait_seconds": 30}), None);
+    assert_eq!(structured(&r)["instances"]["android"], "emulator-5554", "{r}");
+}
