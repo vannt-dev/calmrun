@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-24
+
 ### Added
 
 - `calmrun bump` picks jobs by `--pos N` (the `#` column of `calmrun status`), `--ticket ID`
