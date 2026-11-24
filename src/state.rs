@@ -53,6 +53,32 @@ pub struct Job {
     /// Leases whose resources this job may use (`CALMRUN_LEASE`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub use_leases: Vec<String>,
+    // Fields added in 0.4. All additive with defaults: a 0.3.x binary still reads this state
+    // (unknown fields are ignored) and only drops them when it rewrites the file.
+    /// `--prio low`: after every normal and high waiter. `high` stays the 0.3 field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub low: bool,
+    /// Moved to the front by `calmrun bump`: later waiters may not pass it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bumped: bool,
+    /// Time `calmrun stop` asked the owner to stop this job; the owner stops it and exits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_ms: Option<u64>,
+    /// Run time limit of a running job (`--timeout` or the config), for display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// CPU time used so far by the running command's whole process tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_ms: Option<u64>,
+    /// Last time the running tree used a noticeable share of CPU (an idle tree may hang).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy_ms: Option<u64>,
+    /// Full output log of the running command, when calmrun keeps one (MCP tasks, `--log`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
+    /// Last time the running command wrote output to that log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_ms: Option<u64>,
 }
 
 impl Job {
@@ -485,6 +511,7 @@ mod tests {
             hold_ttl_ms: None,
             cwd_key: String::new(),
             use_leases: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -571,6 +598,45 @@ mod tests {
         assert_eq!(sweep_idle_queues(tmp.path(), 0), vec!["b".to_string()]);
         assert!(tmp.path().join("queues").join("a").is_dir());
         assert!(!tmp.path().join("queues").join("b").exists());
+    }
+
+    #[test]
+    fn fields_added_in_0_4_keep_the_0_3_format() {
+        // A 0.3 entry (none of the 0.4 fields) still parses, and an entry that leaves them at
+        // their defaults is written exactly as 0.3 wrote it, so mixed versions share the file.
+        let old = r#"{"id":7,"pid":1,"pid_start":2,"label":"npx vitest","kind":"test","cost":2,
+            "keys":[],"cwd":"/r","high":false,"order":3,"queued_ms":10,"started_ms":null,
+            "child_pid":null}"#;
+        let job: Job = serde_json::from_str(old).unwrap();
+        assert!(!job.low && !job.bumped);
+        assert_eq!((job.stop_ms, job.timeout_ms, job.cpu_ms), (None, None, None));
+        assert_eq!(
+            (job.busy_ms, job.log_path.as_deref(), job.output_ms),
+            (None, None, None)
+        );
+        let written = serde_json::to_value(&job).unwrap();
+        for k in [
+            "low",
+            "bumped",
+            "stop_ms",
+            "timeout_ms",
+            "cpu_ms",
+            "busy_ms",
+            "log_path",
+        ] {
+            assert!(written.get(k).is_none(), "{k} written at its default");
+        }
+        assert!(written.get("output_ms").is_none());
+        // Set fields survive a round trip.
+        let set = Job {
+            low: true,
+            bumped: true,
+            stop_ms: Some(5),
+            log_path: Some("l".into()),
+            ..job
+        };
+        let back: Job = serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
+        assert_eq!(back, set);
     }
 
     #[test]

@@ -310,6 +310,7 @@ mod tests {
             hold_ttl_ms: None,
             cwd_key: String::new(),
             use_leases: Vec::new(),
+            ..Default::default()
         }
     }
     fn keyed(mut j: Job, k: &str) -> Job {
