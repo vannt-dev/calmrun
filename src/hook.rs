@@ -172,6 +172,8 @@ pub enum Background {
     Param(&'static str),
     /// Only a general hint.
     Hint,
+    /// The agent's shell tool cannot run a command in the background (Pi): no hint.
+    None,
 }
 
 /// The deny reason every agent shows its model: the command to run instead, the queue's
@@ -198,7 +200,7 @@ pub fn deny_reason(p: &Plan, bg: Background, o: &Opts) -> String {
                 p.plain
             ));
         }
-    } else if !p.background {
+    } else if !p.background && !matches!(bg, Background::None) {
         s.push_str("\nIf it may take more than a minute or two, run it in the background.");
     }
     s

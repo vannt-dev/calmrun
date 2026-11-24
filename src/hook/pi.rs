@@ -36,7 +36,7 @@ pub fn handle(input: &str, o: &Opts) -> Option<String> {
     };
     let p = plan(&call, o.kinds, o.program)?;
     let out = match o.mode {
-        Mode::Deny => json!({"decision": "deny", "reason": deny_reason(&p, Background::Hint, o)}),
+        Mode::Deny => json!({"decision": "deny", "reason": deny_reason(&p, Background::None, o)}),
         Mode::Rewrite => json!({"decision": "rewrite", "input": {"command": p.command()}}),
     };
     Some(out.to_string())
@@ -126,7 +126,8 @@ mod tests {
         let reason = v["reason"].as_str().unwrap();
         assert!(reason.contains("\ncalmrun -- npx tsc --noEmit"), "{reason}");
         assert!(!reason.contains("--wait-timeout"), "{reason}");
-        assert!(reason.contains("in the background"), "{reason}");
+        // Pi's bash tool has no way to run a command in the background
+        assert!(!reason.contains("background"), "{reason}");
     }
 
     #[test]
