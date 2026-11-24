@@ -351,7 +351,7 @@ fn bump_selectors_and_pushing_back() {
     let env = Env::new();
     let sub = env.home.path().join("w").join("b");
     std::fs::create_dir_all(&sub).unwrap();
-    let a = env.probe(1, &["--label", "a"], "a", 6000, None);
+    let a = env.probe(1, &["--label", "a"], "a", 15000, None);
     env.wait_queue(1, 0);
     let mut kids = vec![a];
     for (i, (l, flags)) in [
@@ -401,7 +401,12 @@ fn bump_selectors_and_pushing_back() {
     let text = String::from_utf8(out.stdout).unwrap();
     let mark = |label: &str| {
         text.lines()
-            .find(|l| l.split_whitespace().nth(1) == Some(label))
+            .find(|l| {
+                let mut t = l.split_whitespace();
+                t.next()
+                    .is_some_and(|m| m.starts_with(|c: char| c.is_ascii_digit()))
+                    && t.any(|w| w == label)
+            })
             .and_then(|l| l.split_whitespace().next())
             .unwrap_or_else(|| panic!("{label} not in {text}"))
             .to_string()
@@ -420,7 +425,7 @@ fn bump_selectors_and_pushing_back() {
 #[test]
 fn a_kept_place_keeps_its_push_back() {
     let env = Env::new();
-    let a = env.probe(1, &["--label", "a"], "a", 5000, None);
+    let a = env.probe(1, &["--label", "a"], "a", 10000, None);
     env.wait_queue(1, 0);
     let out = env
         .cmd(1)

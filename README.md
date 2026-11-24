@@ -244,8 +244,8 @@ ticket kept by `--wait-timeout`) or `--dir PATH` (jobs whose folder is that one 
 A bumped job also holds the front: while it waits for budget points or free RAM, no later job
 may pass it, since that would take the room it waits for (the others wait with
 `bumped job "npx vitest" ahead (1st in line) to start`). While it waits for an exclusive key,
-a resource slot or disk space, later jobs may still pass it: those can last long, and passing
-does not delay it.
+a resource slot or disk space, later jobs may still pass it (until it has waited past the pass
+limit, as for any job): those can last long, and passing does not delay it.
 
 `calmrun bump --back <selector>` moves jobs to the very end instead: prio low, after every
 other waiter, in their order. A low job waits behind every normal job, also ones that come
