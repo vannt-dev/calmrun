@@ -153,7 +153,7 @@ fn run_task_schema() -> Value {
                 "kind": {"type": "string", "description": "Job kind; detected from the command when omitted"},
                 "cost": {"type": "integer", "minimum": 1, "description": "Budget points; default by kind"},
                 "label": {"type": "string", "description": "Name shown in the queue"},
-                "timeout_s": {"type": "number", "exclusiveMinimum": 0, "description": "Stop the command after this many seconds (exit 124). Default: the config's max_run_min (60 min for test-like kinds, else no limit)"},
+                "timeout_s": {"type": "number", "minimum": 0, "description": "Stop the command after this many seconds (exit 124); 0 = no limit. Default: the config's max_run_min (60 min for test-like kinds, else no limit)"},
                 "prio": {"type": "string", "enum": ["normal", "high", "low"], "description": "high goes before every normal job, low after every normal one (default normal)"},
                 "wait_timeout_s": {"type": "number", "exclusiveMinimum": 0, "description": "Give up waiting after this many seconds; the result carries a ticket that keeps the place in line for 10 minutes"},
                 "ticket": {"type": "integer", "description": "Ticket from an earlier wait timeout: resume that place in line"},
@@ -392,6 +392,15 @@ fn secs(args: &Value, key: &str) -> Option<Duration> {
         .map(|t| Duration::from_secs_f64(t.min(MAX_SECS)))
 }
 
+/// `timeout_s`: like [`secs`], but 0 is kept: it asks for no run time limit, like
+/// `--timeout 0`, instead of falling back to the config's `max_run_min`.
+fn run_limit_secs(args: &Value) -> Option<Duration> {
+    args.get("timeout_s")
+        .and_then(Value::as_f64)
+        .filter(|t| *t >= 0.0)
+        .map(|t| Duration::from_secs_f64(t.min(MAX_SECS)))
+}
+
 fn string(args: &Value, key: &str) -> Option<String> {
     args.get(key).and_then(Value::as_str).map(String::from)
 }
@@ -409,7 +418,7 @@ fn request_for(args: &Value, command: &str, log: PathBuf, cancel: Arc<AtomicBool
         high: args.get("prio").and_then(Value::as_str) == Some("high"),
         low: args.get("prio").and_then(Value::as_str) == Some("low"),
         label: string(args, "label"),
-        timeout: secs(args, "timeout_s"),
+        timeout: run_limit_secs(args),
         log: Some(log),
         cancel: Some(cancel),
         wait_timeout: secs(args, "wait_timeout_s"),
@@ -1009,6 +1018,17 @@ pub fn serve() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeout_s_zero_means_no_limit_not_the_default() {
+        assert_eq!(run_limit_secs(&json!({"timeout_s": 0})), Some(Duration::ZERO));
+        assert_eq!(
+            run_limit_secs(&json!({"timeout_s": 90})),
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(run_limit_secs(&json!({})), None);
+        assert_eq!(run_limit_secs(&json!({"timeout_s": -1})), None);
+    }
 
     #[test]
     fn bump_takes_exactly_one_selector() {

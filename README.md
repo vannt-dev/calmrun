@@ -796,7 +796,7 @@ server process; the last 100 finished ones stay queryable.
 
 - While a task waits, the server sends progress notifications if the client passed a
   `progressToken`.
-- `timeout_s` stops the command (exit 124); without it the config's `max_run_min` applies, as
+- `timeout_s` stops the command (exit 124; `0` = no limit); without it the config's `max_run_min` applies, as
   for the CLI. `wait_timeout_s` gives up waiting (exit 75) and
   returns a `ticket`; pass it back as `ticket` to resume the same place in line.
 - Cancelling a `run_task` request (`notifications/cancelled`) while it still waits for its
