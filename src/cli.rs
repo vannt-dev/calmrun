@@ -194,12 +194,12 @@ pub enum Sub {
         /// Take the calmrun block (and with --hook, the hook) out again.
         #[arg(long)]
         remove: bool,
-        /// Also install the hook of these agents (claude, codex, antigravity, opencode, all;
+        /// Also install the hook of these agents (claude, codex, antigravity, opencode, pi, all;
         /// default claude), in their user-level files; other hooks there are kept.
         #[arg(long, value_name = "AGENTS", num_args = 0..=1, default_missing_value = "claude",
               value_delimiter = ',')]
         hook: Option<Vec<String>>,
-        /// Which agents (claude, codex, gemini, opencode). Default: those whose folder exists.
+        /// Which agents (claude, codex, gemini, opencode, pi). Default: those whose folder exists.
         #[arg(long, value_delimiter = ',')]
         agents: Option<Vec<String>>,
         /// Home directory to use instead of yours (for tests and other users' profiles).
@@ -259,6 +259,8 @@ pub enum HookTarget {
     Antigravity,
     /// Behind calmrun's OpenCode plugin: reads the bash call as JSON on stdin.
     Opencode,
+    /// Behind calmrun's Pi extension: reads the shell tool call as JSON on stdin.
+    Pi,
 }
 
 /// Arguments of `calmrun stop`.

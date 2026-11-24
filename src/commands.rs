@@ -504,6 +504,7 @@ pub fn hook(target: &HookTarget) -> i32 {
         HookTarget::Codex => hook::Agent::Codex,
         HookTarget::Antigravity => hook::Agent::Antigravity,
         HookTarget::Opencode => hook::Agent::OpenCode,
+        HookTarget::Pi => hook::Agent::Pi,
     };
     let mut input = String::new();
     if std::io::stdin().read_to_string(&mut input).is_err() {

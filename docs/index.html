@@ -504,7 +504,7 @@ calmrun: waiting — 4 of 6 points in use, 2nd in line (needs 2); running: npx v
       <section id="agents">
         <h2 data-i18n="ag.h2">Agent integration</h2>
         <p class="sub" data-i18n="ag.sub">
-          Agents don't need to remember anything: hooks for Claude Code, Codex and OpenCode (Antigravity: experimental) catch heavy shell
+          Agents don't need to remember anything: hooks for Claude Code, Codex, OpenCode and the <a href="https://github.com/earendil-works/pi">Pi coding agent</a> (Antigravity: experimental) catch heavy shell
           commands, the MCP server gives any MCP client a queued <code>run_task</code> tool, and <code>setup</code> writes the instructions
           and hooks into each agent's global files.
         </p>
@@ -512,7 +512,7 @@ calmrun: waiting — 4 of 6 points in use, 2nd in line (needs 2); running: npx v
           <div>
             <h3 data-i18n="ag.hook.h">Agent hooks</h3>
             <p class="note" data-i18n="ag.hook">
-              <code>calmrun hook claude|codex|opencode|antigravity</code> is a PreToolUse hook for the agent's shell tool. When a command
+              <code>calmrun hook claude|codex|opencode|pi|antigravity</code> is a PreToolUse hook for the agent's shell tool. When a command
               runs a heavy tool without calmrun (also through <code>rtk</code>), the hook denies it and tells the agent the exact command
               with each heavy part wrapped, with a <code>--wait-timeout</code> below the tool's time limit. Light commands pass.
               <code>calmrun setup --write --hook all</code> installs them; for Claude Code by hand, in <code>~/.claude/settings.json</code>:
@@ -559,7 +559,7 @@ tool_timeout_sec = 3600
           <div>
             <h3 data-i18n="ag.setup.h">calmrun setup</h3>
             <p class="note" data-i18n="ag.setup">
-              Adds a short calmrun section to the global instruction file of Claude Code, Codex, Gemini CLI and OpenCode. It is a dry run
+              Adds a short calmrun section to the global instruction file of Claude Code, Codex, Gemini CLI, OpenCode and Pi. It is a dry run
               until you add <code>--write</code>; every file it changes is backed up first.
             </p>
             <pre><span class="p">$</span> calmrun setup                          <span class="dim" data-i18n="ag.setup.c1"># show what would change</span>
@@ -611,7 +611,7 @@ Do not wrap light commands (git, ls, cat, package installs).</pre>
             <tr><th><code>calmrun guide</code></th><td data-i18n="cmd.guide">Short instructions for coding agents.</td></tr>
             <tr><th><code>calmrun setup</code></th><td data-i18n="cmd.setup">Write or remove the calmrun block in agents' global instruction files: <code>--write</code>, <code>--remove</code>, <code>--hook</code>, <code>--agents</code>.</td></tr>
             <tr><th><code>calmrun hold</code> / <code>release</code></th><td data-i18n="cmd.hold">Hold a resource slot (an emulator, a database) without a command and print a lease; <code>release &lt;lease&gt;</code> gives it back, <code>release --ticket &lt;id&gt;</code> gives up a kept place.</td></tr>
-            <tr><th><code>calmrun hook &lt;agent&gt;</code></th><td data-i18n="cmd.hook">The PreToolUse hook of <code>claude</code>, <code>codex</code>, <code>opencode</code> or <code>antigravity</code> (experimental); reads the hook JSON on stdin.</td></tr>
+            <tr><th><code>calmrun hook &lt;agent&gt;</code></th><td data-i18n="cmd.hook">The PreToolUse hook of <code>claude</code>, <code>codex</code>, <code>opencode</code>, <code>pi</code> or <code>antigravity</code> (experimental); reads the hook JSON on stdin.</td></tr>
             <tr><th><code>calmrun mcp</code></th><td data-i18n="cmd.mcp">The MCP server on stdio: <code>run_task</code>, <code>task_status</code>, <code>cancel_task</code>, <code>queue_status</code>, <code>bump</code>.</td></tr>
           </table>
         </div>
@@ -827,10 +827,10 @@ patterns = ["make", "bazel build"]</pre>
           'eco.ctr': 'Container',
           'ag.h2': 'Tích hợp với agent',
           'ag.sub':
-            'Agent không cần nhớ gì cả: hook cho Claude Code, Codex và OpenCode (Antigravity: thử nghiệm) bắt các lệnh shell nặng, MCP server cho mọi client MCP một công cụ <code>run_task</code> có xếp hàng, còn <code>setup</code> ghi hướng dẫn và hook vào file toàn cục của từng agent.',
+            'Agent không cần nhớ gì cả: hook cho Claude Code, Codex, OpenCode và <a href="https://github.com/earendil-works/pi">Pi coding agent</a> (Antigravity: thử nghiệm) bắt các lệnh shell nặng, MCP server cho mọi client MCP một công cụ <code>run_task</code> có xếp hàng, còn <code>setup</code> ghi hướng dẫn và hook vào file toàn cục của từng agent.',
           'ag.hook.h': 'Hook cho agent',
           'ag.hook':
-            '<code>calmrun hook claude|codex|opencode|antigravity</code> là một PreToolUse hook cho công cụ shell của agent. Khi một lệnh chạy công cụ nặng mà không qua calmrun (kể cả qua <code>rtk</code>), hook chặn lại và đưa cho agent đúng câu lệnh với từng phần nặng đã được bọc, kèm <code>--wait-timeout</code> dưới giới hạn thời gian của công cụ. Lệnh nhẹ đi qua bình thường. <code>calmrun setup --write --hook all</code> cài chúng; với Claude Code có thể tự thêm vào <code>~/.claude/settings.json</code>:',
+            '<code>calmrun hook claude|codex|opencode|pi|antigravity</code> là một PreToolUse hook cho công cụ shell của agent. Khi một lệnh chạy công cụ nặng mà không qua calmrun (kể cả qua <code>rtk</code>), hook chặn lại và đưa cho agent đúng câu lệnh với từng phần nặng đã được bọc, kèm <code>--wait-timeout</code> dưới giới hạn thời gian của công cụ. Lệnh nhẹ đi qua bình thường. <code>calmrun setup --write --hook all</code> cài chúng; với Claude Code có thể tự thêm vào <code>~/.claude/settings.json</code>:',
           'ag.hook.ex':
             '<code>cd web &amp;&amp; npx vitest run</code> trở thành <code>cd web &amp;&amp; calmrun -- npx vitest run</code>. Với <code>CALMRUN_HOOK_MODE=rewrite</code>, hook tự sửa lệnh thay vì chặn.',
           'ag.mcp.h': 'MCP server',
@@ -838,7 +838,7 @@ patterns = ["make", "bazel build"]</pre>
             '<code>calmrun mcp</code> cung cấp các công cụ qua stdio: <code>run_task</code> (chờ trong cùng hàng chờ và chạy lệnh; việc còn bận sau <code>wait_seconds</code> tiếp tục chạy nền và trả về <code>task_id</code>), <code>task_status</code>, <code>cancel_task</code>, <code>queue_status</code> và <code>bump</code>. Giữ một thiết bị hay emulator mà không chạy lệnh: <code>calmrun hold emulator</code> in ra một lease, <code>calmrun release &lt;lease&gt;</code> trả lại.',
           'ag.setup.h': 'calmrun setup',
           'ag.setup':
-            'Thêm một đoạn ngắn về calmrun vào file hướng dẫn toàn cục của Claude Code, Codex, Gemini CLI và OpenCode. Lệnh chỉ chạy thử cho tới khi bạn thêm <code>--write</code>; file nào bị sửa đều được sao lưu trước.',
+            'Thêm một đoạn ngắn về calmrun vào file hướng dẫn toàn cục của Claude Code, Codex, Gemini CLI, OpenCode và Pi. Lệnh chỉ chạy thử cho tới khi bạn thêm <code>--write</code>; file nào bị sửa đều được sao lưu trước.',
           'ag.setup.c1': '# xem sẽ thay đổi gì',
           'ag.setup.c2': '# áp dụng',
           'ag.setup.c3': '# chỉ một số agent',
@@ -859,7 +859,7 @@ patterns = ["make", "bazel build"]</pre>
           'cmd.guide': 'Hướng dẫn ngắn cho coding agent.',
           'cmd.setup': 'Ghi hoặc gỡ đoạn calmrun trong file hướng dẫn toàn cục của các agent: <code>--write</code>, <code>--remove</code>, <code>--hook</code>, <code>--agents</code>.',
           'cmd.hold': 'Giữ một suất tài nguyên (emulator, database) mà không chạy lệnh và in ra một lease; <code>release &lt;lease&gt;</code> trả lại, <code>release --ticket &lt;id&gt;</code> bỏ chỗ đang được giữ.',
-          'cmd.hook': 'PreToolUse hook của <code>claude</code>, <code>codex</code>, <code>opencode</code> hoặc <code>antigravity</code> (thử nghiệm); đọc JSON của hook từ stdin.',
+          'cmd.hook': 'PreToolUse hook của <code>claude</code>, <code>codex</code>, <code>opencode</code>, <code>pi</code> hoặc <code>antigravity</code> (thử nghiệm); đọc JSON của hook từ stdin.',
           'cmd.mcp': 'MCP server qua stdio: <code>run_task</code>, <code>task_status</code>, <code>cancel_task</code>, <code>queue_status</code>, <code>bump</code>.',
           'exit.h': 'Mã thoát',
           'exit.cmd': 'mã của chính lệnh',

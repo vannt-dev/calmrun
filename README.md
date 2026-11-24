@@ -500,8 +500,8 @@ calmrun release --ticket <id> [--id QUEUE]
 calmrun doctor
 calmrun init [--force]
 calmrun guide
-calmrun setup [--write] [--remove] [--hook[=AGENTS]] [--agents claude,codex,gemini,opencode] [--home DIR]
-calmrun hook claude|codex|antigravity|opencode
+calmrun setup [--write] [--remove] [--hook[=AGENTS]] [--agents claude,codex,gemini,opencode,pi] [--home DIR]
+calmrun hook claude|codex|antigravity|opencode|pi
 calmrun mcp
 ```
 
@@ -545,7 +545,7 @@ calmrun mcp
 | `init [--force]` | Write a commented `config.toml` with this machine's defaults and print its path; `--force` overwrites. |
 | `guide` | Short instructions for coding agents, to paste into their context. |
 | `setup` | Add or remove the calmrun block in agents' global instruction files; see [below](#calmrun-setup). |
-| `hook <agent>` | The PreToolUse hook of `claude`, `codex`, `antigravity` or `opencode`; reads the hook JSON on stdin. See [Coding agents](#coding-agents). |
+| `hook <agent>` | The PreToolUse hook of `claude`, `codex`, `antigravity`, `opencode` or `pi`; reads the hook JSON on stdin. See [Coding agents](#coding-agents). |
 | `mcp` | An MCP server on stdin/stdout with `run_task`, `task_status`, `cancel_task`, `queue_status` and `bump`. |
 
 `--id QUEUE` is accepted by every subcommand, before or after its name; it matters for running,
@@ -620,8 +620,9 @@ not mistaken for a live job. A corrupt `state.json` is set aside; an unreadable 
 
 ## Coding agents
 
-calmrun has a PreToolUse hook for Claude Code, Codex, OpenCode and (experimental) Antigravity.
-All four make the same decision; only the way each agent sends a tool call and reads the answer
+calmrun has a PreToolUse hook for Claude Code, Codex, OpenCode, the
+[Pi coding agent](https://github.com/earendil-works/pi) and (experimental) Antigravity. All five
+make the same decision; only the way each agent sends a tool call and reads the answer
 differs.
 `calmrun setup --write --hook <agents>` installs them in each agent's user-level file (see
 [`calmrun setup`](#calmrun-setup)).
@@ -660,7 +661,8 @@ its `next:` line. A watch mode or interactive session without one (`sbt shell`, 
 `nx watch`, `docker run -it`), dev servers and app runs are left alone.
 
 **Long waits.** An agent's shell tool stops a command after its time limit (Claude Code: the
-call's `timeout`, 2 minutes by default; OpenCode the same). A heavy command waiting in a busy
+call's `timeout`, 2 minutes by default; OpenCode the same; Pi only when the call sets a
+`timeout`). A heavy command waiting in a busy
 queue could be stopped there and lose its place. So for those tools the suggestion carries a
 `--wait-timeout` a little below the limit (120 s → 108 s): calmrun exits 75 before the tool
 stops it, keeps the place in line, and prints the `calmrun: next:` command that resumes it. The
@@ -677,7 +679,7 @@ calmrun -- npx vitest run
 ```
 
 **Rewrite mode.** With `CALMRUN_HOOK_MODE=rewrite` in the agent's environment the hook changes
-the command instead of denying it (all four agents support that). The default deny mode works
+the command instead of denying it (all five agents support that). The default deny mode works
 everywhere and keeps the change visible to the agent.
 
 **Sandboxes.** calmrun keeps the queue in its state directory (`calmrun doctor` shows it). An
@@ -802,6 +804,24 @@ model; in rewrite mode it changes `command`. If calmrun cannot be asked, the com
 unchanged. The wait cap follows the call's `timeout` (2 minutes when it has none). Setup
 replaces or removes the file only when it starts with calmrun's marker line.
 
+### Pi
+
+Pi hooks are extensions (TypeScript or JavaScript modules), so `calmrun setup --write --hook pi`
+writes a small one, `~/.pi/agent/extensions/calmrun.js` (under `$PI_CODING_AGENT_DIR` when that
+is set), where Pi finds it at its next start or `/reload`. Before the `bash` tool runs (or the
+optional `powershell` tool on Windows), the extension's `tool_call` handler sends the call to
+`calmrun hook pi`:
+
+- Deny: `{"decision": "deny", "reason": "…"}`. The extension blocks the call and Pi shows the
+  reason to the model.
+- Rewrite: `{"decision": "rewrite", "input": {"command": "…"}}`. The extension changes the
+  command in place.
+- If calmrun cannot be asked, the command runs unchanged.
+
+Pi's shell tool has no time limit unless the call sets `timeout` (in seconds), so the wait cap is
+added only then. For the `powershell` tool a quoted calmrun path is called with `&`. Setup
+replaces or removes the file only when it starts with calmrun's marker line.
+
 ### MCP server
 
 `calmrun mcp` is an [MCP](https://modelcontextprotocol.io) server over stdio. Agents that speak
@@ -896,13 +916,14 @@ to apply.
 | `codex` | `~/.codex/AGENTS.md` (or `$CODEX_HOME/AGENTS.md`) |
 | `gemini` | `~/.gemini/GEMINI.md` |
 | `opencode` | `~/.config/opencode/AGENTS.md` |
+| `pi` | `~/.pi/agent/AGENTS.md` (or `$PI_CODING_AGENT_DIR/AGENTS.md`) |
 
 ```sh
 calmrun setup                         # show what would change (agents whose folder exists)
 calmrun setup --write                 # apply
 calmrun setup --write --agents codex  # only some agents
 calmrun setup --write --hook          # also add the Claude Code hook to ~/.claude/settings.json
-calmrun setup --write --hook codex,opencode  # hooks of other agents (or --hook all)
+calmrun setup --write --hook codex,opencode,pi  # hooks of other agents (or --hook all)
 calmrun setup --write --remove --hook # take both out again
 ```
 
@@ -913,15 +934,16 @@ calmrun setup --write --remove --hook # take both out again
   or is not UTF-8 text is left alone (exit 1).
 - `--hook` installs hooks in user-level files: `claude` (the default) in `settings.json`,
   `codex` in `hooks.json`, `antigravity` in `~/.gemini/config/hooks.json`, `opencode` as a
-  plugin; `all` installs every one but the experimental Antigravity hook (`--remove --hook all`
+  plugin, `pi` as an extension; `all` installs every one but the experimental Antigravity hook (`--remove --hook all`
   removes it too). With `codex` it also lets Codex's sandbox write calmrun's state directory. Only calmrun's own entry is added, replaced or removed (a
-  hook running `calmrun … hook <agent>`, Antigravity's `calmrun` entry, the plugin file with
-  calmrun's marker), so hooks of other tools stay as they are. A file it cannot parse is left
+  hook running `calmrun … hook <agent>`, Antigravity's `calmrun` entry, the plugin and extension
+  files with calmrun's marker), so hooks of other tools stay as they are. A file it cannot parse is left
   untouched. An agent whose folder does not exist gets no hook (an error when named, a note
   under `all`). The hook command is `calmrun`, or calmrun's absolute path when it is not on
   `PATH`.
-- When Codex has an `AGENTS.override.md`, Codex reads that file instead; setup says so, and you
-  copy the block there too.
+- When Codex or Pi has an `AGENTS.override.md`, the agent reads that file instead; setup says so,
+  and you copy the block there too. Pi reads only one instructions file per folder, so when
+  `~/.pi/agent` has a `CLAUDE.md` and no `AGENTS.md`, setup puts the block in `CLAUDE.md`.
 - `--home DIR` uses another home directory (for tests, or another user's profile).
 
 ### `calmrun guide` and hand-written instructions

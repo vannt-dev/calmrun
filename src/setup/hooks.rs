@@ -2,15 +2,15 @@
 //!
 //! The files are shared with other tools, so only calmrun's own entry is added, replaced or
 //! removed: a hook whose command runs `calmrun … hook <agent>`, Antigravity's entry named
-//! `calmrun`, or OpenCode's plugin file that starts with calmrun's marker line.
+//! `calmrun`, or the OpenCode plugin and Pi extension files that start with calmrun's marker line.
 
 use super::{read_existing, report_write, verb, write_with_backup, Agent, Options, Report};
-use crate::hook::opencode;
+use crate::hook::{opencode, pi};
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 
 /// Agents with a hook, in the order `all` installs them.
-pub const HOOK_AGENTS: &[&str] = &["claude", "codex", "antigravity", "opencode"];
+pub const HOOK_AGENTS: &[&str] = &["claude", "codex", "antigravity", "opencode", "pi"];
 
 /// Hooks `all` leaves out when installing: they work, but what they suggest does not run yet
 /// in the agent's default setup. Antigravity runs commands in a terminal sandbox (on by
@@ -156,7 +156,8 @@ fn place(agent: &'static str, home: &Path, all: &[Agent]) -> Place {
         "claude" => (dir_of("claude"), &["settings.json"]),
         "codex" => (dir_of("codex"), &["hooks.json"]),
         "antigravity" => (home.join(".gemini"), &["config", "hooks.json"]),
-        _ => (dir_of("opencode"), &["plugins", "calmrun.js"]),
+        "opencode" => (dir_of("opencode"), &["plugins", "calmrun.js"]),
+        _ => (dir_of("pi"), &["extensions", "calmrun.js"]),
     };
     let file = file.iter().fold(dir.clone(), |p, part| p.join(part));
     Place { agent, dir, file }
@@ -218,7 +219,7 @@ pub(super) fn apply(r: &mut Report, opts: &Options, all: &[Agent], agents: &[&'s
             continue;
         }
         match agent {
-            "opencode" => apply_plugin(r, &p, opts),
+            "opencode" | "pi" => apply_plugin(r, &p, opts),
             "codex" => {
                 apply_json(r, &p, opts);
                 apply_codex_sandbox(r, &p.dir, &opts.state_dir, opts);
@@ -491,31 +492,36 @@ pub fn add_writable_root(text: &str, dir: &str) -> Result<Option<String>, String
     }
 }
 
+/// A hook that is a JavaScript file of calmrun's own: its marker line, its text, and its name.
+fn plugin_of(agent: &str, program: &str) -> (&'static str, String, &'static str) {
+    match agent {
+        "pi" => (pi::MARKER, pi::extension(program), "Pi extension"),
+        _ => (opencode::MARKER, opencode::plugin(program), "OpenCode plugin"),
+    }
+}
+
 fn apply_plugin(r: &mut Report, p: &Place, opts: &Options) {
     let old = match read_existing(&p.file) {
         Ok(t) => t,
         Err(msg) => return r.fail(msg),
     };
-    if !old.is_empty() && !old.starts_with(opencode::MARKER) {
+    let (marker, source, name) = plugin_of(p.agent, &opts.program);
+    if !old.is_empty() && !old.starts_with(marker) {
         return r.fail(format!(
             "calmrun: {} was not written by calmrun; left it alone",
             p.file.display()
         ));
     }
-    let new = if opts.remove {
-        String::new()
-    } else {
-        opencode::plugin(&opts.program)
-    };
+    let new = if opts.remove { String::new() } else { source };
     if new == old {
         return r.line(format!("hook      {}: unchanged", p.file.display()));
     }
     let what = if opts.remove { "remove" } else { "write" };
     r.line(format!(
-        "hook      {}: {}{what} the OpenCode plugin (`{}`)",
+        "hook      {}: {}{what} the {name} (`{}`)",
         p.file.display(),
         verb(opts),
-        command(&opts.program, "opencode")
+        command(&opts.program, p.agent)
     ));
     if !opts.write {
         return;
@@ -616,11 +622,11 @@ mod tests {
         // Installing `all` leaves the experimental Antigravity hook out unless it is named.
         assert_eq!(
             chosen(&["all".into()], false).unwrap(),
-            ["claude", "codex", "opencode"]
+            ["claude", "codex", "opencode", "pi"]
         );
         assert_eq!(
             chosen(&["all".into(), "antigravity".into()], false).unwrap(),
-            ["claude", "codex", "opencode", "antigravity"]
+            ["claude", "codex", "opencode", "pi", "antigravity"]
         );
         assert!(chosen(&["gemini".into()], false)
             .unwrap_err()

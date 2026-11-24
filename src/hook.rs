@@ -3,7 +3,7 @@
 //! One decision for every agent ([`plan`]): which parts of a shell command are heavy, the
 //! command with each of them wrapped in `calmrun --`, and a `--wait-timeout` below the tool's
 //! own time limit. Each agent has a thin adapter that reads its tool call and writes its answer:
-//! Claude Code here ([`handle`]), Codex, Antigravity and OpenCode in the child modules.
+//! Claude Code here ([`handle`]), Codex, Antigravity, OpenCode and Pi in the child modules.
 //!
 //! Claude Code contract (https://code.claude.com/docs/en/hooks): the hook reads JSON with
 //! `tool_name` and `tool_input` on stdin. To block a call it prints
@@ -14,6 +14,7 @@
 pub mod antigravity;
 pub mod codex;
 pub mod opencode;
+pub mod pi;
 
 use crate::config::KindConfig;
 use crate::detect::{detect_words, disposition, parse, tool_name, Disposition};
@@ -36,6 +37,7 @@ pub enum Agent {
     Codex,
     Antigravity,
     OpenCode,
+    Pi,
 }
 
 /// What every adapter needs besides the agent's input.
@@ -71,6 +73,7 @@ pub fn run(agent: Agent, input: &str, o: &Opts) -> Option<String> {
         Agent::Codex => codex::handle(input, o),
         Agent::Antigravity => antigravity::handle(input, o),
         Agent::OpenCode => opencode::handle(input, o),
+        Agent::Pi => pi::handle(input, o),
     }
 }
 
@@ -169,6 +172,8 @@ pub enum Background {
     Param(&'static str),
     /// Only a general hint.
     Hint,
+    /// The agent's shell tool cannot run a command in the background (Pi): no hint.
+    None,
 }
 
 /// The deny reason every agent shows its model: the command to run instead, the queue's
@@ -195,7 +200,7 @@ pub fn deny_reason(p: &Plan, bg: Background, o: &Opts) -> String {
                 p.plain
             ));
         }
-    } else if !p.background {
+    } else if !p.background && !matches!(bg, Background::None) {
         s.push_str("\nIf it may take more than a minute or two, run it in the background.");
     }
     s
