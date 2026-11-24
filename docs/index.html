@@ -427,6 +427,22 @@ calmrun: waiting — 4 of 6 points in use, 2nd in line (needs 2); running: npx v
               <code>--needs db</code> takes a named resource; <code>--id</code> uses a separate queue.
             </p>
           </div>
+          <div class="card">
+            <h3 data-i18n="how.7.h">An order you can steer</h3>
+            <p data-i18n="how.7">
+              <code>calmrun bump</code> puts a waiting job next: while it waits for room, later jobs may not pass it. Pick it by label,
+              <code>--pos</code>, <code>--ticket</code> or <code>--dir</code>; <code>--prio low</code> and <code>bump --back</code> send
+              long jobs to the end of the line.
+            </p>
+          </div>
+          <div class="card">
+            <h3 data-i18n="how.8.h">See and stop a stuck job</h3>
+            <p data-i18n="how.8">
+              <code>calmrun status</code> and the waiting lines show a running job's CPU, <code>idle 5m</code>, its usual time and its last
+              output. Test-like jobs stop after 60 minutes (exit 124, <code>--timeout</code>, <code>max_run_min</code>);
+              <code>calmrun stop &lt;id&gt;</code> ends one now, <code>calmrun logs &lt;id&gt; --follow</code> shows what it prints.
+            </p>
+          </div>
         </div>
 
         <h3 data-i18n="kinds.h">Kinds and default costs</h3>
@@ -632,7 +648,9 @@ Do not wrap light commands (git, ls, cat, package installs).</pre>
             <tr><th><code>ceiling_gb</code><br /><code>CALMRUN_CEILING_GB</code></th><td data-i18n="cfg.ceiling">Half the RAM. Memory one job's process tree may use; 0 turns it off.</td></tr>
             <tr><th><code>critical_free_gb</code><br /><code>CALMRUN_CRITICAL_FREE_GB</code></th><td data-i18n="cfg.critical">5% of RAM, at most 1 GB. Below this for 3 seconds, the biggest job is stopped; 0 turns it off.</td></tr>
             <tr><th><code>[resources]</code><br /><code>CALMRUN_RESOURCES</code></th><td data-i18n="cfg.res">Slots per named resource, e.g. <code>db = 1</code> or <code>db=1,gpu=2</code>. Unlisted resources have 1 slot.</td></tr>
-            <tr><th><code>[kinds.&lt;name&gt;]</code></th><td data-i18n="cfg.kinds"><code>cost</code> overrides a kind's points; <code>patterns = ["make"]</code> adds a kind of your own.</td></tr>
+            <tr><th><code>[kinds.&lt;name&gt;]</code></th><td data-i18n="cfg.kinds"><code>cost</code> overrides a kind's points; <code>patterns = ["make"]</code> adds a kind of your own; <code>max_run_min</code> sets its run time limit.</td></tr>
+            <tr><th><code>max_run_min</code><br /><code>CALMRUN_MAX_RUN_MIN</code></th><td data-i18n="cfg.maxrun">60 for test, vitest, jest, pytest, typecheck, tsc, lint and eslint; no limit for builds and other kinds. Minutes a job may run before it is stopped (exit 124); 0 turns it off.</td></tr>
+            <tr><th><code>log</code><br /><code>CALMRUN_LOG</code></th><td data-i18n="cfg.log">Off. Copy every run's output to a log file (as <code>--log</code>) for <code>calmrun logs</code>; tools then see a pipe, not a terminal, and may drop colours.</td></tr>
             <tr><th><code>CALMRUN_LOW_CPU</code></th><td data-i18n="cfg.lowcpu"><code>0</code> keeps normal priority.</td></tr>
             <tr><th><code>CALMRUN_HOOK_MODE</code></th><td data-i18n="cfg.hookmode"><code>rewrite</code> makes the hook wrap commands itself instead of denying them.</td></tr>
             <tr><th><code>CALMRUN_HOME</code> · <code>CALMRUN_CONFIG</code></th><td data-i18n="cfg.home">The state directory and the config file path.</td></tr>
@@ -783,6 +801,12 @@ patterns = ["make", "bazel build"]</pre>
           'how.6.h': 'Vé chờ, tài nguyên, hàng riêng',
           'how.6':
             '<code>--wait-timeout</code> thôi chờ sau một khoảng thời gian (mã thoát 75) và giữ chỗ trong hàng 10 phút dưới dạng một vé. <code>--needs db</code> giữ một tài nguyên có tên; <code>--id</code> dùng một hàng chờ riêng.',
+          'how.7.h': 'Thứ tự do bạn điều khiển',
+          'how.7':
+            '<code>calmrun bump</code> đưa một việc đang chờ lên chạy kế tiếp: khi nó chờ chỗ trống, việc sau không được chen lên. Chọn theo nhãn, <code>--pos</code>, <code>--ticket</code> hoặc <code>--dir</code>; <code>--prio low</code> và <code>bump --back</code> đẩy các việc dài xuống cuối hàng.',
+          'how.8.h': 'Thấy và dừng việc bị treo',
+          'how.8':
+            '<code>calmrun status</code> và các dòng chờ hiện CPU của việc đang chạy, <code>idle 5m</code>, thời gian thường lệ và lần in ra cuối. Việc kiểu test dừng sau 60 phút (mã thoát 124, <code>--timeout</code>, <code>max_run_min</code>); <code>calmrun stop &lt;id&gt;</code> dừng ngay, <code>calmrun logs &lt;id&gt; --follow</code> xem nó đang in gì.',
           'kinds.h': 'Các loại lệnh và số điểm mặc định',
           'kinds.c1': 'Loại',
           'kinds.c2': 'Điểm',
@@ -859,7 +883,9 @@ patterns = ["make", "bazel build"]</pre>
           'cfg.ceiling': 'Một nửa RAM. Bộ nhớ tối đa cho cây tiến trình của một việc; 0 để tắt.',
           'cfg.critical': '5% RAM, tối đa 1 GB. Thấp hơn mức này trong 3 giây thì việc lớn nhất bị dừng; 0 để tắt.',
           'cfg.res': 'Số slot cho mỗi tài nguyên có tên, ví dụ <code>db = 1</code> hoặc <code>db=1,gpu=2</code>. Tài nguyên không khai báo có 1 slot.',
-          'cfg.kinds': '<code>cost</code> ghi đè số điểm của một loại; <code>patterns = ["make"]</code> thêm một loại của riêng bạn.',
+          'cfg.kinds': '<code>cost</code> ghi đè số điểm của một loại; <code>patterns = ["make"]</code> thêm một loại của riêng bạn; <code>max_run_min</code> đặt giới hạn thời gian chạy của nó.',
+          'cfg.maxrun': '60 cho test, vitest, jest, pytest, typecheck, tsc, lint và eslint; build và các loại khác không giới hạn. Số phút một việc được chạy trước khi bị dừng (mã thoát 124); 0 để tắt.',
+          'cfg.log': 'Tắt. Chép output của mọi lần chạy vào file log (như <code>--log</code>) cho <code>calmrun logs</code>; khi đó công cụ thấy pipe chứ không phải terminal và có thể tắt màu.',
           'cfg.lowcpu': '<code>0</code> để giữ mức ưu tiên thường.',
           'cfg.hookmode': '<code>rewrite</code> cho hook tự bọc lệnh thay vì chặn.',
           'cfg.home': 'Thư mục trạng thái và đường dẫn file cấu hình.',

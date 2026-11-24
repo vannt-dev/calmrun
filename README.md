@@ -45,6 +45,10 @@ makes them take turns:
 - Commands run at low CPU priority, so your editor and the agents stay responsive.
 - A job whose process tree grows past a memory ceiling is stopped instead of taking the machine.
 - A killed terminal does not leave orphaned workers: the command's tree dies with calmrun.
+- A stuck job is visible and short-lived: `status` and the waiting lines show its CPU, `idle 5m`
+  and its usual time, test-like jobs stop after 60 minutes, and `calmrun stop <id>` ends one now.
+- You steer the order: `calmrun bump` puts a job next, `--prio low` and `bump --back` send long
+  jobs to the end, and `calmrun logs <id> --follow` shows what the job ahead prints.
 
 ## Install
 
